@@ -56,12 +56,26 @@ import {
   type MinimaxInlineImage,
 } from './minimax-messages.js'
 import {
-  isMinimaxExpired,
+  isMinimaxExpiringWithin,
   minimaxFallbackEntries,
   minimaxFetch,
   type MinimaxCredential,
   type MinimaxModelEntry,
 } from './minimax.js'
+
+/**
+ * 请求前预判的**最小剩余有效期**（2026-10-24 本地试验版）。
+ *
+ * 旧判据是 `isMinimaxExpired`（已过期才续）—— 401 都发出去一轮了才补。
+ * 改成「剩余不足 60s 就先续」，与官方 `oauth-core` 的
+ * `getAccessToken({minValidityMs})` 同语义：让 token 在**临死前**换新，
+ * 而不是让用户的请求撞在正在死掉的 token 上。60s 取官方 30s 的两倍宽：
+ * 一次续期 grant 实测 ~300ms，60s 足够覆盖慢网络下的整轮续期。
+ *
+ * ⚠️ 巡检（60s tick、5min margin）正常在跑时，这里的命中应**接近于零**；
+ * 命中变多说明巡检没跟上（宿主刚唤醒 / 巡检被阻塞），它兜的是那个底。
+ */
+const MINIMAX_ONDEMAND_MIN_VALIDITY_MS = 60_000
 
 /**
  * 前缀识别「必须 adaptive thinking」的模型。
@@ -684,7 +698,7 @@ export class MinimaxAdapter extends LlmAdapter {
      */
     let geoRouted = false
     let credential = await this.options.resolveCredential(options.model)
-    if (credential === undefined || isMinimaxExpired(credential)) {
+    if (credential === undefined || isMinimaxExpiringWithin(credential, MINIMAX_ONDEMAND_MIN_VALIDITY_MS)) {
       await this.options.refresh()
       credential = await this.options.resolveCredential(options.model)
     }

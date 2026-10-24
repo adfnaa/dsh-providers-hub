@@ -14,6 +14,7 @@ import type { Context } from '@deepseek-ai/cordis'
 import type { AccountPool } from './account-pool.js'
 import {
   refreshAccountWithReconcile,
+  syncAccountExpiry,
   type ExpiryAccessors,
 } from './expiry-sync.js'
 import {
@@ -23,9 +24,12 @@ import {
   type MinimaxProduct,
 } from './minimax-product.js'
 import { fetchMinimaxUserIdentity } from './minimax-identity.js'
+import { appendMinimaxJournal, type MinimaxJournalTrigger } from './minimax-refresh-journal.js'
+import { resolveJetHubHome } from './jet-hub-store.js'
 import {
   inheritMinimaxIdentity,
   fallbackToEntry,
+  isMinimaxExpiringWithin,
   isMinimaxRefreshable,
   minimaxCredentialExpiresAtMs,
   describeMinimaxGeoRoute,
@@ -99,6 +103,54 @@ export function parseMinimaxCredential(value: string): MinimaxCredential | undef
   }
 }
 
+// ===== 2026-10-24 本地试验版：续期机制重构的常量 =====
+//
+// 设计依据（三方源码交叉审计的结论）：
+// - **官方** `MiniMax-AI/minimax-code` 的 `oauth-core` 是**纯按需刷新**
+//   （`getAccessToken({minValidityMs:30_000})`），没有任何定时轮换器；
+// - 本插件旧形态是 30min tick + 1h lead + TTL≈1h ⇒ **每个 tick 都对每个
+//   可续期账号发起轮换（~48 次/天/账号）**，且批量顺序执行使全部账号的
+//   过期时刻焊死在同一秒窗内 —— 一次系统性失败（断网/上游抖动/关机跨窗）
+//   必然**全池同时阵亡**，正是「一失效就是一大片」的结构性根因。
+//
+// ⇒ 新形态：定时器只**对账**（reconcile-only），轮换交给
+//   ① 本类 60s 专属巡检（{@link startRenewPatrol}，margin 5min + 按账号散列
+//   的 0-10min 抖动 ⇒ 各账号续期时刻天然错开）；
+//   ② 请求路径兜底（adapter 预判 + 401 强刷，走 `refreshAccountCredential`）。
+//   轮换纪律照抄官方/dsh-minimax-connect：单飞、CAS 落盘、失败重试一次、
+//   旧代际 RT 回退抢救、全量 journal。
+
+/** 巡检提前量：距过期不足 5 分钟才发续期请求（dsh-minimax-connect 生产验证值）。 */
+const MINIMAX_RENEW_MARGIN_MS = 5 * 60_000
+/** 按账号散列的额外提前量跨度（0-10min）：把各账号的续期时刻散开，错峰。 */
+const MINIMAX_RENEW_JITTER_SPAN_MS = 10 * 60_000
+/** 巡检间隔（60s）：比 margin 细一档，保证窗口不会被整段跳过。 */
+const MINIMAX_RENEW_PATROL_INTERVAL_MS = 60_000
+/** 非终态失败（网络抖动）后的同 RT 重试间隔。 */
+const MINIMAX_RENEW_RETRY_DELAY_MS = 1_500
+/** 历史代际 refresh_token 保留条数（新→旧，**不含当前值**）。 */
+const MINIMAX_PREVIOUS_REFRESH_TOKENS = 3
+
+/**
+ * 按账号 id 算一个**确定性**的续期抖动（0 ≤ x < span）。
+ *
+ * ⚠️ 必须确定性（不能每次随机）：同一条账号的续期时刻要在**周期之间稳定**，
+ * 否则「错峰」退化为「洗牌」。djb2 足够 —— 这里不需要密码学强度。
+ */
+function renewJitterMs(accountId: string, spanMs: number): number {
+  let hash = 5381
+  for (let i = 0; i < accountId.length; i++) {
+    hash = ((hash << 5) + hash + accountId.charCodeAt(i)) | 0
+  }
+  return Math.abs(hash) % spanMs
+}
+
+/** 判一条错误是不是「refresh_token 已死」的终态（与既有 refreshCredentialFor 同判据）。 */
+function isTerminalRefreshError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error)
+  return /invalid_grant|expired|revoked/i.test(message)
+}
+
 /** 认证服务选项。 */
 export interface MinimaxAuthOptions {
   /** 产品配置；默认 {@link MINIMAX}。 */
@@ -127,6 +179,14 @@ export interface MinimaxAuthOptions {
   fetchFor?: (accountId: string) => typeof fetch
   /** 注入的 sleep（测试用）。 */
   sleep?: (ms: number) => Promise<void>
+  /**
+   * 续期/身份 journal 的落盘根目录（`$DSH_HOME`；2026-10-24 本地试验版）。
+   *
+   * ⚠️ **必须由接线层显式传入**（`index.ts` 传 `resolveJetHubHome(ctx)`）：
+   * 不传（单测 / 旧接线）⇒ **绝不写盘** —— 否则单测会把日志写进用户真实的
+   * `~/.dsh/jet-hub/`。见 `minimax-refresh-journal.ts` 的模块头。
+   */
+  journalHome?: string
 }
 
 /** 登录流程句柄。 */
@@ -163,12 +223,27 @@ export class MinimaxAuth extends Service {
   readonly credentialRefName: string
 
   private lastRefreshError: string | undefined
+  /**
+   * 每 ref **单飞**闸门：巡检 / 请求路径 / 401 强刷可能同时想续同一个账号，
+   * 并发轮换同一 RT = 双方都在用一把正在被作废的钥匙（轮换式令牌的
+   * 致命竞态）。同 ref 的并发调用都等同一份 Promise。
+   * ⚠️ 值类型放宽为 `unknown`：`refreshAccountCredential`（lead-aware 流程）
+   * 与 `renewEntry`（margin 流程）的返回形状不同，汇合方各自解读。
+   */
+  private readonly renewInFlight = new Map<string, Promise<unknown>>()
+  /** 60s 专属巡检定时器（{@link startRenewPatrol}；重复调用幂等）。 */
+  private patrolTimer: ReturnType<typeof setInterval> | undefined
+  /** 巡检防重入：一轮没跑完时跳过本轮（refreshAllCredentials 级别的教训）。 */
+  private patrolBusy = false
+  /** journal 落盘根目录（`journalHome` 选项；undefined = 不写，见模块注释）。 */
+  private readonly journalHome: string | undefined
 
   constructor(ctx: Context, private readonly options: MinimaxAuthOptions = {}) {
     const product = options.product ?? MINIMAX
     super(ctx, options.serviceName ?? `${product.id}Auth`)
     this.product = product
     this.credentialRefName = product.defaultCredentialRef
+    this.journalHome = options.journalHome
   }
 
   private get fetchImpl(): typeof fetch {
@@ -380,11 +455,18 @@ export class MinimaxAuth extends Service {
   }
 
   /**
-   * 续期**指定 ref**（RPC `account.refresh` / 定时器）。
+   * 续期**指定 ref**（RPC `account.refresh` / adapter 401 强刷 / 积分自愈）。
    *
    * ⚠️ 只读写传入的 ref，**不碰**默认单凭据 ref。
    * ⚠️ **走共享实现 `refreshAccountWithReconcile`** —— 它保证「凭据仍有效」时
    * 也把池值对账（见 `refreshAll` 的注释）。
+   *
+   * ⚠️⚠️ **2026-10-24 本地试验版：并入单飞闸门**（`renewInFlight`，与
+   * `renewEntry`/巡检共用同一把锁）。这不是洁癖 —— 旧形态下 401 路径与巡检
+   * **并发**对同一 ref 各发一份 grant，轮换式 RT 下**输家拿到 invalid_grant**；
+   * 若输家是巡检，会把账号**误标成需重登**（而赢家明明存下了一份好凭据）。
+   * 汇合语义：巡检的 grant 在天上时，这里**等它落地**再走自己的 lead-aware
+   * 流程（顺序双 grant 无害，并发双 grant 才致命）。
    */
   async refreshAccountCredential(
     refName: string,
@@ -392,43 +474,66 @@ export class MinimaxAuth extends Service {
     accountId?: string,
   ): Promise<void> {
     const ref = credentialRef(refName)
-    const resolved = await this.ctx.credentials.resolve(ref)
-    if (!resolved) throw new Error('凭据未配置')
-    const credential = parseMinimaxCredential(resolved.value)
-    if (!credential) throw new Error('凭据解析失败')
-    if (!isMinimaxRefreshable(credential)) {
-      throw new MinimaxRefreshTokenExpiredError('凭据缺少 refresh_token，请重新登录')
-    }
-    // 无账号池时退化为「直接续期 + 落盘」（单凭据路径）
     if (pool === undefined) {
+      // 无池：退化为「直接续期 + 落盘到同一个 ref」（单凭据路径，保持既有行为）
+      const resolved = await this.ctx.credentials.resolve(ref)
+      if (!resolved) throw new Error('凭据未配置')
+      const credential = parseMinimaxCredential(resolved.value)
+      if (!credential) throw new Error('凭据解析失败')
+      if (!isMinimaxRefreshable(credential)) {
+        throw new MinimaxRefreshTokenExpiredError('凭据缺少 refresh_token，请重新登录')
+      }
       const next = await this.refreshCredentialFor(credential, accountId)
       await this.ctx.credentials.set(ref, JSON.stringify(next))
       return
     }
-    await refreshAccountWithReconcile({
-      pool,
-      provider: this.product.id,
-      tag: `[${this.product.id}]`,
-      accountId: accountId ?? '',
-      credential,
-      accessors: MINIMAX_EXPIRY_ACCESSORS,
-      refresh: (c) => this.refreshCredentialFor(c, accountId),
-      save: (c) => this.ctx.credentials.set(ref, JSON.stringify(c)),
-      warn: (message) => this.ctx.logger?.warn?.(message),
-      info: (message) => this.ctx.logger?.info?.(message),
-    })
+    const existing = this.renewInFlight.get(refName)
+    if (existing !== undefined) await existing.catch(() => undefined)
+    const task = (async () => {
+      const resolved = await this.ctx.credentials.resolve(ref)
+      if (!resolved) throw new Error('凭据未配置')
+      const credential = parseMinimaxCredential(resolved.value)
+      if (!credential) throw new Error('凭据解析失败')
+      if (!isMinimaxRefreshable(credential)) {
+        throw new MinimaxRefreshTokenExpiredError('凭据缺少 refresh_token，请重新登录')
+      }
+      await refreshAccountWithReconcile({
+        pool,
+        provider: this.product.id,
+        tag: `[${this.product.id}]`,
+        accountId: accountId ?? '',
+        credential,
+        accessors: MINIMAX_EXPIRY_ACCESSORS,
+        refresh: (c) => this.refreshCredentialFor(c, accountId),
+        save: (c) => this.ctx.credentials.set(ref, JSON.stringify(c)),
+        warn: (message) => this.ctx.logger?.warn?.(message),
+        info: (message) => this.ctx.logger?.info?.(message),
+      })
+    })().finally(() => { this.renewInFlight.delete(refName) })
+    this.renewInFlight.set(refName, task)
+    await task
   }
 
   /**
-   * 批量续期：**只按 `refreshable` 过滤，不看 `enabled`**。
+   * 批量处理：**2026-10-24 本地试验版改为只对账（reconcile-only），不发 grant**。
    *
-   * ⚠️ **必须走共享实现 `refreshAccountWithReconcile`**（`src/expiry-sync.ts`），
-   * **不要**手写对账逻辑。九个既有 provider 里**八个**都用它
-   *（buddy / cline / lobsterai / qoder / service / trae / loomy / raccoon 的部分路径）；
-   * 手写版本会在「凭据仍有效」的分支漏掉池值对账，导致 UI **永远**显示「已过期」
-   * —— 那正是 `src/expiry-sync.ts` 模块注释记录的真实缺陷。
+   * ## 为什么砍掉这里的轮换（三方源码审计结论）
    *
-   * 照 `src/cline-auth.ts` 的 `refreshAll` 形态（它是最规范的一份）。
+   * 旧形态：全局 30min tick 走到这里 + `REFRESH_LEAD_MS`=1h + access TTL≈1h
+   * ⇒ **每个 tick、每个可续期账号都命中刷新窗口**（~48 次轮换/天/账号），
+   * 且循环顺序执行使全部账号的过期时刻焊死在同一秒窗 —— 一次系统性失败
+   * 就是全池同时报废（用户实测「一失效就是一大片」）。
+   *
+   * 新分工：
+   * - **轮换**交给 ① 60s 专属巡检（{@link startRenewPatrol}，5min margin +
+   *   账号散列抖动）与 ② 请求路径兜底（adapter 预判 + 401 强刷）——
+   *   官方 `oauth-core` 本就是按需制，定时批量轮换是本插件自加的；
+   * - **本方法只做对账**：把凭据里的真实 `expiresAt` 镜像回池（UI 读池值），
+   *   保持「凭据被别处更新过而索引没跟上」的自愈能力
+   *   （`src/expiry-sync.ts` 模块头记录的缺陷反面）。
+   *
+   * ⚠️ 纪律保持：**只按 `refreshable` 过滤，不看 `enabled`**；凭据缺失/
+   * 损坏仍标 `refreshable:false`；单账号失败不拖住其余。
    */
   async refreshAll(pool: AccountPool): Promise<void> {
     const accounts = await pool.listAccounts(this.product.id)
@@ -447,36 +552,23 @@ export class MinimaxAuth extends Service {
           await pool.updateAccount(entry.id, { refreshable: false })
           continue
         }
-        await refreshAccountWithReconcile({
+        await syncAccountExpiry({
           pool,
           provider: this.product.id,
-          tag: `[${this.product.id}]`,
-          accountId: entry.id,
           credential,
           accessors: MINIMAX_EXPIRY_ACCESSORS,
+          accountId: entry.id,
           current: entry,
-          refresh: (c) => this.refreshCredentialFor(c, entry.id),
-          save: (c) => this.ctx.credentials.set(ref, JSON.stringify(c)),
+          tag: `[${this.product.id}]`,
           warn: (message) => this.ctx.logger?.warn?.(message),
         })
       } catch (error) {
-        if (error instanceof MinimaxRefreshTokenExpiredError) {
-          try {
-            await pool.updateAccount(entry.id, { refreshable: false })
-          } catch {
-            // 忽略 updateAccount 本身的错误
-          }
-          this.ctx.logger?.warn?.(
-            `[minimax] 账号 ${entry.id} 的 refresh_token 已失效，已标记为不可续期（需重新登录）`,
-          )
-        } else {
-          // 非终态失败（网络抖动、5xx…）**必须留下日志** ——
-          // 静默失败会让账号在 UI 上仍显示「可续期」却永远刷不动，无从排查。
-          this.ctx.logger?.warn?.(
-            `[minimax] 账号 ${entry.id} 续期失败：`
+        // 只对账不会产生终态错误；这里兜的是池/凭据读取层面的意外，
+        // 照旧留日志（静默失败会让「凭据一直刷不动」无痕）。
+        this.ctx.logger?.warn?.(
+          `[${this.product.id}] 账号 ${entry.id} 有效期对账失败：`
             + `${error instanceof Error ? error.message : String(error)}`,
-          )
-        }
+        )
       }
     }
   }
@@ -486,11 +578,29 @@ export class MinimaxAuth extends Service {
    *
    * ⚠️ **不落盘** —— 落盘由共享实现的 `save` 回调负责。
    *
+   * 2026-10-24 起走 {@link grantWithSalvage}：非终态失败同 RT 重试一次、
+   * 终态失败先回退历史代际 RT —— 语义对单凭据路径同样成立。
+   *
    * @param accountId 该凭据属于哪个账号（可选，供代理取出口）。
    *   ⚠️ 与推理路径同因：国际站的续期端点也在 `agent.minimax.io` 上，
    *   大陆出口直连会 307 ⇒ 续期恒失败而 UI 只显示「已过期」。
    */
   async refreshCredentialFor(
+    credential: MinimaxCredential,
+    accountId?: string,
+  ): Promise<MinimaxCredential> {
+    return this.grantWithSalvage(credential, accountId)
+  }
+
+  /**
+   * **单次 grant**（含终态分类 + 历史代际维护）。
+   *
+   * - 服务端判 RT 已死（`invalid_grant|expired|revoked`）⇒ 包成终态错误抛出；
+   * - 成功 ⇒ 组装新凭据：**旧 RT 压入历史栈**（新→旧、去重、截 3 条），
+   *   再交给 `inheritMinimaxIdentity` **继承全部非令牌字段**（`nickname` / `user_id` /
+   *   `previous_refresh_tokens`）—— 续期响应只带令牌五件套，手工透传每加一个字段就漏一个。
+   */
+  private async grantOnce(
     credential: MinimaxCredential,
     accountId?: string,
   ): Promise<MinimaxCredential> {
@@ -505,12 +615,25 @@ export class MinimaxAuth extends Service {
         this.product,
       )
     } catch (error) {
-      const message = error instanceof Error ? error.message : String(error)
-      if (/invalid_grant|expired|revoked/i.test(message)) {
+      if (isTerminalRefreshError(error)) {
         throw new MinimaxRefreshTokenExpiredError('refresh_token 已失效，请重新登录')
       }
       throw error
     }
+    // 旧 RT 压栈（**新→旧**、去重、最多 `MINIMAX_PREVIOUS_REFRESH_TOKENS` 条）——
+    // 供 `grantWithSalvage` 在终态失败时逐把回退（断链抢救）。
+    // ⚠️ 这是**非令牌字段**：随下面 `inheritMinimaxIdentity` 的
+    // `{ ...previous, ...refreshed }` 自然落盘，**不要**在这里手工透传。
+    const previous = [credential.refresh_token as string, ...(credential.previous_refresh_tokens ?? [])]
+    const deduped: string[] = []
+    for (const token of previous) {
+      if (typeof token === 'string' && token.length > 0 && !deduped.includes(token)) {
+        deduped.push(token)
+        if (deduped.length >= MINIMAX_PREVIOUS_REFRESH_TOKENS) break
+      }
+    }
+    if (deduped.length > 0) refreshed = { ...refreshed, previous_refresh_tokens: deduped }
+
     /**
      * ⚠️⚠️ 续期**必须继承**身份字段（2026-10-24）。
      *
@@ -518,12 +641,233 @@ export class MinimaxAuth extends Service {
      * `token_type` / `expires_at` / `scope`），**不认识** `nickname` / `user_id`；
      * 而续期结果会被整体覆盖落盘 ⇒ 每续期一次丢一次：`nickname` 丢了账号卡片退回
      * 内部 id（IKP8UA 复发），`user_id` 丢了**同账号去重失去唯一判据**。
-     * 定时续期 30 分钟一轮、SELF_HEAL 还会补一次 ⇒ 这个丢失**必然发生**。
+     * 60s 巡检、请求前预判、401 强刷、SELF_HEAL 都会续期 ⇒ 这个丢失**必然发生**。
      *
      * ⚠️ 收口在**唯一**的续期出口（本方法）：本文件有 4 条续期路径，在各调用点
      *    分别补必然漏一处。
      */
     return inheritMinimaxIdentity(refreshed, credential)
+  }
+
+  /**
+   * grant + **两层抢救**（2026-10-24 本地试验版）。
+   *
+   * ## 抢救顺序（顺序不可颠倒）
+   *
+   * 1. **非终态失败**（网络断/超时/5xx）⇒ 隔 1.5s **同 RT 重试一次**：
+   *    覆盖「服务端还没处理就断了」的情形；重试若转终态，说明服务端已经
+   *    轮换过（响应丢失）⇒ 落入第 2 层。
+   * 2. **终态失败** ⇒ 依次回退 **历史代际 RT**（`previous_refresh_tokens`，
+   *    新→旧最多 3 把）：上游若只作废被用的那条而非整族，就能救回 ——
+   *    全失败才抛终态（调用方标记需重登）。**实验特性**：上游语义未证实，
+   *    全失败只是多花几次注定失败的请求，无新增风险；每次抢救结果都进 journal。
+   */
+  private async grantWithSalvage(
+    credential: MinimaxCredential,
+    accountId?: string,
+  ): Promise<MinimaxCredential> {
+    try {
+      return await this.grantOnce(credential, accountId)
+    } catch (error) {
+      if (error instanceof MinimaxRefreshTokenExpiredError) {
+        // 第 2 层：历史代际回退（当前值除外 —— 刚刚就是它死的）。
+        const history = (credential.previous_refresh_tokens ?? [])
+          .filter((rt) => rt !== credential.refresh_token)
+        for (const token of history) {
+          try {
+            return await this.grantOnce({ ...credential, refresh_token: token }, accountId)
+          } catch {
+            // 这把也死了 → 试下一把（journal 由调用方记最终结局）。
+          }
+        }
+        throw error
+      }
+      // 第 1 层：非终态（网络抖动）→ 同 RT 重试一次。
+      await (this.options.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms))))(
+        MINIMAX_RENEW_RETRY_DELAY_MS,
+      )
+      return this.grantOnce(credential, accountId)
+    }
+  }
+
+  /**
+   * **按账号条目续期**（2026-10-24 本地试验版的核心入口）。
+   *
+   * ## 与 `refreshAccountCredential` 的分工
+   *
+   * | 入口 | 用途 | margin |
+   * |---|---|---|
+   * | 本方法 | 60s 巡检 / 请求路径兜底 | 5min + 账号抖动（`force` 时无窗口） |
+   * | `refreshAccountCredential` | RPC `account.refresh` / adapter `refresh()` | 既有 1h lead（用户点了就是要刷） |
+   *
+   * ## 三条纪律（缺一都是事故）
+   *
+   * 1. **单飞**（`renewInFlight`）：巡检 / 兜底 / 强刷并发想续同一个账号时，
+   *    只允许一份 grant 在天上 —— 并发轮换同一 RT 是轮换式令牌的致命竞态；
+   * 2. **CAS 落盘**：grant 前后**重读凭据**，`access_token` 变了说明期间
+   *    有别人写过（登录 / RPC 续期）⇒ **丢弃本次结果**（别人写的是更新的
+   *    会话，覆盖回去等于把新钥匙换成旧的）；
+   * 3. **全量 journal**：每次 grant 记 `{trigger, result, error, latencyMs,
+   *    newExpiresAt}` —— 试验期验收全靠它。
+   */
+  async renewEntry(
+    pool: AccountPool,
+    entry: { id: string; credentialRef: string; refreshable?: boolean; expiresAt?: number },
+    opts: { marginMs?: number; force?: boolean; trigger?: MinimaxJournalTrigger } = {},
+  ): Promise<{ renewed: boolean; credential?: MinimaxCredential; superseded?: boolean }> {
+    const existing = this.renewInFlight.get(entry.credentialRef)
+    if (existing !== undefined) {
+      // 汇合：别的入口（refreshAccountCredential 的 lead-aware 流程）正在续
+      // 同一个 ref ⇒ 等它落地，重读凭据交回去（对账/镜像由那次飞行完成）。
+      await existing.catch(() => undefined)
+      const reRead = await this.ctx.credentials.resolve(credentialRef(entry.credentialRef))
+      const credential = reRead === undefined ? undefined : parseMinimaxCredential(reRead.value)
+      return { renewed: false, ...(credential === undefined ? {} : { credential }) }
+    }
+    const task = this.renewEntryInner(pool, entry, opts)
+      .finally(() => { this.renewInFlight.delete(entry.credentialRef) })
+    this.renewInFlight.set(entry.credentialRef, task)
+    return task
+  }
+
+  private async renewEntryInner(
+    pool: AccountPool,
+    entry: { id: string; credentialRef: string; refreshable?: boolean; expiresAt?: number },
+    opts: { marginMs?: number; force?: boolean; trigger?: MinimaxJournalTrigger },
+  ): Promise<{ renewed: boolean; credential?: MinimaxCredential; superseded?: boolean }> {
+    const ref = credentialRef(entry.credentialRef)
+    const resolved = await this.ctx.credentials.resolve(ref)
+    if (!resolved) {
+      await pool.updateAccount(entry.id, { refreshable: false }).catch(() => {})
+      return { renewed: false }
+    }
+    const credential = parseMinimaxCredential(resolved.value)
+    if (credential === undefined || !isMinimaxRefreshable(credential)) {
+      await pool.updateAccount(entry.id, { refreshable: false }).catch(() => {})
+      return { renewed: false }
+    }
+    const trigger = opts.trigger ?? 'patrol'
+    const margin = opts.force === true ? Number.POSITIVE_INFINITY : (opts.marginMs ?? MINIMAX_RENEW_MARGIN_MS)
+    const expiresAt = minimaxCredentialExpiresAtMs(credential)
+    // ⚠️ 读不到过期时间视为「该续」（fail-open，与 shouldRefreshNow 同口径）。
+    if (!opts.force && expiresAt !== undefined && Number.isFinite(expiresAt)
+      && expiresAt - Date.now() > margin) {
+      return { renewed: false, credential }
+    }
+    const started = Date.now()
+    try {
+      const next = await this.grantWithSalvage(credential, entry.id)
+      // CAS：grant 期间凭据若被别人写过（登录 / RPC 续期），丢弃本次结果 ——
+      // 别人写的是更新的会话，覆盖回去等于把新钥匙换成旧的。
+      const reRead = await this.ctx.credentials.resolve(ref)
+      const reReadCredential = reRead === undefined ? undefined : parseMinimaxCredential(reRead.value)
+      if (reReadCredential !== undefined && reReadCredential.access_token !== credential.access_token) {
+        appendMinimaxJournal(this.journalHome, {
+          ts: Date.now(),
+          provider: this.product.id,
+          accountId: entry.id,
+          kind: 'superseded',
+          trigger,
+          result: 'skipped',
+        })
+        return { renewed: false, credential: reReadCredential, superseded: true }
+      }
+      await this.ctx.credentials.set(ref, JSON.stringify(next))
+      await syncAccountExpiry({
+        pool,
+        provider: this.product.id,
+        credential: next,
+        accessors: MINIMAX_EXPIRY_ACCESSORS,
+        accountId: entry.id,
+        current: entry,
+        tag: `[${this.product.id}]`,
+        warn: (message) => this.ctx.logger?.warn?.(message),
+      })
+      this.lastRefreshError = undefined
+      appendMinimaxJournal(this.journalHome, {
+        ts: Date.now(),
+        provider: this.product.id,
+        accountId: entry.id,
+        kind: 'grant',
+        trigger,
+        result: 'ok',
+        latencyMs: Date.now() - started,
+        newExpiresAt: minimaxCredentialExpiresAtMs(next),
+      })
+      return { renewed: true, credential: next }
+    } catch (error) {
+      appendMinimaxJournal(this.journalHome, {
+        ts: Date.now(),
+        provider: this.product.id,
+        accountId: entry.id,
+        kind: 'grant',
+        trigger,
+        result: 'error',
+        error: error instanceof Error ? error.message : String(error),
+        latencyMs: Date.now() - started,
+      })
+      if (error instanceof MinimaxRefreshTokenExpiredError) {
+        await pool.updateAccount(entry.id, { refreshable: false }).catch(() => {})
+        this.ctx.logger?.warn?.(
+          `[${this.product.id}] 账号 ${entry.id} 的 refresh_token 已失效，已标记为不可续期（需重新登录）`,
+        )
+      }
+      throw error
+    }
+  }
+
+  /**
+   * **60s 专属续期巡检**（2026-10-24 本地试验版；重复调用幂等）。
+   *
+   * ## 为什么不塞进全局 30min 调度器
+   *
+   * 30min 粒度配 5min margin 会出现「上一轮看着还够、下一轮 token 已死」的
+   * 空窗；而全局调度器是十三个 provider 共用的，为 MiniMax 一家改粒度会
+   * 波及全部。故 MiniMax 自带 60s 定时器，margin 内（5min + 账号抖动）才发
+   * grant —— 轮换次数从 ~48 次/天/账号降到 ~24-32 次，且**各账号时刻互不相同**。
+   *
+   * ⚠️ **立即先跑一轮**（与 `MultiAccountRefreshScheduler.start` 同理由）：
+   * 宿主重启后不该等满 60s 才开始补。
+   */
+  startRenewPatrol(pool: AccountPool): void {
+    if (this.patrolTimer !== undefined) return
+    const tick = async (): Promise<void> => {
+      if (this.patrolBusy) return
+      this.patrolBusy = true
+      try {
+        const accounts = await pool.listAccounts(this.product.id)
+        for (const entry of accounts) {
+          // ⚠️ 只按 refreshable 过滤，不看 enabled（AGENTS.md 既有铁律）。
+          if (!entry.refreshable) continue
+          try {
+            await this.renewEntry(pool, entry, {
+              marginMs: MINIMAX_RENEW_MARGIN_MS + renewJitterMs(entry.id, MINIMAX_RENEW_JITTER_SPAN_MS),
+              trigger: 'patrol',
+            })
+          } catch (error) {
+            // 终态已在 renewEntry 内记账 + 标池；这里只吞掉继续，
+            // 单账号失败不得拖住其余（与 refreshAll 同纪律）。
+            if (!(error instanceof MinimaxRefreshTokenExpiredError)) {
+              this.ctx.logger?.warn?.(
+                `[${this.product.id}] 账号 ${entry.id} 巡检续期失败：`
+                  + `${error instanceof Error ? error.message : String(error)}`,
+              )
+            }
+          }
+        }
+      } catch (error) {
+        this.ctx.logger?.warn?.(
+          `[${this.product.id}] 续期巡检一轮失败（下一轮重试）：`
+            + `${error instanceof Error ? error.message : String(error)}`,
+        )
+      } finally {
+        this.patrolBusy = false
+      }
+    }
+    void tick()
+    this.patrolTimer = setInterval(() => { void tick() }, MINIMAX_RENEW_PATROL_INTERVAL_MS)
+    // ⚠️ 不持进程：宿主退出时定时器不该是「退不下去」的原因。
+    this.patrolTimer.unref?.()
   }
 
   /**

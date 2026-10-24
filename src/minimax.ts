@@ -67,6 +67,24 @@ export interface MinimaxCredential {
    * ⚠️ 同样**不是令牌字段** ⇒ 续期必须由 `inheritMinimaxIdentity` 继承。
    */
   user_id?: string
+  /**
+   * 历史代际的 refresh_token（**新→旧**，最多 3 条；2026-10-24 本地试验版新增）。
+   *
+   * ## 为什么留它
+   *
+   * refresh_token 是**单次有效、每次轮换**的：grant 响应丢失（网络断在服务端
+   * 已轮换之后）时，手上的 RT 已经死了 ⇒ 账号报废只能重登。留最近几代旧 RT，
+   * `invalid_grant` 时逐把回退试一次 —— 上游若只作废被用的那条而非整族，就能救回。
+   * 全失败再走终态，**只多花几次注定失败的请求，无新增风险**（实验特性，
+   * 上游语义未证实；journal 会记录每次抢救结果）。
+   *
+   * ⚠️ **不是令牌字段**（是历史令牌的**记录**）⇒ 续期时由
+   * `inheritMinimaxIdentity` 的 `{ ...previous, ...refreshed }` 自然继承，
+   * 不需要单独透传；由续期路径（`grantOnce`）自己维护这个数组。
+   *
+   * ⚠️ 调用方不写它也能正常工作（`parseMinimaxCredential` 对未知字段透明透传）。
+   */
+  previous_refresh_tokens?: string[]
 }
 
 /**
@@ -145,6 +163,27 @@ export function minimaxCredentialExpiresAtMs(
 export function isMinimaxExpired(credential: MinimaxCredential, nowMs = Date.now()): boolean {
   const expiresAt = minimaxCredentialExpiresAtMs(credential)
   return expiresAt !== undefined && nowMs >= expiresAt
+}
+
+/**
+ * 凭据剩余有效期是否不足 `minValidityMs`（请求前预判用，2026-10-24 本地试验版）。
+ *
+ * 与 {@link isMinimaxExpired} 的差别：过期前一小段窗口也算「该续了」——
+ * 让请求路径在 token **临死前**就续掉，而不是等 401 回来再补
+ *（官方 `oauth-core` 的 `getAccessToken({minValidityMs})` 同一语义）。
+ *
+ * ⚠️ **读不到过期时间（`undefined`/NaN）视为「该续」**：与 `shouldRefreshNow`
+ *（`src/expiry-sync.ts`）的 fail-open 口径一致；一次成功续期就会写上
+ * `expires_at`，不会持续触发。
+ */
+export function isMinimaxExpiringWithin(
+  credential: MinimaxCredential,
+  minValidityMs: number,
+  nowMs = Date.now(),
+): boolean {
+  const expiresAt = minimaxCredentialExpiresAtMs(credential)
+  if (expiresAt === undefined || !Number.isFinite(expiresAt)) return true
+  return expiresAt - nowMs <= minValidityMs
 }
 
 /** 凭据是否可续期（必须有 refresh_token）。 */
