@@ -3546,6 +3546,47 @@ export function apply(ctx: Context): void {
     // 共享骨架」后，那两个字段**已删除** —— 现在唯一入口是本行传进去的池。
     // ⚠️ **不要把它们加回来**：那会重现「同一语义两套判据」（本仓库红线）。
     accountPool: pool,
+    /**
+     * ⚠️⚠️ **2026-10-25 补：401 按需续期这条腿此前完全缺失**（真实缺陷）。
+     *
+     * ## 缺陷与证据
+     *
+     * `autoclaw-adapter.ts:636` 的 401 重试判据是
+     * `if (!response.ok && (401 || 403) && this.options.refresh)` ——
+     * **没有本回调时整段不执行**（既不续期、也不重发）。
+     * 而本实例（与国际版）自 `6da5505`（AutoClaw 首次接入）起**从未传过它**
+     * （`git log -S"autoclawAdapter"` 只命中那一个提交）。
+     *
+     * ⇒ 401 直接落到 `isAutoclawAuthError` 命中 `'invalid token'` ⇒ 归 `AUTH`
+     *   ⇒ 而 `AUTH` 会被 DSH 客户端**换成固定文案「API 密钥无效」并丢掉原文**
+     *   （本仓库自记：`autoclaw.ts:555-556` / `docs/agent-notes/client-ui.md`）。
+     *   这正是用户报「模型经常报错 API 密钥无效」的**直接来源**。
+     *
+     * ## 为什么「经常」（触发窗口）
+     *
+     * 定时 `refreshAll`（注册表派生，覆盖本家）本身是工作的 —— 实测凭据
+     * AT 的 `iat` 已刷新、RT 还剩 24.5 天，说明续期成功过。但定时器有 **30 分钟
+     * 粒度**：AT 过期到下一轮成功续期之间存在窗口（宿主关闭/重启、某一轮失败
+     * 都会拉长它），窗口内任何请求都 401 且**无按需自愈** ⇒ 每次过期边界附近
+     * 都可能撞上。补上本回调后，401 会先续期再原样重发一次，请求级自愈。
+     *
+     * ## 形态
+     *
+     * 与 accio（本文件下方 `refresh`）逐字同构：续「解析凭据时所用的那一个」
+     * 账号（`getAvailableAccount`），池空时退默认单凭据 ref。
+     * ⚠️ 必须传 `pool + entry.id`，否则续期成功后新 `expiresAt` 写不回账号池，
+     * UI 会一直显示「已过期」而实际可用（issue !IKIRTT 的形态）。
+     */
+    refresh: async () => {
+      const available = await pool.getAvailableAccount(AUTOCLAW.id, '')
+      if (available) {
+        await autoclaw.refreshAccountCredential(
+          available.entry.credentialRef, pool, available.entry.id,
+        )
+      } else {
+        await autoclaw.refresh()
+      }
+    },
   })
 
   // ===== AutoClaw 国际版（autoclawintl）=====
@@ -3597,6 +3638,24 @@ export function apply(ctx: Context): void {
     // ⚠️⚠️ 同国内版（2026-10-23 迁移）：黑名单与关闭意图由共享骨架从账号池读。
     //    两个站点**各一条** `accountPool`，漏一处即该站静默失效（本仓库的既有纪律）。
     accountPool: pool,
+    /**
+     * ⚠️⚠️ **2026-10-25 补：401 按需续期这条腿此前完全缺失**（与国内版同因同源）。
+     *
+     * 证据与形态**逐字同国内版那条**（见上）：`autoclaw-adapter.ts:636` 的 401
+     * 重试判据带 `&& this.options.refresh`，而两个实例自 `6da5505` 起都没传它
+     * ⇒ 401 不续期不重发 ⇒ 归 `AUTH` ⇒ 客户端换成「API 密钥无效」。
+     * 两个站点**各补一条**（本仓库既有纪律：双站点每处都要到位）。
+     */
+    refresh: async () => {
+      const available = await pool.getAvailableAccount(AUTOCLAW_INTL.id, '')
+      if (available) {
+        await autoclawIntl.refreshAccountCredential(
+          available.entry.credentialRef, pool, available.entry.id,
+        )
+      } else {
+        await autoclawIntl.refresh()
+      }
+    },
   })
 
   const accio = new AccioAuth(ctx)
