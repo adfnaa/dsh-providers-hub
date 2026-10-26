@@ -301,9 +301,12 @@ async function convergeOnce(): Promise<void> {
   //   `listen()`，已建立连接不受影响）⇒ 空窗期缩到近乎为零；
   // - 排水**不阻塞**换绑：`void` 出去，新实例立刻能起。旧实例多活一会儿没有任何
   //   用户可见成本（端口已交出、新连接已由新实例接管）。
+  // ⚠️ `replaced` 标记「本轮是换绑」：换绑失败需要重试（见下面 start 的 catch）。
+  let replaced: OpenAiGateway | undefined
   if (running !== undefined) {
     const stale = running
     running = undefined
+    replaced = stale
     // ⚠️ `detachListen` 是**同步**的，且必须在起新实例**之前**调用（否则端口还被
     // 旧实例占着 ⇒ 新实例 `listen` 撞 EADDRINUSE）。
     try {
@@ -363,6 +366,35 @@ async function convergeOnce(): Promise<void> {
   } catch (error) {
     running = undefined
     failure = error
+    // ⚠️⚠️ **换绑失败必须重试一次**（Gitee IKQODR 缺陷 2 的修复引入的新失败模式，
+    // 自查实测）：换绑的第一步 `detachListen()` 已经把**旧实例的端口交出去了**，
+    // 此时若新实例 `start()` 失败（端口被外部进程抢、或内核尚未回收），网关就
+    // **完全没有监听**，而旧实例还在后台排水、不会自动恢复 —— 这比修复前更糟
+    // （修复前旧实例至少还在监听）。
+    //
+    // 实测复现：`g1.detachListen()` → 外部占端口 → `g2.start()` 抛
+    // `listen EADDRINUSE` ⇒ 端口此刻 `EADDRINUSE`（既不是 g1 也不是 g2 在服务）。
+    //
+    // 为什么重试有意义：`detachListen()` 是**同步**释放端口的，但内核回收有
+    // 极短延迟；第一次失败往往就是这个窗口。重试一次（换新实例、新 socket）
+    // 能把「换绑后无监听」压到近乎不可能。仍失败则如实记 `lastError`。
+    if (replaced !== undefined) {
+      const retry = factory()
+      if (retry !== undefined) {
+        starting = retry
+        try {
+          await retry.start()
+          running = retry
+          failure = undefined
+          console.warn('[openai-gateway] 换绑后首次启动失败，重试成功')
+        } catch (retryError) {
+          failure = retryError
+          // 重试也失败 ⇒ 如实上报（下面统一记 lastError）
+        } finally {
+          starting = undefined
+        }
+      }
+    }
   } finally {
     starting = undefined
   }

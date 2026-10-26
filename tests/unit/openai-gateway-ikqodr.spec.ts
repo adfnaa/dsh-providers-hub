@@ -149,3 +149,72 @@ describe('IKQODR 缺陷2 修复验收', () => {
     expect(elapsed).toBeLessThan(2000)
   }, 40000)
 })
+
+/**
+ * ★★ 换绑失败**必须重试**（自查发现的新失败模式）。
+ *
+ * 换绑的第一步 `detachListen()` 已经把**旧实例的端口交出去了**。此时若新实例
+ * `start()` 失败（端口被外部进程抢、或内核尚未回收），网关就**完全没有监听**，
+ * 而旧实例还在后台排水、不会自动恢复 —— **这比修复前更糟**（修复前旧实例至少
+ * 还在监听）。
+ *
+ * 实测复现：`g1.detachListen()` → 外部占端口 → `g2.start()` 抛 `EADDRINUSE`
+ * ⇒ 端口此刻 `EADDRINUSE`（既不是 g1 也不是 g2 在服务）。
+ *
+ * 修法：换绑路径（`replaced !== undefined`）首次 start 失败后**换新实例重试一次**
+ * —— `detachListen()` 是同步释放端口的，第一次失败往往就是内核回收的极短窗口。
+ */
+describe('IKQODR：换绑失败必须重试（不留「无监听」状态）', () => {
+  it('★★ 换绑时首次 start 失败 ⇒ 重试后必须仍在监听', async () => {
+    const runtime = await import('../../src/openai-gateway/runtime.js')
+    let starts = 0
+    let failNext = false
+    runtime.registerGatewayFactory((() => ({
+      async start() {
+        starts += 1
+        if (failNext) { failNext = false; throw new Error('listen EADDRINUSE (模拟)') }
+      },
+      detachListen() {},
+      async close() {},
+      address() { return { host: '127.0.0.1', port: 8326 } },
+      apiKey: null,
+    })) as never)
+    runtime.setGatewayDesiredEnabled(true)
+    runtime.setGatewayDesiredAllowLan(false)
+    await runtime.applyGatewayDesiredState()
+    expect(runtime.isGatewayRunning()).toBe(true)
+
+    // 换绑 + 让首次 start 失败一次
+    failNext = true
+    const before = starts
+    runtime.setGatewayDesiredAllowLan(true)
+    await runtime.applyGatewayDesiredState()
+
+    expect(runtime.isGatewayRunning()).toBe(true)
+    // 首次失败 + 重试成功 ⇒ 至少 2 次
+    expect(starts - before).toBeGreaterThanOrEqual(2)
+  }, 20_000)
+
+  it('★ 首次启动失败（非换绑）不得重试（没有旧实例要救）', async () => {
+    const runtime = await import('../../src/openai-gateway/runtime.js')
+    // ⚠️ 必须从「干净状态」开始：前一个用例可能留下 running 实例，那样本轮会走
+    // **换绑**分支（有旧实例要救）⇒ 重试是**正确**行为，本用例就变成测错对象。
+    // 实测踩过：前一个用例的假实例 `address()` 恒返回回环地址，而期望态是
+    // wildcard ⇒ 永远失配 ⇒ 每次收敛都走换绑分支 ⇒ starts 变 2（假红）。
+    await runtime.disposeGatewayRuntime()
+    let starts = 0
+    runtime.registerGatewayFactory((() => ({
+      async start() { starts += 1; throw new Error('boom') },
+      detachListen() {},
+      async close() {},
+      address() { return { host: '127.0.0.1', port: 8326 } },
+      apiKey: null,
+    })) as never)
+    runtime.setGatewayDesiredEnabled(true)
+    runtime.setGatewayDesiredAllowLan(false)
+    await runtime.applyGatewayDesiredState()
+    expect(runtime.isGatewayRunning()).toBe(false)
+    // ⚠️ 非换绑路径不该重试 —— 否则「端口被永久占用」会变成每次收敛都白发两发
+    expect(starts).toBe(1)
+  }, 20_000)
+})
