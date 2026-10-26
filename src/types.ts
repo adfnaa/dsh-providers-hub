@@ -1751,6 +1751,39 @@ export interface RpcGatewayStatusResponse {
    * - `none`：两者都拿不到，目录必然为空
    */
   modelsSource: 'catalog' | 'adapters' | 'none'
+  /**
+   * 期望运行**却没能监听**的原因（Issue #11 的建议 ②）。
+   *
+   * ⚠️ 存在的理由：`running: false` 有四种完全不同的成因，而面板原先只能表达
+   * 其中三种（被 env 停用 / 用户关了主开关 / 端口被占），**第四种「期望运行但
+   * 启动失败」没有任何可区分的信号** —— 它与「用户自己关了」在响应里逐字相同，
+   * 于是报障者只能看到「网关没了」，而下游全部 connection refused 又被误读成
+   * API-key 问题。
+   *
+   * 取值：
+   * - `null`：没有异常（正常在跑，或用户/ env 主动关闭）
+   * - `start-failed`：`shouldRun` 为真但 `start()` 失败（端口冲突等），
+   *   `reason` 带上游错误原文（如 `listen EADDRINUSE ...`）
+   * - `factory-missing`：插件装配异常，压根没有可用的网关实例工厂
+   */
+  lastError: RpcGatewayLastError | null
+}
+
+/** 网关「期望运行但未监听」的结构化原因（见 {@link RpcGatewayStatusResponse.lastError}）。 */
+export interface RpcGatewayLastError {
+  kind: 'start-failed' | 'factory-missing'
+  /** 上游错误原文（`start-failed` 时必有；`factory-missing` 时为说明文案）。 */
+  reason: string
+  /**
+   * 该失败发生的时刻（`Date.now()`）。
+   *
+   * ⚠️ 存在的理由（对抗审计 P1-2）：`disposeGatewayRuntime()` 收尾时要清掉
+   * 「上一轮遗留」的失败痕迹，但**不能**清掉「本轮 dispose 期间新一轮收敛真的
+   * 失败」的那条（实测：dispose 在飞时新收敛撞 `EADDRINUSE`，尾巴把它清成 null
+   * ⇒ 面板显示「网关已关闭」，真因丢失）。时间戳让这个判据可判，且比比较对象
+   * 引用更稳（新一轮可能写入形状相同的对象）。
+   */
+  at: number
 }
 
 /** RPC: 网关可用的模型条目（设置页内嵌展示用）。 */

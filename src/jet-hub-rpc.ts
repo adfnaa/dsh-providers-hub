@@ -32,6 +32,7 @@ import {
   applyGatewayDesiredState,
   gatewayAddress,
   gatewayApiKey,
+  gatewayLastError,
   isGatewayRunning,
   setGatewayDesiredAllowLan,
   setGatewayDesiredEnabled,
@@ -8254,6 +8255,9 @@ function registerJetHubEndpoints(
           // 被 env 停用时即使 `enabled` 为真也不会监听，此时**不**回显地址，
           // 否则设置页会显示一个根本连不上的 URL。
           address,
+          // 「期望运行但没监听」的结构化原因（Issue #11 建议 ②）：
+          // `running: false` 本身分不清「用户关的」与「起不来的」。
+          lastError: await degrade('失败原因', () => gatewayLastError(), null),
           // ⚠️ 明文凭据：只用于设置页展示与复制，**不进日志**。
           apiKey: apiKey === null
             ? null
@@ -8318,6 +8322,8 @@ function registerJetHubEndpoints(
           allowLan: pool.gatewayAllowLan(),
           hostFromEnv: isGatewayHostFromEnv(process.env),
           address: blockedByEnv ? null : gatewayAddress() ?? null,
+          // 「期望运行但没监听」的结构化原因（Issue #11 建议 ②）。
+          lastError: gatewayLastError(),
           apiKey: key === null ? null : { value: key.value, fromEnv: key.fromEnv, path: key.path },
           models,
           modelsSource,
@@ -8376,6 +8382,8 @@ function registerJetHubEndpoints(
           allowLan: pool.gatewayAllowLan(),
           hostFromEnv,
           address: blockedByEnv ? null : gatewayAddress() ?? null,
+          // 「期望运行但没监听」的结构化原因（Issue #11 建议 ②）。
+          lastError: gatewayLastError(),
           apiKey: key === null ? null : { value: key.value, fromEnv: key.fromEnv, path: key.path },
           models,
           modelsSource,

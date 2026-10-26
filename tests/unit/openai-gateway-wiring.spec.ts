@@ -105,8 +105,20 @@ afterEach(async () => {
   rmSync(home, { recursive: true, force: true })
 })
 
-/** 让出若干个微任务轮次，等 `applyGatewayDesiredState()` 这条异步链走完。 */
+/**
+ * 让出足够的事件循环轮次，等 `applyGatewayDesiredState()` 这条异步链走完。
+ *
+ * ⚠️ **必须包含真实 I/O tick，不能只让出 microtask**（2026-10-26，Issue #11 审计）：
+ * 网关的 `start()` 最终是 `server.listen(...)` + 等 `'listening'` 事件 —— 那是
+ * **I/O 事件**，只在真实 tick 里发生。原先这里只 `await Promise.resolve()` 10 次，
+ * 当时能过是因为 `running` 在 `await start()` **之前**就被赋值（`isGatewayRunning()`
+ * 提前为 true）—— 那本身是缺陷（审计 P0-2：面板会渲染一个连不上的 URL）。
+ * 把 `running` 改成「start 成功后才赋值」后，只让 microtask 就等不到它。
+ */
 async function settle(): Promise<void> {
+  for (let i = 0; i < 10; i++) await Promise.resolve()
+  // 真实 I/O tick（listen 完成 + 'listening' 回调）。
+  await new Promise<void>((resolve) => setTimeout(resolve, 0))
   for (let i = 0; i < 10; i++) await Promise.resolve()
 }
 

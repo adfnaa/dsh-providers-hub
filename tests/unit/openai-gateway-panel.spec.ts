@@ -281,6 +281,42 @@ describe('本机网关面板的文案与判定', () => {
     expect(gatewayStatusLines(ENV_BLOCKED).join()).toContain('DSH_OPENAI_GATEWAY_ENABLED')
   })
 
+  it('★ 四条「没在监听」文案必须**全部**转述 lastError（Issue #11 审计 P1-1）', () => {
+    // ⚠️ 本文件有**四条**文案都在描述「已选择开启但没在监听」。PR 起初只给两条
+    // 接了 `lastError`，另两条仍印「通常是端口被占用」这个**猜测** —— 这正是
+    // 本 PR 声称要消除的那句话，而 `gatewayButtonTitle` 是**真实渲染的页头
+    // tooltip**。这条用例把四条一起钉住，防止将来只补其中几条。
+    const reason = 'listen EADDRINUSE: address already in use'
+    const failed = {
+      enabled: true,
+      running: false,
+      blockedByEnv: false,
+      allowLan: false,
+      hostFromEnv: false,
+      address: null,
+      apiKey: null,
+      models: [],
+      modelsSource: 'none',
+      lastError: { kind: 'start-failed', reason, at: 1 },
+    }
+    // ① 状态行
+    expect(gatewayStatusLines(failed).join('\n')).toContain(reason)
+    // ② 主开关切换提示
+    expect(gatewayToggleNotice(failed, true)).toContain(reason)
+    // ③ 页头 tooltip（审计指出这条此前完全没接）
+    expect(gatewayButtonTitle(failed)).toContain(reason)
+    // ④ 局域网开关切换提示（审计指出这条此前把用户指向「先开总开关」，归因错误）
+    expect(gatewayAllowLanToggleNotice(failed, true)).toContain(reason)
+
+    // ⚠️ 反向对照：没有 lastError 时四条都必须回落到**通用**提示（而不是空串/
+    // 也不该凭空编原因）——否则上面的断言在「无条件都说失败」的实现下也会绿。
+    const noReason = { ...failed, lastError: null }
+    expect(gatewayStatusLines(noReason).join('\n')).toContain('端口被其它程序占用')
+    expect(gatewayToggleNotice(noReason, true)).toContain('端口是否被占用')
+    expect(gatewayButtonTitle(noReason)).toContain('端口被占用')
+    expect(gatewayAllowLanToggleNotice(noReason, true)).toContain('先打开网关总开关')
+  })
+
   it('状态未读取时开关禁用，避免用户对着未知状态做操作', () => {
     expect(gatewaySwitchDisabled(null)).toBe(true)
   })
@@ -1523,6 +1559,30 @@ describe('「允许局域网访问」开关的判定与文案', () => {
     expect(gatewayAllowLanToggleNotice({
       ...base, running: false, allowLan: true, hostFromEnv: false, address: null,
     }, true)).toContain('没有在监听')
+  })
+
+  it('★ 翻 LAN 开关失败时必须转述真实原因，不得把用户指向「先开总开关」（Issue #11）', () => {
+    // ⚠️ 这条锁的是**错误归因**：翻 LAN 开关时网关总开关**本来就是开的**
+    // （用户刚点的就是 LAN 开关），而换绑自身可能失败（要关旧实例再重建）。
+    // 原先一律回「先打开网关总开关」⇒ 把用户指向一个已经满足的条件。
+    const withReason = gatewayAllowLanToggleNotice({
+      ...base,
+      running: false,
+      allowLan: true,
+      hostFromEnv: false,
+      address: null,
+      lastError: { kind: 'start-failed', reason: 'listen EADDRINUSE: address already in use' },
+    }, true)
+    expect(withReason).toContain('EADDRINUSE')
+    expect(withReason).toContain('换绑失败')
+    expect(withReason).not.toContain('先打开网关总开关')
+
+    // 反向对照：没有 lastError 时才允许说「先打开总开关」——
+    // 否则上一条断言在「无条件都说换绑失败」的实现下也会绿（无牙）。
+    const withoutReason = gatewayAllowLanToggleNotice({
+      ...base, running: false, allowLan: true, hostFromEnv: false, address: null, lastError: null,
+    }, true)
+    expect(withoutReason).toContain('先打开网关总开关')
   })
 
   it('★ 绑 0.0.0.0 时状态行必须教用户把地址换成局域网 IP（0.0.0.0 抄走连不上）', () => {

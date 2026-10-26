@@ -34,6 +34,9 @@
  *   （此时局域网开关不生效，UI 必须禁用并说明）
  * @property {{ host: string, port: number } | null} address 实际监听地址
  * @property {ApiKeyInfo | null} [apiKey] 正在使用的凭据
+ * @property {{ kind: 'start-failed' | 'factory-missing', reason: string, at: number } | null} [lastError]
+ *   「期望运行但未监听」的结构化原因（Issue #11）。⚠️ 可选：老版本宿主不返回它，
+ *   所有读取点都必须容忍 `undefined`（统一走 `gatewayFailureReason()`）。
  */
 
 /**
@@ -582,6 +585,22 @@ export function gatewayEffortsCurl(endpoint) {
  * @param {GatewayStatus | null | undefined} status
  * @returns {string}
  */
+/**
+ * 从 `status.lastError` 取出**可展示的失败原因**（空串 = 没有失败原因）。
+ *
+ * ⚠️ 存在的理由（Issue #11 审计 P1-1）：本文件有**四条**文案都在描述「已选择
+ * 开启但没在监听」，而 PR 起初只给其中两条接了 `lastError` ⇒ 同一语义两套判据，
+ * 另两条仍在印「通常是端口被占用」这个**猜测**（`gatewayButtonTitle` 是真实渲染
+ * 的页头 tooltip）。抽成一个函数，四条路径共用，避免将来再加文案时又漏。
+ *
+ * @param {GatewayStatus | null | undefined} status
+ * @returns {string} 非空 = 有真实原因；空串 = 无（调用方可回落到通用提示）
+ */
+export function gatewayFailureReason(status) {
+  const reason = status?.lastError?.reason
+  return typeof reason === 'string' && reason.length > 0 ? reason : ''
+}
+
 export function gatewayButtonTitle(status) {
   if (!status) return '本机 OpenAI 网关：读取状态中。'
   if (status.blockedByEnv) {
@@ -589,7 +608,13 @@ export function gatewayButtonTitle(status) {
       + '在这里改开关不会让它监听端口。'
   }
   if (status.running) return `本机 OpenAI 网关：运行中（${gatewayEndpoint(status)}）。`
-  if (status.enabled) return '本机 OpenAI 网关：已选择开启，但当前未在监听（通常是端口被占用）。'
+  if (status.enabled) {
+    // ⚠️ 页头 tooltip 也必须转述真实原因（Issue #11 审计 P1-1）：原先无条件说
+    // 「通常是端口被占用」—— 那是**猜的**，真实原因可能是配置/密钥初始化失败。
+    const reason = gatewayFailureReason(status)
+    if (reason !== '') return `本机 OpenAI 网关：已选择开启，但启动失败（${reason}）。`
+    return '本机 OpenAI 网关：已选择开启，但当前未在监听（通常是端口被占用）。'
+  }
   return '本机 OpenAI 网关：已关闭。'
 }
 
@@ -775,7 +800,13 @@ export function gatewayStatusLines(status) {
   if (status.enabled) {
     return [
       '已选择开启，但网关当前没有在监听。',
-      '最常见的原因是端口被其它程序占用 —— 换 DSH_OPENAI_GATEWAY_PORT 后重启即可。',
+      // ⚠️ 有真实原因时**如实转述**（Issue #11 建议 ②）。原先这句「最常见的原因
+      // 是端口被其它程序占用」是**猜的**：当真实原因是「配置/密钥初始化失败」或
+      // 「插件没注册工厂」时，用户会照着它去查端口，永远查不出问题 —— 报障者正是
+      // 因此把它误读成 API-key 问题。宿主侧现在回传 `lastError`。
+      ...(gatewayFailureReason(status) !== ''
+        ? [`启动失败的原因：${gatewayFailureReason(status)}`]
+        : ['最常见的原因是端口被其它程序占用 —— 换 DSH_OPENAI_GATEWAY_PORT 后重启即可。']),
     ]
   }
   return ['网关已关闭，不会监听任何端口。']
@@ -873,6 +904,13 @@ export function gatewayAllowLanToggleNotice(status, nextAllowLan) {
   if (status?.running) {
     return '已改绑 0.0.0.0：其它设备用「这台电脑的局域网 IP:8326/v1」+ API Key 访问。'
   }
+  // ⚠️ 翻 LAN 开关**自己就可能失败**（Issue #11 的真实场景：换绑要关旧实例再重建，
+  // 而 close() 曾挂在在途连接上）。原先这里一律说「先打开网关总开关」—— 但总开关
+  // **本来就是开的**（用户刚点的是 LAN 开关），于是这条提示把用户指向一个已经满足
+  // 的条件，真正的失败原因被藏起来。与 `gatewayToggleNotice` 同轴。
+  if (gatewayFailureReason(status) !== '') {
+    return `已保存选择，但网关换绑失败：${gatewayFailureReason(status)}`
+  }
   return '已选择允许局域网访问，但网关当前没有在监听（先打开网关总开关）。'
 }
 
@@ -889,5 +927,10 @@ export function gatewayToggleNotice(status, nextEnabled) {
   }
   if (!nextEnabled) return '网关已关闭，不再监听端口。'
   if (status?.running) return `网关已启动：${gatewayEndpoint(status)}`
+  // ⚠️ 同样如实转述真实原因（Issue #11 建议 ②）：只说「请检查端口」会把
+  // 「密钥/配置初始化失败」这类原因藏起来，用户永远查不到。
+  if (gatewayFailureReason(status) !== '') {
+    return `已选择开启，但网关启动失败：${gatewayFailureReason(status)}`
+  }
   return '已选择开启，但网关没有在监听，请检查端口是否被占用。'
 }
