@@ -39,6 +39,7 @@ import {
   calculateAutoclawSign,
   type AutoclawCredential,
 } from './autoclaw.js'
+import { refreshAutoclawToken } from './autoclaw-oauth.js'
 
 export const AUTOCLAW_WALLETS_PATH = '/agent-assetmgr/api/v2/wallets'
 export const AUTOCLAW_LEDGERS_PATH = '/agent-assetmgr/api/v1/ledgers_std'
@@ -632,8 +633,79 @@ export async function fetchAutoclawCreditBalance(
 }
 
 /**
+ * 领取前先做一次 **token 刷新**（= 服务端眼里的「登录」）。
+ *
+ * ## ⚠️⚠️ 为什么这是必需的（2026-10-27 真机取证，用户报障「1 亿 Tokens 领不到」）
+ *
+ * AutoClaw 的活动奖励**不是**由 `user-info` 本身发放的，而是由「**登录事件**」触发：
+ * 官方客户端的实现（`AutoClaw2/resources/app/dist/main.cjs` → `claimDailyCreditsOnSignIn`）是
+ * **监听登录状态**，一旦进入 `authenticated` 就调一次 `user-info`：
+ *
+ * ```js
+ * function claimDailyCreditsOnSignIn(account, dailyCredits) {
+ *   let previous = account.snapshot().status
+ *   account.subscribe((snapshot) => {
+ *     const entered = snapshot.status === 'authenticated' && previous !== 'authenticated'
+ *     previous = snapshot.status
+ *     if (entered) void dailyCredits.claim()   // → POST /userapi/v1/user-info
+ *   })
+ * }
+ * ```
+ *
+ * 也就是说：**服务端把「签发 token」当作「登录」**，之后那次 `user-info` 才发放
+ * `autoclaw_user_active_reward_*` 这类登录奖励。
+ *
+ * 而本插件此前**只用存量 access_token 调 `user-info`** —— 在服务端看来这不是一次
+ * 登录，于是活动奖励永远不发。真机对照（同一账号、同一端点，仅差一次 refresh）：
+ *
+ * | 调用 | 结果 |
+ * |---|---|
+ * | 存量 token → `user-info` | `code: 0`，只有每日签到，无活动奖励 |
+ * | `POST /userapi/v1/refresh` → `user-info` | **立刻 +10000 积分**（`autoclaw_user_active_reward_202609`） |
+ *
+ * ## 为什么**不落盘**新 token
+ *
+ * 实测 refresh **不轮换 `refresh_token`**，且**旧 `access_token` 刷新后仍有效**
+ * （刷新后用它查余额仍 `code: 0`）⇒ 本次领完即可丢弃新 token，
+ * 不必把「新凭据」从 `claim` 冒泡到调用方（那要改 `ClaimOutcome` 契约与
+ * `provider-credits` 的 `claim` 签名，代价远大于收益）。
+ * 下次签到会再刷新一次，得到新的登录事件 —— 这正是我们要的语义。
+ *
+ * @returns 新 `access_token`；**拿不到就返回 `undefined`**（调用方降级用原 token）。
+ */
+async function refreshTokenForLoginEvent(
+  credential: AutoclawCredential,
+  product: AutoclawProduct,
+  deviceId: string,
+  fetcher: typeof fetch,
+): Promise<string | undefined> {
+  const refreshToken = cleanToken(credential.refresh_token)
+  // 没有 refresh_token（老凭据 / 手工导入）⇒ 静默跳过，不阻塞签到。
+  if (!refreshToken) return undefined
+  try {
+    const fresh = await refreshAutoclawToken(refreshToken, {
+      product,
+      fetchImpl: fetcher,
+      deviceId,
+    })
+    return cleanToken(fresh.access_token) || undefined
+  } catch {
+    /**
+     * ⚠️ **刷新失败绝不阻断签到**（降级用原 token 继续）：
+     * 签到本身仍有价值（每日额度），而活动奖励是增量。
+     * 把「登录事件」失败升级成签到失败，等于用一个新功能打坏一个老功能。
+     */
+    return undefined
+  }
+}
+
+/**
  * 执行 AutoClaw 每日签到领额度。
  * 遵循 POST /userapi/v1/user-info 规范，不抛出异常。
+ *
+ * ⚠️ 调用前会先刷新一次 token —— 那是服务端认定的「登录」事件，
+ *    活动奖励（如「1 亿 Tokens」）只在那之后的那次签到请求上发放。
+ *    详见 {@link refreshTokenForLoginEvent}。
  */
 export async function claimAutoclawDailyQuota(
   credential: AutoclawCredential,
@@ -658,13 +730,23 @@ export async function claimAutoclawDailyQuota(
     ?? credential.device_id
     ?? randomUUID()
 
+  /**
+   * ★ **先刷新（= 一次登录）再签到** —— 活动奖励依赖这个顺序。
+   *
+   * ⚠️ 顺序不可颠倒：服务端在「签发 token」时记下登录，由**紧随其后**的
+   *    `user-info` 触发发放。反过来（先 user-info 再 refresh）只会白发一次
+   *    签到请求，活动奖励落空。
+   */
+  const refreshedToken = await refreshTokenForLoginEvent(credential, product, deviceId, fetcher)
+  const claimToken = refreshedToken ?? token
+
   const url = `${product.apiBase}${AUTOCLAW_DAILY_CLAIM_PATH}`
   const body = {
     source_id: AUTOCLAW_SOURCE_ID,
     device_id: deviceId,
   }
   try {
-    const headers = buildAutoclawCreditsHeaders(product, token)
+    const headers = buildAutoclawCreditsHeaders(product, claimToken)
     const resp = await fetcher(url, {
       method: 'POST',
       headers,

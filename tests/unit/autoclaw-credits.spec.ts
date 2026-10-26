@@ -213,6 +213,8 @@ describe('claimAutoclawDailyQuota', () => {
   function makeFetcher(opts: {
     claimData: Record<string, unknown>
     walletTotal?: number
+    /** 让 refresh 端点失败（用来验证「刷新失败仍能签到」的降级路径）。 */
+    refreshFails?: boolean
   }) {
     return vi.fn().mockImplementation((url: string) => {
       if (String(url).includes(AUTOCLAW_WALLETS_PATH)) {
@@ -230,6 +232,26 @@ describe('claimAutoclawDailyQuota', () => {
               display: true,
               priority: 10,
             }],
+          },
+        }))
+      }
+      /**
+       * ★ `claimAutoclawDailyQuota` 在签到**之前**会先调 refresh（= 登录事件）。
+       * 必须显式应答它：否则真实生产路径上的「先刷新再签到」序列在测试里
+       * 会退化成「刷新连续失败 + 降级」，测的就不是生产行为了。
+       */
+      if (String(url).includes('/userapi/v1/refresh') || String(url).includes('/userapi/v1/agent-refresh')) {
+        if (opts.refreshFails) {
+          return Promise.resolve(jsonResponse({ code: 401, msg: 'refresh token invalid' }))
+        }
+        return Promise.resolve(jsonResponse({
+          code: 0,
+          msg: 'SUCCESS',
+          data: {
+            access_token: 'refreshed-access-token',
+            refresh_token: 'refreshed-refresh-token',
+            expires_in: 3600,
+            expires_at: Date.now() + 3_600_000,
           },
         }))
       }
@@ -259,15 +281,35 @@ describe('claimAutoclawDailyQuota', () => {
     // ⚠️ 这条才是防「+0 被误解」的判据。
     expect((outcome as { delayedMessage?: string }).delayedMessage).toContain('上游不返回积分数量')
 
-    // ⚠️ **只发一次请求**（只有领取接口，不读钱包）。
-    expect(fetcher).toHaveBeenCalledTimes(1)
-    const [url, init] = fetcher.mock.calls[0] as [string, RequestInit]
+    /**
+     * ⚠️ 现在是**两次**请求：refresh（登录事件）+ 领取。
+     *
+     * 不再读钱包 —— 那一点仍要守住（见下面的 wallets 断言）。
+     */
+    expect(fetcher).toHaveBeenCalledTimes(2)
+    const urls = fetcher.mock.calls.map((c) => String(c[0]))
+    expect(urls.filter((u) => u.includes(AUTOCLAW_WALLETS_PATH))).toHaveLength(0)
+
+    // ★ 关键顺序：refresh 必须**先于**领取（服务端在签发 token 时记「登录」）
+    const claimIdx = urls.findIndex((u) => u.includes(AUTOCLAW_DAILY_CLAIM_PATH))
+    const refreshIdx = urls.findIndex((u) => u.includes('/userapi/v1/refresh'))
+    expect(refreshIdx).toBeGreaterThanOrEqual(0)
+    expect(refreshIdx).toBeLessThan(claimIdx)
+
+    const [url, init] = fetcher.mock.calls[claimIdx] as [string, RequestInit]
     expect(url).toBe(`${AUTOCLAW.apiBase}${AUTOCLAW_DAILY_CLAIM_PATH}`)
     expect(init.method).toBe('POST')
     expect(JSON.parse(init.body as string)).toEqual({
       source_id: 'autoclaw',
       device_id: MOCK_CREDENTIAL.device_id,
     })
+    /**
+     * ★★ 领取必须用**刷新后的** token：那正是「登录事件」在服务端的凭据。
+     * 用原 token 会在服务端看来仍是「未登录的新请求」，活动奖励不发
+     * （2026-10-27 真机对照：同一账号，仅差这一次 refresh，结果差 10000 积分）。
+     */
+    const claimHeaders = init.headers as Record<string, string>
+    expect(claimHeaders.Authorization).toContain('refreshed-access-token')
   })
 
   it('⚠️ 凭据没有 device_id 时**不得**回落到固定常量（会共用假设备号）', async () => {
@@ -308,11 +350,96 @@ describe('claimAutoclawDailyQuota', () => {
     expect(urls.filter((u) => u.includes(AUTOCLAW_WALLETS_PATH))).toHaveLength(0)
   })
 
+  /**
+   * ★★ **刷新（登录事件）先于签到**（2026-10-27 真机取证）。
+   *
+   * 用户报障原文：「说的登录就有」（官方活动「1 亿 Tokens 登录即领」领不到）。
+   *
+   * 根因：官方客户端（`main.cjs` 的 `claimDailyCreditsOnSignIn`）监听**登录状态**，
+   * 一进入 `authenticated` 就调一次 `user-info`；服务端把「**签发 token**」当作登录，
+   * 之后那次 `user-info` 才发放 `autoclaw_user_active_reward_*`。
+   * 本插件此前只用存量 token 调 `user-info` ⇒ 服务端眼里从没登录过 ⇒ 奖励不发。
+   *
+   * 真机对照（同一账号、同一端点）：存量 token → 只有每日签到；
+   * `refresh` → `user-info` ⇒ **立刻 +10000 积分**。
+   */
+  it('★ 领取前先刷新 token（服务端据此认定「登录」并发放活动奖励）', async () => {
+    const fetcher = makeFetcher({
+      claimData: { uid: 'user_123', daily_check_in_completed_on_request: true },
+    })
+
+    await claimAutoclawDailyQuota(MOCK_CREDENTIAL, {
+      product: AUTOCLAW,
+      fetcher: fetcher as unknown as typeof fetch,
+    })
+
+    const urls = fetcher.mock.calls.map((c) => String(c[0]))
+    const refreshIdx = urls.findIndex((u) => u.includes('/userapi/v1/refresh'))
+    const claimIdx = urls.findIndex((u) => u.includes(AUTOCLAW_DAILY_CLAIM_PATH))
+    expect(refreshIdx, '必须先发 refresh').toBeGreaterThanOrEqual(0)
+    expect(refreshIdx, 'refresh 必须早于领取').toBeLessThan(claimIdx)
+
+    // refresh 的请求体要带 refresh_token 与同一个 device_id（服务端按设备记登录）
+    const [, refreshInit] = fetcher.mock.calls[refreshIdx] as [string, RequestInit]
+    const refreshBody = JSON.parse(refreshInit.body as string)
+    expect(refreshBody.refresh_token).toBe(MOCK_CREDENTIAL.refresh_token)
+    expect(refreshBody.source_id).toBe('autoclaw')
+  })
+
+  /**
+   * ⚠️★ **刷新失败绝不阻断签到**。
+   *
+   * 取舍理由：签到（每日额度）是既有价值，活动奖励是**增量**。
+   * 若把「登录事件」失败升级成签到失败，等于用一个新功能打坏一个老功能 ——
+   * 而 refresh 失败在生产上并不罕见（token 过期、上游抖动）。
+   */
+  it('★ 刷新失败时降级用原 token 继续签到（不把新功能变成新的故障点）', async () => {
+    const fetcher = makeFetcher({
+      claimData: { uid: 'user_123', daily_check_in_completed_on_request: true },
+      refreshFails: true,
+    })
+
+    const outcome = await claimAutoclawDailyQuota(MOCK_CREDENTIAL, {
+      product: AUTOCLAW,
+      fetcher: fetcher as unknown as typeof fetch,
+    })
+
+    expect(outcome.kind, '刷新失败不得让签到失败').toBe('claimed')
+
+    const calls = fetcher.mock.calls as [string, RequestInit][]
+    const claimCall = calls.find((c) => String(c[0]).includes(AUTOCLAW_DAILY_CLAIM_PATH))
+    expect(claimCall).toBeDefined()
+    // 用的仍是**原** token（没有可用的新 token）
+    expect((claimCall![1].headers as Record<string, string>).Authorization)
+      .toContain(MOCK_CREDENTIAL.access_token)
+  })
+
+  it('凭据里没有 refresh_token 时跳过刷新，只发签到请求', async () => {
+    const fetcher = makeFetcher({
+      claimData: { uid: 'user_123', daily_check_in_completed_on_request: true },
+    })
+
+    await claimAutoclawDailyQuota(
+      { ...MOCK_CREDENTIAL, refresh_token: '' },
+      { product: AUTOCLAW, fetcher: fetcher as unknown as typeof fetch },
+    )
+
+    const urls = fetcher.mock.calls.map((c) => String(c[0]))
+    expect(urls.filter((u) => u.includes('/refresh'))).toHaveLength(0)
+    expect(urls.filter((u) => u.includes(AUTOCLAW_DAILY_CLAIM_PATH))).toHaveLength(1)
+  })
+
   it('请求失败或网络异常时不抛错，返回 failed 状态', async () => {
-    const fetcher = vi.fn().mockResolvedValue(jsonResponse({
+    /**
+     * ⚠️ 用 `mockImplementation` 而不是 `mockResolvedValue`：`claim` 现在会先发
+     * refresh 再发签到，**两次读同一个 `Response` 对象**会抛
+     * `Body is unusable`（body 只能读一次）。真实上游每次都返回新对象，
+     * 故这里每次调用现造一个 —— mock 必须贴合真实形状，否则测的是 mock 的 bug。
+     */
+    const fetcher = vi.fn().mockImplementation(() => Promise.resolve(jsonResponse({
       code: 5001,
       msg: '签到服务繁忙',
-    }))
+    })))
 
     const outcome = await claimAutoclawDailyQuota(MOCK_CREDENTIAL, {
       fetcher: fetcher as unknown as typeof fetch,
