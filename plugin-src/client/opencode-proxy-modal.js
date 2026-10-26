@@ -103,7 +103,7 @@ export function OpencodeProxyModal({ ctx, accountId, current, onClose }) {
   const activeHint = (MODES.find((m) => m.id === mode) || {}).hint || ''
 
   return React.createElement('div', {
-    className: 'dim-jh-modalOverlay dim-jh-modalOverlay--top',
+    className: 'dim-jh-modalOverlay',
     onClick: (e) => { if (e.target === e.currentTarget) close() },
   },
     React.createElement('div', {
@@ -253,7 +253,7 @@ export function GeminiProxyModal({ ctx, accountId, current, onClose }) {
   const activeHint = (MODES.find((m) => m.id === mode) || {}).hint || ''
 
   return React.createElement('div', {
-    className: 'dim-jh-modalOverlay dim-jh-modalOverlay--top',
+    className: 'dim-jh-modalOverlay',
     onClick: (e) => { if (e.target === e.currentTarget) close() },
   },
     React.createElement('div', {
@@ -419,7 +419,7 @@ export function QoderProxyModal({ ctx, accountId, current, provider, onClose }) 
   const activeHint = (MODES.find((m) => m.id === mode) || {}).hint || ''
 
   return React.createElement('div', {
-    className: 'dim-jh-modalOverlay dim-jh-modalOverlay--top',
+    className: 'dim-jh-modalOverlay',
     onClick: (e) => { if (e.target === e.currentTarget) close() },
   },
     React.createElement('div', {
@@ -586,7 +586,7 @@ export function MinimaxIntlProxyModal({ ctx, accountId, current, onClose }) {
   const activeHint = (MODES.find((m) => m.id === mode) || {}).hint || ''
 
   return React.createElement('div', {
-    className: 'dim-jh-modalOverlay dim-jh-modalOverlay--top',
+    className: 'dim-jh-modalOverlay',
     onClick: (e) => { if (e.target === e.currentTarget) close() },
   },
     React.createElement('div', {
@@ -717,7 +717,7 @@ export function OpencodeKeyModal({ error, busy, inputRef, onSubmit, onSubmitAnon
     onSubmit(value)
   }
   return React.createElement('div', {
-    className: 'dim-jh-modalOverlay dim-jh-modalOverlay--top',
+    className: 'dim-jh-modalOverlay',
     onClick: (e) => { if (e.target === e.currentTarget && !busy && onClose) onClose() },
   },
     React.createElement('div', {

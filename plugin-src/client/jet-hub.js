@@ -57,7 +57,6 @@ import {
   disablingLeavesNoEnabledAccount,
 } from './account-model-link.js';
 import { buildCreateAccountPayload, newAccountAsksChannel } from './new-account.js';
-import { bulkButtonState } from './model-bulk.js';
 import {
   copyToClipboard,
   formatModelIdList,
@@ -126,6 +125,7 @@ import {
 import {
   groupProviders,
   nextProviderOrderAfterDrop,
+  nextProviderOrderAfterGroupDrop,
   providerSwitchRows,
   providerToggleSummary,
   sortOpenProvidersByOrder,
@@ -191,6 +191,7 @@ import {
   claimAllCompensation,
   compensationHeadline,
   compensationHint,
+  shouldShowCompensation,
 } from './compensation-panel-logic.js';
 
 export const JET_HUB_RPC_CHANNEL = '/jet-hub';
@@ -358,7 +359,7 @@ const TEST_HELP = '无条件真实发送一条最小消息给这个账号（不�
   + '只回报结果，不修改任何限流标记。会消耗少量模型额度。';
 
 /**
- * 「显示列表」按钮的说明。
+ * 「模型列表」按钮的说明。
  *
  * 措辞必须讲清两点，否则用户会以为关掉开关就等于删除模型：
  * - 关闭只是**从对话框的模型选择里隐藏**，模型本身仍然存在、可随时再打开；
@@ -367,6 +368,20 @@ const TEST_HELP = '无条件真实发送一条最小消息给这个账号（不�
 const MODEL_LIST_HELP = '列出该 Provider 的全部模型。每个模型后面的开关默认打开；'
   + '关闭后，该模型不再出现在对话框的模型选择列表里（黑名单制：只有被关闭的才隐藏，'
   + '其余含服务端新增的模型一律默认显示）。此设置持久化保存，可随时重新打开。';
+
+/**
+ * 账号管理页「排序提示」的文案（排序提示元素的正文 + title 同源）。
+ *
+ * 必须**单行显示**（用户 2026-10-26「文案改为一行显示」）：样式侧用
+ * white-space: nowrap 钉死，窄窗口下会被省略号截断。正因如此，完整文案
+ * 必须同时挂到元素的 title 上 —— 否则被截掉的后半句就再也读不到。
+ * 抽成常量是为了让正文与 title **不可能**写出两份不同的文案。
+ *
+ * 两个不可省的语义（删任一条用户就会把它当 bug）：
+ * ① 拖动 = 改选号优先级（拖动不是装饰）；② 限额账号沉底且恢复后不复位。
+ */
+const ORDER_HINT_TEXT = '拖动卡片调整排序，按顺序选号。限额账号会沉到末尾、恢复后不复位，'
+  + '避免长期占位将其他号额度放过期。';
 
 /** 把一次重测/重置的响应汇总成一行可读文案。 */
 function summarizeProbe(kind, res) {
@@ -454,21 +469,35 @@ function formatPackageLine(pkg, windowDays, now) {
  * @param windowDays - 后端 `credits.balances` 回传的「临时积分」窗口（天）。
  *   有它才显示**临时 / 长期**两桶（CodeBuddy / WorkBuddy / TRAE / LobsterAI 带）。
  */
-function CreditBalanceRow({ balance, error, loading, windowDays, provider }) {
+function CreditBalanceRow({ balance, error, loading, windowDays, provider, actions }) {
+  /**
+   * 有 `actions`（重测 / 重置 / 停用 / 删除）时，这一行是**三列**网格：
+   * `标签 | 余额 | 按钮`，按钮贴最右 —— 用户报障「底部那排按钮别单独占一行」。
+   *
+   * ⚠️ 不传 `actions` 时逐字不变（类名仍是 `dim-jh-metaRow`，仍是两列），
+   * 所以对没有操作按钮的调用方是零影响。
+   */
+  const rowProps = actions === undefined
+    ? { className: 'dim-jh-metaRow' }
+    : { className: 'dim-jh-metaRow dim-jh-metaRow--actions' };
   const all = balance?.packages || [];
   // ⚠ 单位从**包**上取（ZCode 是 token，其余是积分），标签与格式化都按它走。
   const unit = all.find(p => p && p.unit)?.unit;
   const label = unitLabel(unit);
   if (loading) {
-    return React.createElement('div', { className: 'dim-jh-metaRow' },
+    return React.createElement('div', rowProps,
       React.createElement('dt', null, label),
-      React.createElement('dd', { 'data-tone': 'muted' }, '读取中…'));
+      React.createElement('dd', { 'data-tone': 'muted' }, '读取中…'),
+      // 读取中也要挂按钮：否则按钮会在读数到达的那一瞬从右侧跳出来。
+      actions === undefined ? null : actions);
   }
   if (error || !balance) {
-    return React.createElement('div', { className: 'dim-jh-metaRow' },
+    return React.createElement('div', rowProps,
       React.createElement('dt', null, label),
       React.createElement('dd', { 'data-tone': 'warn', title: error || '查询失败' },
-        error || '查询失败'));
+        error || '查询失败'),
+      // 查询失败恰恰是最需要「重测」的时候，按钮必须还在。
+      actions === undefined ? null : actions);
   }
   const total = formatUnits(balance.total, unit) ?? '0';
   const activeCount = all.filter(p => p.active).length;
@@ -592,7 +621,7 @@ function CreditBalanceRow({ balance, error, loading, windowDays, provider }) {
         return countdown === null ? null : `每日额度 ${countdown}后刷新`;
       })()
     : null;
-  return React.createElement('div', { className: 'dim-jh-metaRow' },
+  return React.createElement('div', rowProps,
     // ⚠ 标签按单位走：ZCode 是 token，显示「Token」而不是「积分」。
     React.createElement('dt', null, label),
     React.createElement('dd', {
@@ -694,7 +723,11 @@ function CreditBalanceRow({ balance, error, loading, windowDays, provider }) {
     balance.expiredTotal > 0
       ? React.createElement('span', { className: 'dim-jh-creditExpired' },
           `另有 ${formatUnits(balance.expiredTotal, unit)} 已失效`)
-      : null));
+      : null),
+    // 操作按钮（重测 / 重置 / 停用 / 删除）贴在这行最右侧 —— 三列网格的第三列。
+    // ⚠️ 必须是 div 的直接子节点（与 dt / dd 同级）：挂进 dd 会被它的
+    //    `overflow: hidden` + `white-space: nowrap` 直接裁掉。
+    actions === undefined ? null : actions);
 }
 
 /**
@@ -787,121 +820,7 @@ function AccountCard({ account, index, order, provider, onToggle, onDelete, onRe
   const accountTitle = packageTooltip
     ?? (showPackageList && creditsLoading ? '资源包加载中…' : undefined);
 
-  return React.createElement('div', {
-    className: 'dim-jh-accountCard',
-    'data-enabled': account.enabled,
-    'data-dragging': dragProps.isDragging ? 'true' : undefined,
-    // 插入位置指示：before 画在卡片上方，after 画在下方 —— 必须与
-    // 实际落点一致，否则用户按指示拖放却得到不同结果。
-    'data-dropBefore': dragProps.isDropTarget && dragProps.dropPosition !== 'after' ? 'true' : undefined,
-    'data-dropAfter': dragProps.isDropTarget && dragProps.dropPosition === 'after' ? 'true' : undefined,
-    // 整卡可拖：抓取柄之外也能拖，手感更好；但文本选择区（凭据/时间）
-    // 仍可正常选中——HTML5 拖拽不会阻止选择。
-    draggable: dragProps.enabled ? 'true' : undefined,
-    onDragStart: dragProps.onDragStart,
-    onDragEnd: dragProps.onDragEnd,
-    onDragOver: dragProps.onDragOver,
-    onDrop: dragProps.onDrop,
-  },
-    React.createElement('div', { className: 'dim-jh-accountTop' },
-      // 抓取柄 + 序号：序号即自动选号的优先级，让"拖到第一位"的含义明确。
-      dragProps.enabled
-        ? React.createElement('span', {
-            className: 'dim-jh-dragHandle',
-            title: '拖动以调整顺序（顺序即自动选号优先级）',
-            'aria-hidden': 'true',
-          }, '⠿')
-        : null,
-      dragProps.enabled
-        ? React.createElement('span', { className: 'dim-jh-accountOrder', title: '自动选号优先级' },
-            String((order ?? index ?? 0) + 1))
-        : null,
-      React.createElement('span', {
-        className: 'dim-jh-accountStatus',
-        'data-on': account.enabled ? 'true' : 'false',
-        title: account.enabled ? '已启用' : '已停用',
-        'aria-hidden': 'true',
-      }),
-      React.createElement('span', {
-        className: 'dim-jh-accountName',
-        // 资源包列表（剩余/总量 + 到期时间）。仅 buddy 系挂，见 packageTooltip。
-        title: accountTitle,
-      },
-        account.nickname || account.id),
-      React.createElement('span', {
-        className: 'dim-jh-accountTag',
-        'data-tone': account.enabled ? 'on' : 'off',
-        // 同账号名：hover 出资源包列表（两处都挂，用户 hover 哪个都能看见）。
-        title: accountTitle,
-      }, account.enabled ? '已启用' : '已停用'),
-      // 受限标记：这张卡片被自动沉到了列表末尾，标出来才说得清「为什么它在下面」。
-      // 判据与下方「限额重置」行同源（都是未到期的 modelRateLimits）。
-      rateLimits.length > 0
-        ? React.createElement('span', {
-            className: 'dim-jh-accountTag',
-            'data-tone': 'warn',
-            title: '当前处于模型限额中。该账号不会参与自动选号，并已被沉到列表末尾；'
-              + '限额解除后仍留在末尾，避免它再次霸占首位而让其它账号的额度白白过期。',
-          }, '限额中')
-        : null,
-      // ⚠️ 匿名通道标记：它不需要 key、只用于免费模型，额度按**出口 IP** 计。
-      // 标注出来是为了让用户知道「这几条不是登录账号」，
-      // 以及为什么给它们配不同代理才会各自获得独立额度。
-      provider === 'opencode' && isAnonymousAccountId(account.id)
-        ? React.createElement('span', {
-            className: 'dim-jh-accountTag',
-            'data-tone': 'on',
-            title: '匿名通道：无需 API key，仅用于免费模型。'
-              + '额度按出口 IP 计算 —— 给它单独配置代理，才会获得独立额度。',
-          }, '匿名')
-        : null),
-    React.createElement('dl', { className: 'dim-jh-accountMeta' },
-      React.createElement('div', { className: 'dim-jh-metaRow' },
-        React.createElement('dt', null, '凭据'),
-        React.createElement('dd', null, React.createElement('code', null, account.credentialRef))),
-      React.createElement('div', { className: 'dim-jh-metaRow' },
-        React.createElement('dt', null, '有效期'),
-        React.createElement('dd', { 'data-tone': expired ? 'warn' : undefined },
-          account.expiresAt
-            ? `${formatTime(account.expiresAt) || '未知'}${account.refreshable ? ' · 自动续期' : ''}`
-            : '未知')),
-      // 账号规格（目前只有 Gemini 有）：Pro / Free / Ultra。
-      //
-      // ⚠️ 判据是 `extra.accountTier` 有值才渲染 —— 取不到档位（上游改协议、
-      // 网络失败、非 Gemini 的 provider）时**整行不出现**，不显示「未知」也不
-      // 报错：它只是一栏附注信息，不该制造一条无法修复的提示。
-      // `title` 放上游原文（`Google AI Pro（g1-pro-tier）`），面板只放得下一个词。
-      credits?.extra?.accountTier
-        ? React.createElement('div', { className: 'dim-jh-metaRow' },
-            React.createElement('dt', null, '账号规格'),
-            React.createElement('dd', { title: credits.extra.accountTier.title },
-              credits.extra.accountTier.label))
-        : null,
-      // 不支持积分余额的 provider 不渲染该行：留着它只能显示「查询失败」，
-      // 而失败原因是「这个 provider 根本没有此接口」——与其展示一条无法修复
-      // 的错误，不如不展示。
-      showCredits
-        ? React.createElement(CreditBalanceRow, {
-            balance: credits?.balance ?? null,
-            error: credits?.error,
-            loading: creditsLoading,
-            // 「临时 / 长期」分桶的窗口天数（buddy 系 + TRAE + LobsterAI 有值）。
-            windowDays,
-            // 池名分桶（loomy / raccoon）要按 provider 决定另一个池的标签。
-            provider,
-          })
-        : null),
-    rateLimits.length > 0
-      ? React.createElement('div', { className: 'dim-jh-rateLimits' },
-          React.createElement('span', { className: 'dim-jh-rateLimitsLabel' }, '限额重置'),
-          rateLimits.map(([modelId, resetAt]) =>
-            React.createElement('span', {
-              key: modelId,
-              className: 'dim-jh-ttlBadge',
-              title: `模型 ${modelId}`,
-            }, `${modelId} · ${formatTime(resetAt)}`)))
-      : null,
-    React.createElement('div', { className: 'dim-jh-accountActions' },
+  const actionsNode = React.createElement('div', { className: 'dim-jh-accountActions' },
       // 新手任务（仅 Loomy）：一次性 10000 分，每号只能领一次。
       // 与「一键领取积分」（每日签到）是**不同**的操作，故独立按钮 ——
       // 混进「一键签到」会导致每天对已领完的账号发 8 个必然 alreadyCompleted 的请求。
@@ -975,10 +894,9 @@ function AccountCard({ account, index, order, provider, onToggle, onDelete, onRe
             onClick: () => onReset(account.id),
           }, '重置')
         : null,
-      React.createElement('button', {
-        className: 'dim-jh-btn',
-        onClick: () => onToggle(account.id, !account.enabled),
-      }, account.enabled ? '停用' : '启用'),
+// ⚠️ 「停用 / 启用」按钮已**移除**（用户 2026-10-26）：该能力合并进
+      //    账号名右侧的状态徽章（点徽章即切换）。留在这里会有两个入口，
+      //    且按钮离状态显示很远 —— 用户点完还得回头找徽章确认结果。
       // ⚠️ 仅 opencode / gemini / qoder：出口代理是该 provider 独有的**账号维度**
       // 能力（其余 provider 没有这一项）。用 props 存在性开关而非
       // `provider === 'opencode'` 硬判断 —— 前者让 AccountCard 无需知道
@@ -1046,11 +964,189 @@ function AccountCard({ account, index, order, provider, onToggle, onDelete, onRe
             onClick: () => onEditModelscopeKey(account.id, account.modelscopeKeyMask || ''),
           }, '令牌')
         : null,
+      // ⚠️ **只显示垃圾桶图标**（用户 2026-10-26 要求「删除按钮改为图标」）。
+      //    ⚠️ 换成图标后有两处**必须**补上，否则是净损失：
+      //    ① `title` —— 原按钮文案「删除」自带动作语义，图标不自解释；
+      //       且这是**不可逆**操作，tooltip 必须把后果说全
+      //       （与 `onDelete` 里那句 confirm 的措辞保持一致）。
+      //    ② `aria-label` —— 图标按钮没有文字节点，`svg` 又标了 `aria-hidden`
+      //       ⇒ 不给 `aria-label` 时读屏只会念出「按钮」，用户无从知道它删号。
+      //       这是「文字改图标」最容易漏、也最难被自测发现的一处。
+      //    ⚠️ 行为一行未动（`data-kind='danger'` 也保留，危险色靠它）。
       React.createElement('button', {
-        className: 'dim-jh-btn',
+        className: 'dim-jh-btn dim-jh-iconBtn',
         'data-kind': 'danger',
+        title: '删除该账号（不可逆：关联的凭据也将被清除）',
+        'aria-label': '删除该账号',
         onClick: () => onDelete(account.id),
-      }, '删除')));
+      },
+      React.createElement('svg', {
+        width: 14,
+        height: 14,
+        viewBox: '0 0 24 24',
+        fill: 'none',
+        stroke: 'currentColor',
+        strokeWidth: 2,
+        strokeLinecap: 'round',
+        strokeLinejoin: 'round',
+        'aria-hidden': 'true',
+        focusable: 'false',
+      },
+      // 垃圾桶：盖沿 + 桶身 + 盖上的提手 + 两道竖纹
+      React.createElement('path', { d: 'M3 6h18' }),
+      React.createElement('path', { d: 'M8 6V4a1 1 0 0 1 1-1h6a1 1 0 0 1 1 1v2' }),
+      React.createElement('path', { d: 'M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6' }),
+      React.createElement('path', { d: 'M10 11v6' }),
+      React.createElement('path', { d: 'M14 11v6' }))));
+
+  return React.createElement('div', {
+    className: 'dim-jh-accountCard',
+    'data-enabled': account.enabled,
+    'data-dragging': dragProps.isDragging ? 'true' : undefined,
+    // 插入位置指示：before 画在卡片上方，after 画在下方 —— 必须与
+    // 实际落点一致，否则用户按指示拖放却得到不同结果。
+    'data-dropBefore': dragProps.isDropTarget && dragProps.dropPosition !== 'after' ? 'true' : undefined,
+    'data-dropAfter': dragProps.isDropTarget && dragProps.dropPosition === 'after' ? 'true' : undefined,
+    // 整卡可拖：抓取柄之外也能拖，手感更好；但文本选择区（凭据/时间）
+    // 仍可正常选中——HTML5 拖拽不会阻止选择。
+    draggable: dragProps.enabled ? 'true' : undefined,
+    onDragStart: dragProps.onDragStart,
+    onDragEnd: dragProps.onDragEnd,
+    onDragOver: dragProps.onDragOver,
+    onDrop: dragProps.onDrop,
+  },
+    React.createElement('div', { className: 'dim-jh-accountTop' },
+      // 抓取柄 + 序号：序号即自动选号的优先级，让"拖到第一位"的含义明确。
+      dragProps.enabled
+        ? React.createElement('span', {
+            className: 'dim-jh-dragHandle',
+            title: '拖动以调整顺序（顺序即自动选号优先级）',
+            'aria-hidden': 'true',
+          }, '⠿')
+        : null,
+      dragProps.enabled
+        ? React.createElement('span', { className: 'dim-jh-accountOrder', title: '自动选号优先级' },
+            String((order ?? index ?? 0) + 1))
+        : null,
+      React.createElement('span', {
+        className: 'dim-jh-accountStatus',
+        'data-on': account.enabled ? 'true' : 'false',
+        title: account.enabled ? '已启用' : '已停用',
+        'aria-hidden': 'true',
+      }),
+      React.createElement('span', {
+        className: 'dim-jh-accountName',
+        // 资源包列表（剩余/总量 + 到期时间）。仅 buddy 系挂，见 packageTooltip。
+        title: accountTitle,
+      },
+        account.nickname || account.id),
+/**
+       * 状态徽章 = **唯一的启停入口**（用户 2026-10-26：「将停用按钮功能
+       * 合并到右上角的已启用，点击后账号已启用/停用切换」）。
+       *
+       * ⚠️ 用 `span` + `role="button"` 而不是 `<button>`：`dim-jh-accountTag`
+       * 的胶囊外观（圆角 / 内边距 / 字号）是按 span 的盒模型调的，
+       * 换成 button 会带上浏览器默认的 border 与 font，得整段覆盖。
+       * ⚠️ 键盘可达性靠 `tabIndex` + `onKeyDown`，否则它就成了只能用
+       * 鼠标点的控件（原来那个真 `<button>` 是可达的，不能倒退）。
+       */
+      React.createElement('span', {
+        className: 'dim-jh-accountTag',
+        'data-tone': account.enabled ? 'on' : 'off',
+        'data-clickable': 'true',
+        role: 'button',
+        tabIndex: 0,
+        /**
+         * ⚠️ title 必须**同时**说清「当前状态」与「点了会怎样」。
+         * 只写「已启用」的话用户根本不知道它能点 —— 这正是本次合并的
+         * 关键落差：原按钮的文案「停用」本身就是动作，而徽章的文字是状态。
+         */
+        title: [
+          accountTitle,
+          `当前${account.enabled ? '已启用' : '已停用'}，点击${account.enabled ? '停用' : '启用'}该账号`,
+        ].filter(Boolean).join('\n\n'),
+        onClick: () => onToggle(account.id, !account.enabled),
+        onKeyDown: (event) => {
+          if (event.key !== 'Enter' && event.key !== ' ') return;
+          // ⚠️ 空格键默认会滚动页面，必须拦下。
+          event.preventDefault();
+          onToggle(account.id, !account.enabled);
+        },
+      }, account.enabled ? '已启用' : '已停用'),
+      // 受限标记：这张卡片被自动沉到了列表末尾，标出来才说得清「为什么它在下面」。
+      // 判据与下方「限额重置」行同源（都是未到期的 modelRateLimits）。
+      rateLimits.length > 0
+        ? React.createElement('span', {
+            className: 'dim-jh-accountTag',
+            'data-tone': 'warn',
+            title: '当前处于模型限额中。该账号不会参与自动选号，并已被沉到列表末尾；'
+              + '限额解除后仍留在末尾，避免它再次霸占首位而让其它账号的额度白白过期。',
+          }, '限额中')
+        : null,
+      // ⚠️ 匿名通道标记：它不需要 key、只用于免费模型，额度按**出口 IP** 计。
+      // 标注出来是为了让用户知道「这几条不是登录账号」，
+      // 以及为什么给它们配不同代理才会各自获得独立额度。
+      provider === 'opencode' && isAnonymousAccountId(account.id)
+        ? React.createElement('span', {
+            className: 'dim-jh-accountTag',
+            'data-tone': 'on',
+            title: '匿名通道：无需 API key，仅用于免费模型。'
+              + '额度按出口 IP 计算 —— 给它单独配置代理，才会获得独立额度。',
+          }, '匿名')
+        : null),
+    React.createElement('dl', { className: 'dim-jh-accountMeta' },
+      React.createElement('div', { className: 'dim-jh-metaRow' },
+        React.createElement('dt', null, '凭据'),
+        React.createElement('dd', null, React.createElement('code', null, account.credentialRef))),
+      React.createElement('div', { className: 'dim-jh-metaRow' },
+        React.createElement('dt', null, '有效期'),
+        React.createElement('dd', { 'data-tone': expired ? 'warn' : undefined },
+          account.expiresAt
+            ? `${formatTime(account.expiresAt) || '未知'}${account.refreshable ? ' · 自动续期' : ''}`
+            : '未知')),
+      // 账号规格（目前只有 Gemini 有）：Pro / Free / Ultra。
+      //
+      // ⚠️ 判据是 `extra.accountTier` 有值才渲染 —— 取不到档位（上游改协议、
+      // 网络失败、非 Gemini 的 provider）时**整行不出现**，不显示「未知」也不
+      // 报错：它只是一栏附注信息，不该制造一条无法修复的提示。
+      // `title` 放上游原文（`Google AI Pro（g1-pro-tier）`），面板只放得下一个词。
+      credits?.extra?.accountTier
+        ? React.createElement('div', { className: 'dim-jh-metaRow' },
+            React.createElement('dt', null, '账号规格'),
+            React.createElement('dd', { title: credits.extra.accountTier.title },
+              credits.extra.accountTier.label))
+        : null,
+      // 不支持积分余额的 provider 不渲染该行：留着它只能显示「查询失败」，
+      // 而失败原因是「这个 provider 根本没有此接口」——与其展示一条无法修复
+      // 的错误，不如不展示。
+      showCredits
+        ? React.createElement(CreditBalanceRow, {
+            balance: credits?.balance ?? null,
+            error: credits?.error,
+            loading: creditsLoading,
+            // 「临时 / 长期」分桶的窗口天数（buddy 系 + TRAE + LobsterAI 有值）。
+            windowDays,
+            // 池名分桶（loomy / raccoon）要按 provider 决定另一个池的标签。
+            provider,
+            // 操作按钮（重测 / 重置 / 停用 / 删除）挂在积分这一行的最右侧，
+            // 不再单独占一行（用户报障）。
+            actions: actionsNode,
+          })
+        : null),
+    rateLimits.length > 0
+      ? React.createElement('div', { className: 'dim-jh-rateLimits' },
+          React.createElement('span', { className: 'dim-jh-rateLimitsLabel' }, '限额重置'),
+          rateLimits.map(([modelId, resetAt]) =>
+            React.createElement('span', {
+              key: modelId,
+              className: 'dim-jh-ttlBadge',
+              title: `模型 ${modelId}`,
+            }, `${modelId} · ${formatTime(resetAt)}`)))
+      : null,
+    // 不支持积分余额的 provider 没有积分行可挂按钮 ⇒ 退回原来的独立行。
+    // 否则那个账号卡片上就再也没有「重测 / 重置 / 停用 / 删除」入口了。
+    showCredits ? null : actionsNode,
+  );
 }
 
 /**
@@ -1075,7 +1171,7 @@ function AccountCard({ account, index, order, provider, onToggle, onDelete, onRe
  * @param {{ model: {id: string, name?: string, disabled?: boolean, dead?: boolean},
  *           busy: boolean, onToggle: Function, onRestore: Function }} props
  */
-function ModelToggle({ model, busy, onToggle, onRestore }) {
+function ModelToggle({ provider, model, busy, onToggle, onRestore }) {
   const dead = model.dead === true;
   return React.createElement('label', {
     className: 'dim-jh-modelRow',
@@ -1083,6 +1179,13 @@ function ModelToggle({ model, busy, onToggle, onRestore }) {
     'data-dead': dead ? 'true' : 'false',
     title: dead ? `${model.id}（上游已下架，点击「重新显示」可恢复）` : model.id,
   },
+    // ⚠️ 供应商图标放在**行首**（与左栏供应商列表同一视觉语言，用户 2026-10-26
+    //    要求：「给所有页面供应商和模型左侧 + 供应商图标」）。
+    //    模型中心横跨十几家供应商，光看模型名认不出归属 ——
+    //    `deepseek-v4.1-flash` 这类 id 在多家目录里都出现过。
+    // ⚠️ 它在 `<label>` 内、但**不是可标记控件**，故不影响「点整行切开关」
+    //    那条既有交互。真正的坑是插入第二个 checkbox，见上面的类注释。
+    React.createElement(ProviderLogo, { provider }),
     React.createElement('span', { className: 'dim-jh-modelInfo' },
       React.createElement('strong', { className: 'dim-jh-modelName' }, model.name || model.id),
       dead ? React.createElement('span', { className: 'dim-jh-modelDead' }, '已下架') : null,
@@ -1108,7 +1211,7 @@ function ModelToggle({ model, busy, onToggle, onRestore }) {
 }
 
 /**
- * 模型列表弹窗：点击「显示列表」后以 modal 形式浮出。
+ * 模型列表弹窗：点击「模型列表」后以 modal 形式浮出。
  *
  * 数据全部来自 `model.list` RPC —— 也就是适配器 `listModels()` 播报的同一份
  * 目录（对话框模型选择器读的正是它）。因此这里列出的模型与可选模型一一对应，
@@ -1298,8 +1401,6 @@ function ModelListPanel({ provider, rpcCall, onClose }) {
     }
   };
   const providerLabel = PROVIDERS.find(p => p.id === provider)?.label || provider;
-  // 「已经是目标状态」时对应按钮必须禁用，否则点了看不到任何变化、像是坏了。
-  const bulk = bulkButtonState(models, bulkBusy);
 
   /**
    * 筛选后的列表。`filterModels` 是纯函数（见 model-filter.js）：这里只负责
@@ -1378,43 +1479,10 @@ function ModelListPanel({ provider, rpcCall, onClose }) {
     setStatusFilter('all');
   };
 
-  /**
-   * 批量打开/关闭全部模型。
-   *
-   * 走**批量端点**而不是循环调用 `model.setDisabled`：后者会发 N 次请求、写 N 次
-   * 完整文档、广播 N 次 `llm/adapters-updated`，且中途失败会留下「关了一半」的
-   * 黑名单。批量端点只落盘一次、只广播一次。
-   *
-   * 「关闭全部」先二次确认：一次误点会关掉该 provider 的全部模型。反之
-   * 「打开全部」是恢复性操作，不弹确认（弹窗只会碍事）。
-   *
-   * 成功后**就地更新**列表状态（不等重新拉取）：端点返回的是权威黑名单，
-   * 但列表里还有展示名等字段，只能按 id 就地翻 `disabled`。
-   */
-  const setAllDisabled = async (disabled) => {
-    if (disabled && !confirm(`确认关闭全部 ${all.length} 个模型？关闭后它们不再出现在对话框的模型选择里。`)) {
-      return;
-    }
-    setBulkBusy(true);
-    setToggleError(null);
-    try {
-      await rpcCall('model.setAllDisabled', { provider, disabled });
-      if (!mounted.current) return;
-      setModels(prev => (prev || []).map(m => ({ ...m, disabled })));
-    } catch (caught) {
-      console.error('[jet-hub] bulk toggle failed:', caught);
-      if (!mounted.current) return;
-      // 与单条切换同一约定：失败只提示、保留列表，绝不把整张表换成错误页。
-      setToggleError(caught?.message || `批量${disabled ? '关闭' : '打开'}模型失败`);
-    } finally {
-      if (mounted.current) setBulkBusy(false);
-    }
-  };
-
   const dialog = React.createElement('div', {
     // `--top`：顶部锚定。列表长度随搜索变化，若垂直居中会让弹窗整体上下跳动
     //（见 jet-hub-styles.js 中该修饰类的说明）。
-    className: 'dim-jh-modalOverlay dim-jh-modalOverlay--top',
+    className: 'dim-jh-modalOverlay',
     // 点击遮罩关闭；点击弹窗内部不关闭（stopPropagation 由内层容器负责）。
     onClick: (event) => { if (event.target === event.currentTarget) onClose(); },
   },
@@ -1489,22 +1557,6 @@ function ModelListPanel({ provider, rpcCall, onClose }) {
                 }, '清空筛选')
               : null)
         : null,
-      // 批量工具条：只在列表可用时渲染。计数从标题挪到这里，避免与标题争宽。
-      phase === 'ready' && all.length > 0
-        ? React.createElement('div', { className: 'dim-jh-modelBulkBar' },
-            React.createElement('button', {
-              className: 'dim-jh-btn',
-              title: '打开该 Provider 的全部模型开关（含此前被关闭的）。',
-              disabled: bulk.openAllDisabled,
-              onClick: () => void setAllDisabled(false),
-            }, bulkBusy ? '处理中…' : '打开全部'),
-            React.createElement('button', {
-              className: 'dim-jh-btn',
-              title: '关闭该 Provider 的全部模型开关，关闭后它们不再出现在对话框的模型选择里。',
-              disabled: bulk.closeAllDisabled,
-              onClick: () => void setAllDisabled(true),
-            }, bulkBusy ? '处理中…' : '关闭全部'))
-        : null,
       toggleError
         ? React.createElement('div', {
             className: 'dim-jh-probeNotice',
@@ -1567,15 +1619,19 @@ function ModelListPanel({ provider, rpcCall, onClose }) {
                             group.counts.disabled > 0
                               ? `${group.counts.shown} 个 · 已关闭 ${group.counts.disabled}`
                               : `${group.counts.shown} 个`),
+                          // ⚠️ 文案用裸的「全开 / 全关」：模型列表弹窗顶部那排
+                          //    「打开全部 / 关闭全部」工具条已按用户要求删除
+                          //    （2026-10-26），两排并列的歧义不复存在，不必再加「本组」前缀。
+                          //    title 里仍写明「只影响这一组」—— 分组头本身要能自解释。
                           React.createElement('button', {
                             className: 'dim-jh-btn dim-jh-modelGroupBtn',
-                            title: `打开「${group.label}」的全部模型（不影响其它分组）`,
+                            title: `打开「${group.label}」的全部模型（只影响这一组）`,
                             disabled: groupBulk.openAllDisabled,
                             onClick: () => void setGroupDisabled(group, false),
                           }, '全开'),
                           React.createElement('button', {
                             className: 'dim-jh-btn dim-jh-modelGroupBtn',
-                            title: `关闭「${group.label}」的全部模型（不影响其它分组）`,
+                            title: `关闭「${group.label}」的全部模型（只影响这一组）`,
                             disabled: groupBulk.closeAllDisabled,
                             onClick: () => void setGroupDisabled(group, true),
                           }, '全关')),
@@ -1583,6 +1639,10 @@ function ModelListPanel({ provider, rpcCall, onClose }) {
                           ? React.createElement('div', { className: 'dim-jh-modelGroupBody' },
                               group.models.map(model => React.createElement(ModelToggle, {
                                 key: model.id,
+                                // 本弹窗是**单家供应商**的详情（`provider` 来自
+                                // 组件 props，与 `model.list` 用的是同一个值），
+                                // 故整份列表同图标。
+                                provider,
                                 model,
                                 // 批量提交期间一并禁用单条开关：黑名单是整体写入，
                                 // 并发提交必然互相覆盖（后写的会丢掉先写的改动）。
@@ -1845,7 +1905,7 @@ function MinimaxXffPanel({ rpcCall, value, onSaved, onClose }) {
   };
 
   return React.createElement('div', {
-    className: 'dim-jh-modalOverlay dim-jh-modalOverlay--top',
+    className: 'dim-jh-modalOverlay',
     onClick: (event) => { if (event.target === event.currentTarget) onClose(); },
   },
   React.createElement('div', {
@@ -2241,7 +2301,7 @@ function ClineQuotaPanel({ rpcCall, onClose }) {
   // 与登录弹窗、模型列表同款：直接渲染在组件树内，靠 position: fixed 覆盖全屏。
   // **刻意不用 createPortal**（理由见 ModelListPanel 的说明）。
   return React.createElement('div', {
-    className: 'dim-jh-modalOverlay dim-jh-modalOverlay--top',
+    className: 'dim-jh-modalOverlay',
     onClick: (event) => { if (event.target === event.currentTarget) onClose(); },
   },
     React.createElement('div', {
@@ -2788,7 +2848,7 @@ function TokenLedgerPanel({ rpcCall, onClose }) {
               renderModelRow(modelRow, providerRow.provider + '#' + modelRow.model))))))));
 
   return React.createElement('div', {
-    className: 'dim-jh-modalOverlay dim-jh-modalOverlay--top',
+    className: 'dim-jh-modalOverlay',
     onClick: (event) => { if (event.target === event.currentTarget) onClose(); },
   },
     React.createElement('div', {
@@ -3467,7 +3527,7 @@ function ProviderPanel({ provider, rpcCall }) {
       if (mounted.current) setOnboardingLoading(false);
     }
   };
-  // 「显示列表」：控制模型列表面板的展开状态。关闭时不挂载面板，避免
+  // 「模型列表」：控制模型列表面板的展开状态。关闭时不挂载面板，避免
   // 每次进入面板都白白发一次 model.list 请求。
   const [showModels, setShowModels] = React.useState(false);
   // 「订阅额度」：控制额度/请求记录弹窗的展开状态。同样关闭即不挂载，
@@ -4088,7 +4148,7 @@ function ProviderPanel({ provider, rpcCall }) {
    * 见 `AccountPool.hasLoggedInAccount`）—— 这是整体设计，此处不改它。
    *
    * 但用户停用某 provider 的**最后一个**启用账号后，它的模型仍留在对话框的模型
-   * 选择器里（凭据还在，目录门控判为可见），只能再去「显示列表」里逐个关。
+   * 选择器里（凭据还在，目录门控判为可见），只能再去「模型列表」里逐个关。
    * 于是这里把它变成**一次显式选择**：
    *
    * - 停用后该 provider 不再有任何启用账号 → 问一句「是否同时关闭它的全部模型」；
@@ -4123,12 +4183,12 @@ function ProviderPanel({ provider, rpcCall }) {
             await rpcCall('model.setAllDisabled', { provider, disabled: true });
           } catch (caught) {
             // 账号已经停用成功，联动失败不能回滚它 —— 只提示，让用户可去
-            // 「显示列表」手动处理。
+            // 「模型列表」手动处理。
             console.error('[jet-hub] cascade disable models failed:', caught);
             if (mounted.current) {
               setProbeNotice({
                 tone: 'warn',
-                text: `账号已停用，但关闭模型失败：${caught?.message || '未知错误'}。可在「显示列表」中手动关闭。`,
+                text: `账号已停用，但关闭模型失败：${caught?.message || '未知错误'}。可在「模型列表」中手动关闭。`,
                 details: [],
               });
             }
@@ -4146,7 +4206,7 @@ function ProviderPanel({ provider, rpcCall }) {
           models = res.models || [];
         } catch (caught) {
           // 目录读不出来就静默跳过联动：账号启用本身已经成功，不该因目录故障
-          // 而报错。用户仍可去「显示列表」手动打开。
+          // 而报错。用户仍可去「模型列表」手动打开。
           console.error('[jet-hub] read models for cascade enable failed:', caught);
           models = null;
         }
@@ -4163,7 +4223,7 @@ function ProviderPanel({ provider, rpcCall }) {
               if (mounted.current) {
                 setProbeNotice({
                   tone: 'warn',
-                  text: `账号已启用，但打开模型失败：${caught?.message || '未知错误'}。可在「显示列表」中手动打开。`,
+                  text: `账号已启用，但打开模型失败：${caught?.message || '未知错误'}。可在「模型列表」中手动打开。`,
                   details: [],
                 });
               }
@@ -4379,14 +4439,24 @@ function ProviderPanel({ provider, rpcCall }) {
    *
    * ⚠️ 文案一律走纯函数（`compensation-panel-logic.js`），不在 JSX 里内联三元 ——
    *    内联文案无法被单测覆盖（无 react ⇒ 组件不渲染），初版正是这样漏掉了 P0。
+   *
+   * ⚠️⚠️ **渲染与否也走纯函数**（用户 2026-10-26：「常驻改为领取后隐藏」）。
+   *    此前条件是 `compensation !== null` ⇒ 全部领完之后面板顶部仍常驻一条
+   *    「补偿积分已领取 / 限时活动，过期后上游会返回「活动已结束」。」的死文案。
+   *    现在由 `shouldShowCompensation` 决定：只有「有待领」「查询失败」
+   *    「部分账号没查到」三种情况才渲染。
    */
-  const compensationCard = provider === 'buddy' && compensation !== null
+  const compensationCard = provider === 'buddy' && shouldShowCompensation(compensation)
     ? React.createElement('div', {
         className: 'dim-jh-probeNotice',
         'data-tone': compensation.error ? 'warn' : (compensation.total > 0 ? 'ok' : 'idle'),
       },
       React.createElement('div', null, compensationHeadline(compensation)),
-      React.createElement('div', { className: 'dim-jh-hint' }, compensationHint(compensation)),
+      // 副文案可能为空串（已领完那条分支已不再印说明）⇒ 空时不挂空 div，
+      // 否则 .dim-jh-hint 的 margin 会凭空多出一截间距。
+      compensationHint(compensation).length > 0
+        ? React.createElement('div', { className: 'dim-jh-hint' }, compensationHint(compensation))
+        : null,
       compensation.total > 0
         ? React.createElement('button', {
             className: 'dim-jh-btn',
@@ -4400,19 +4470,134 @@ function ProviderPanel({ provider, rpcCall }) {
     : null;
 
 
-  return React.createElement('section', { 'aria-label': `${provider} 账号管理` },
-    // 标题与按钮分开成两块（而不是同一行的 space-between）：操作按钮多达 5 个，
-    // 与面板标题挤在一行时既会被压缩又会溢出。标题独占一行、按钮组另起一行
-    // 并允许换行，窄面板下也能完整显示。
+  // ⚠️ 2026-10-26 用户要求「页头滚动时应该只滚动账号列表」：本 section 现在是
+  //    **滚动边界**（`display: flex; flex-direction: column; min-height: 0`），
+  //    页头（.dim-jh-panelHead）`flex: none` 固定不动，只有 .dim-jh-accountList
+  //    自己 `overflow-y: auto` 滚动。此前滚动发生在 `.dim-jh-panel` 上 ⇒
+  //    标题、排序提示、按钮组、状态提示全都跟着滚走。
+  //    ⚠️ 缺 className 时这套规则无处可挂 —— 它曾经没有类名（只靠 aria-label 定位），
+  //    所以加类名是本次结构改动的一部分，不是装饰。
+  return React.createElement('section', {
+    className: 'dim-jh-accountSection',
+    'aria-label': `${provider} 账号管理`,
+  },
+    // ⚠️ 2026-10-26 用户要求「将按钮行合并到文案行最右侧」：原先标题 / 按钮组 /
+    //    排序提示是三行，按钮组独占一行很浪费。现在改成：
+    //      第一行：标题（flex-basis: 100% 独占）
+    //      第二行：[排序提示 ………………… 按钮组]（提示 flex:1 撑开，按钮组 margin-left:auto 贴右）
+    //    ⇒ **排序提示必须从 `.dim-jh-accountList` 挪到本容器**，否则它和按钮组
+    //    不同父级，CSS 无论如何排不到同一行（这是本次改动的关键，不是样式微调）。
+    //    ⚠️ 提示为 null（账号 ≤ 1）时按钮组仍靠右：margin-left: auto 与
+    //    justify-content: flex-end 两条都留着，任一条都能把它推到右边。
     React.createElement('div', { className: 'dim-jh-panelHead' },
       React.createElement('h2', { className: 'dim-jh-panelTitle' },
         `${PROVIDERS.find(p => p.id === provider)?.label || provider} 账号管理`),
+      // ⚠️ 2026-10-26 用户要求「信息应该在按钮行上方行，而不是下方行」：
+      //    面板级状态提示（探测结果 / 锁定状态 / 领取结果 / 新手任务 / 登录链接 /
+      //    补偿卡片）此前是 section 的直接子节点，排在 panelHead **之后** ⇒
+      //    视觉上落在按钮行下方（截图里那条「已锁定永久积分…」就是）。
+      //    现在全部搬进 panelHead、**排在按钮组之前**，于是页头变成：
+      //      第一行 标题 → 第二行起 各条状态提示 → 最后一行 [排序提示 …… 按钮组]
+      //    ⚠️ 每个提示都必须独占整行（样式侧 `.dim-jh-panelHead > .dim-jh-probeNotice
+      //    { flex: 1 0 100% }`）—— 少那条规则，提示会与按钮组挤在同一行，
+      //    又变回「挤在按钮旁边」的老毛病。
+      //    ⚠️ 它们仍必须是 panelHead 的**直接**子节点：包一层容器会让
+      //    `.dim-jh-panelHead > ...` 那组选择器全部失效。
+      probeNotice
+        ? React.createElement('div', {
+            className: 'dim-jh-probeNotice',
+            'data-tone': probeNotice.tone,
+            role: 'status',
+          },
+          React.createElement('div', null, probeNotice.text),
+          // ⚠️ 不能直接读 `probeNotice.details.length`：`probeNotice` 若被写成裸
+          //    字符串（2026-10-22 整页白屏事故），`.details` 是 undefined ⇒ 抛
+          //    TypeError ⇒ 整个 Jet Hub 设置页被 React 卸载。这里按「无明细」
+          //    降级：宁可少一行明细，也不能让整页消失。
+          safeNoticeDetails(probeNotice.details).length > 0
+            ? React.createElement('ul', { className: 'dim-jh-probeDetails' },
+                safeNoticeDetails(probeNotice.details).map((d, i) => React.createElement('li', { key: i }, d)))
+            : null)
+        : null,
+      lockNotice
+        ? React.createElement('div', {
+            className: 'dim-jh-probeNotice',
+            'data-tone': lockNotice.tone,
+            role: lockNotice.tone === 'error' ? 'alert' : 'status',
+          }, lockNotice.text)
+        : null,
+      claimNotice
+        ? React.createElement('div', {
+            className: 'dim-jh-probeNotice',
+            'data-tone': claimNotice.tone,
+            role: claimNotice.tone === 'error' ? 'alert' : 'status',
+          },
+          React.createElement('div', null, claimNotice.text),
+          // 逐账号原因列表。没有它时用户只看到「1 个失败」，无从判断是
+          // 凭据问题、活动未开、还是解析 bug。
+          (claimNotice.details || []).length > 0
+            ? React.createElement('ul', { className: 'dim-jh-probeDetails' },
+                claimNotice.details.map((d, i) => React.createElement('li', { key: i }, d)))
+            : null)
+        : null,
+      // 新手任务结果（仅 Loomy，一次性领取）。
+      onboardingNotice
+        ? React.createElement('div', {
+            className: 'dim-jh-probeNotice',
+            'data-tone': onboardingNotice.tone,
+            role: onboardingNotice.tone === 'error' ? 'alert' : 'status',
+          },
+          React.createElement('div', null, onboardingNotice.text),
+          (onboardingNotice.details || []).length > 0
+            ? React.createElement('ul', { className: 'dim-jh-probeDetails' },
+                onboardingNotice.details.map((line, index) =>
+                  React.createElement('li', { key: index }, line)))
+            : null)
+        : null,
+      // 弹窗被拦截：给出可点击的登录链接 + 复制按钮。不劫持当前页面（见 createAccount 的说明）。
+      // 链接 300+ 字符，用户此刻唯一动作就是复制到别处；手工框选漏一个字符会得到「授权失败」假象。
+      loginUrlForManual
+        ? React.createElement('div', {
+            className: 'dim-jh-probeNotice',
+            'data-tone': 'warn',
+            role: 'alert',
+          },
+          React.createElement('div', null, '登录窗口被浏览器拦截，请手动打开下方链接完成登录：'),
+          React.createElement('div', {
+            className: 'dim-jh-loginLinkRow',
+            'data-copy-state': loginLinkCopied === false ? 'failed' : 'idle',
+          },
+            React.createElement('a', {
+              className: 'dim-jh-loginLink',
+              href: loginUrlForManual,
+              target: '_blank',
+              rel: 'noopener noreferrer',
+            }, loginUrlForManual),
+            // type='button' 必须有：按钮若落在表单里，默认 submit 会连带提交表单。
+            React.createElement('button', {
+              className: 'dim-jh-btn',
+              type: 'button',
+              title: loginLinkCopied === false ? '复制失败：请手动选中链接后按 Ctrl+C' : '复制授权链接',
+              onClick: async () => setLoginLinkCopied(await copyToClipboard(loginUrlForManual)),
+            }, loginLinkCopied === true ? '已复制 ✓'
+              : loginLinkCopied === false ? '复制失败，请手动选中' : '复制链接')))
+        : null,
+      compensationCard,
+      // 排序提示：顺序会真实影响自动选号，必须让用户知道，否则
+      // 「拖了有什么用」无从得知。仅两个以上账号时才显示。
+      // ⚠️ 2026-10-26 用户定稿文案（第二次改）：两句，保留**两个不可省的语义**：
+      //    ① 顺序 = 优先级（拖动不是装饰）；② 命中限额会沉到末尾且不复位 ——
+      //    连同「为什么这样设计」（免得一个号长期占位、把别人的额度放过期）。
+      // ⚠️ 文案必须**单行显示**（用户同日「文案改为一行显示」）：样式侧用
+      //    white-space: nowrap 钉死，故窄窗口下会被省略号截断 ⇒ 必须把
+      //    完整文案挂到 title 上，否则被截掉的那半句就再也读不到。
+      accounts.length > 1
+        ? React.createElement('p', {
+            className: 'dim-jh-orderHint',
+            title: ORDER_HINT_TEXT,
+          }, ORDER_HINT_TEXT)
+        : null,
       React.createElement('div', { className: 'dim-jh-headerActions' },
-        React.createElement('button', {
-          className: 'dim-jh-btn',
-          title: MODEL_LIST_HELP,
-          onClick: () => setShowModels(true),
-        }, '显示列表'),
         // 「订阅额度」放在**面板级**（而不是账号卡片的按钮行）：
         // 那一行已有 5 个按钮且 `flex-wrap: nowrap`，再塞一个必然溢出
         // （该行的注释里记着「领取新手任务」当时就是这么被挤出去的）。
@@ -4424,14 +4609,6 @@ function ProviderPanel({ provider, rpcCall }) {
                 + '与逐笔请求记录（模型、token、积分）。数据来自官方网关，非本地记账。',
               onClick: () => setShowQuota(true),
             }, '订阅额度')
-          : null,
-        canLoadCredits
-          ? React.createElement('button', {
-              className: 'dim-jh-btn',
-              title: '重新查询本页全部账号的剩余积分（Credits Balance）。余额由服务端实时计算，点此可刷新。',
-              disabled: creditsLoading,
-              onClick: () => void loadCredits(true),
-            }, creditsLoading ? '查询中…' : '刷新积分')
           : null,
         supportsCredits
           ? React.createElement('button', {
@@ -4474,24 +4651,100 @@ function ProviderPanel({ provider, rpcCall }) {
         // 锁定永久积分：只消耗会近期作废的积分，保住长期积分。
         // 文案按 provider 给（Loomy 是「每日赠送额度」，两个 buddy 是
         // 「15 天内到期的积分包」）—— 见 permanentLockCopy 的说明。
+        //
+        // ⚠️ 2026-10-26 用户要求「解锁/锁定永久积分改为图标+永久积分」：
+        //    按钮文字**固定**为「永久积分」，当前是锁定还是解锁**只由图标形态 +
+        //    data-kind=primary 表达**（锁着 = 闭合挂锁 + 实心蓝底；解锁 = 开口挂锁 + 描边）。
+        //    由此带来的三条硬约束，缺任一条都是净损失：
+        //    ① `title` 仍按状态给 lockCopy 的整句 —— 按钮上只剩四个字，
+        //       「保住的是什么 / 先烧的是什么 / 什么时候会没有可用账号」全靠它；
+        //    ② `aria-label` 必须说**动作**（「锁定永久积分」/「解锁永久积分」），
+        //       不能跟着按钮文字念「永久积分」—— 读屏用户听不出点下去会怎样；
+        //       这两个字面量同时是 tests/unit/loomy-client.spec.ts 的锚点，别改字；
+        //    ③ 加载态文字换成「处理中…」之外，图标也一起转圈（`data-loading`
+        //       驱动样式里的 .dim-jh-iconBtn[data-loading="true"] svg 动画）——
+        //       双保险：文字换了但用户眼神在图标上，只动一处会看不出还在忙。
         canLockPermanent
           ? React.createElement('button', {
-              className: 'dim-jh-btn',
+              className: 'dim-jh-btn dim-jh-iconTextBtn',
               'data-kind': permanentLocked ? 'primary' : undefined,
+              'data-loading': lockBusy ? 'true' : undefined,
+              'aria-label': permanentLocked ? '解锁永久积分' : '锁定永久积分',
               title: permanentLocked ? lockCopy.lockedTitle : lockCopy.lockTitle,
               disabled: lockBusy,
               onClick: () => void togglePermanentLock(),
-            }, lockBusy
-              ? '处理中…'
-              : (permanentLocked ? '解锁永久积分' : '锁定永久积分'))
+            },
+            React.createElement('svg', {
+              width: 14,
+              height: 14,
+              viewBox: '0 0 24 24',
+              fill: 'none',
+              stroke: 'currentColor',
+              strokeWidth: 2,
+              strokeLinecap: 'round',
+              strokeLinejoin: 'round',
+              'aria-hidden': 'true',
+              focusable: 'false',
+            },
+            // 挂锁图标，两种状态共用锁体，只改锁梁：
+            //   锁定 = 锁梁闭合（两边都落到锁体上）；
+            //   解锁 = 锁梁右侧抬起（左端仍插在锁体里），一眼能分辨。
+            React.createElement('rect', { x: 3, y: 11, width: 18, height: 11, rx: 2 }),
+            permanentLocked
+              ? React.createElement('path', { d: 'M7 11V7a5 5 0 0 1 10 0v4' })
+              : React.createElement('path', { d: 'M7 11V7a5 5 0 0 1 9.9-1' })),
+            lockBusy ? '处理中…' : '永久积分')
           : null,
+        // ⚠️ **「模型列表」排在「+ 新建账号」左边，且已改成图标 + 文字**
+        //    （用户 2026-10-26：「模型按钮移动到新建账号左边改为图标+模型」）。
+        //    图标是「列表」语义（三横线 + 圆点），文字仍保留「模型」二字 ——
+        //    纯图标认不出是列表还是筛选，而这按钮与新建账号紧挨着、只差一个字的
+        //    宽度，省不出多少地方。
+        //    ⚠️ `aria-label` 仍写全「模型列表」（读屏念的是动作，不是按钮上那两个字）。
+        //    ⚠️ 顺序：**模型列表 → 新建账号 → 刷新积分**（三个都跟「本页内容」相关）。
+        React.createElement('button', {
+          className: 'dim-jh-btn dim-jh-iconTextBtn',
+          title: MODEL_LIST_HELP,
+          'aria-label': '模型列表',
+          onClick: () => setShowModels(true),
+        },
+        React.createElement('svg', {
+          width: 14,
+          height: 14,
+          viewBox: '0 0 24 24',
+          fill: 'none',
+          stroke: 'currentColor',
+          strokeWidth: 2,
+          strokeLinecap: 'round',
+          strokeLinejoin: 'round',
+          'aria-hidden': 'true',
+          focusable: 'false',
+        },
+        // 列表图标：三横线 + 左侧圆点
+        React.createElement('path', { d: 'M9 6h11' }),
+        React.createElement('path', { d: 'M9 12h11' }),
+        React.createElement('path', { d: 'M9 18h11' }),
+        React.createElement('path', { d: 'M4.5 6h.01' }),
+        React.createElement('path', { d: 'M4.5 12h.01' }),
+        React.createElement('path', { d: 'M4.5 18h.01' })),
+        '模型'),
         // ⚠️ 渠道弹窗**只服务 ZCode**：非 zcode 直接发起登录，与「搬进弹窗」
         //   之前逐字等价。上游 15ccae5 把渠道选择搬进弹窗时丢了这层门控，
         //   于是全部 14 个 provider 点「+ 新建账号」都弹出一个「添加 ZCode 账号」。
         React.createElement('button', {
-          className: 'dim-jh-btn',
+          className: 'dim-jh-btn dim-jh-iconBtn',
           'data-kind': 'primary',
-          title: '通过浏览器登录一个新的账号并加入账号池。',
+          // ⚠️ 2026-10-26 用户要求「新建账号按钮改为图标」：文字 `+ 新建账号`
+          //    已收进 title / aria-label。与「删除」「刷新积分」两枚图标按钮
+          //    同一套约束（缺任一条都是净损失）：
+          //    ① `title` 把动作说全（图标不自解释），且要反映登录进行中；
+          //    ② `aria-label` 必须有 —— svg 标了 aria-hidden，否则读屏只念「按钮」；
+          //    ③ 加载态没有文字可换 ⇒ title/aria-label 跟着 `creating` 变，并靠
+          //       `disabled` 拦住重复点击。
+          title: creating
+            ? '正在通过浏览器登录新账号…'
+            : '新建账号：通过浏览器登录一个新的账号并加入账号池。',
+          'aria-label': creating ? '正在登录新账号' : '新建账号',
           // ⚠⚠ **必须按 provider 分支**（真实缺陷，Gitee issue IKJLK3 A1/A2/A3）：
           //   这个按钮在**每一个** provider 的面板里都有，而下面的弹窗是
           //   **zCode 专用**的（登录渠道下拉）。原先无条件 `setPendingLogin(false)`，
@@ -4505,7 +4758,64 @@ function ProviderPanel({ provider, rpcCall }) {
             else void createAccount()
           },
           disabled: creating,
-        }, creating ? '正在登录…' : '+ 新建账号'),
+        },
+        React.createElement('svg', {
+          width: 14,
+          height: 14,
+          viewBox: '0 0 24 24',
+          fill: 'none',
+          stroke: 'currentColor',
+          strokeWidth: 2,
+          strokeLinecap: 'round',
+          strokeLinejoin: 'round',
+          'aria-hidden': 'true',
+          focusable: 'false',
+        },
+        // 人形 + 加号（user-plus）：新建的是「一个账号」，不是「一个文件」
+        React.createElement('path', { d: 'M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2' }),
+        React.createElement('circle', { cx: 9, cy: 7, r: 4 }),
+        React.createElement('path', { d: 'M19 8v6' }),
+        React.createElement('path', { d: 'M22 11h-6' }))),
+        // ⚠️ **刷新积分排在「+ 新建账号」右边**（用户 2026-10-26 要求
+        //    「将刷新积分按钮移动到新建账号右边」）。改前它在「一键领取积分」左侧，
+        //    与「新建账号」隔了两个按钮 —— 两者同属「让本页数据变新」的动作，
+        //    挨在一起比夹在领取/重测中间更顺手。
+        //    ⚠️ 它必须仍在 minimaxintl 的「国际站分流设置」之前：那个是排障入口。
+        canLoadCredits
+          // ⚠️ **只显示刷新图标**（用户 2026-10-26 要求「将刷新积分按钮改为图标」）。
+          //    与「删除」那枚图标按钮同一套约束：
+          //    ① `title` 必须把动作说全（图标不自解释），且要能反映加载态；
+          //    ② `aria-label` 必须有 —— svg 标了 aria-hidden，没有它读屏只会念「按钮」；
+          //    ③ 加载态不再换文案（没有文字可换），改为 `data-loading` 让图标转起来，
+          //       并靠 `disabled` 拦住重复点击（.dim-jh-btn:disabled 已有 opacity .5）。
+          //    ⚠️ 行为一行未动：`onClick` 仍是 `loadCredits(true)`，force 参数不动。
+          ? React.createElement('button', {
+              className: 'dim-jh-btn dim-jh-iconBtn',
+              'data-loading': creditsLoading ? 'true' : undefined,
+              title: creditsLoading
+                ? '正在查询本页全部账号的剩余积分…'
+                : '刷新积分：重新查询本页全部账号的剩余积分（Credits Balance）。'
+                  + '余额由服务端实时计算，点此可强制回源刷新（绕过 120 秒缓存）。',
+              'aria-label': creditsLoading ? '正在查询积分' : '刷新积分',
+              disabled: creditsLoading,
+              onClick: () => void loadCredits(true),
+            },
+            React.createElement('svg', {
+              width: 14,
+              height: 14,
+              viewBox: '0 0 24 24',
+              fill: 'none',
+              stroke: 'currentColor',
+              strokeWidth: 2,
+              strokeLinecap: 'round',
+              strokeLinejoin: 'round',
+              'aria-hidden': 'true',
+              focusable: 'false',
+            },
+            // 环形箭头：缺口圆 + 端点箭头（顺时针方向）
+            React.createElement('path', { d: 'M21 12a9 9 0 1 1-3.2-6.9' }),
+            React.createElement('path', { d: 'M21 3v5h-5' })))
+          : null,
         /**
          * ⚠️ **只给 MiniMax 国际版**（issue IKMEVG）：它的数据面
          * `agent.minimax.io` 按**出口 IP 国别**把中国大陆来源 307 到中国站，
@@ -4860,87 +5170,17 @@ function ProviderPanel({ provider, rpcCall }) {
                 (astudioDialog && astudioLoginMethod === 'local') || (autoclawDialog && autoclawMode === 'local')
                   ? '确定并导入本地账号'
                   : '确定并打开认证页'))),
-        )),
-    probeNotice
-      ? React.createElement('div', {
-          className: 'dim-jh-probeNotice',
-          'data-tone': probeNotice.tone,
-          role: 'status',
-        },
-        React.createElement('div', null, probeNotice.text),
-        // ⚠️ 不能直接读 `probeNotice.details.length`：`probeNotice` 若被写成裸
-        //    字符串（2026-10-22 整页白屏事故），`.details` 是 undefined ⇒ 抛
-        //    TypeError ⇒ 整个 Jet Hub 设置页被 React 卸载。这里按「无明细」
-        //    降级：宁可少一行明细，也不能让整页消失。
-        safeNoticeDetails(probeNotice.details).length > 0
-          ? React.createElement('ul', { className: 'dim-jh-probeDetails' },
-              safeNoticeDetails(probeNotice.details).map((d, i) => React.createElement('li', { key: i }, d)))
-          : null)
-      : null,
-    lockNotice
-      ? React.createElement('div', {
-          className: 'dim-jh-probeNotice',
-          'data-tone': lockNotice.tone,
-          role: lockNotice.tone === 'error' ? 'alert' : 'status',
-        }, lockNotice.text)
-      : null,
-    claimNotice
-      ? React.createElement('div', {
-          className: 'dim-jh-probeNotice',
-          'data-tone': claimNotice.tone,
-          role: claimNotice.tone === 'error' ? 'alert' : 'status',
-        },
-        React.createElement('div', null, claimNotice.text),
-        // 逐账号原因列表。没有它时用户只看到「1 个失败」，无从判断是
-        // 凭据问题、活动未开、还是解析 bug。
-        (claimNotice.details || []).length > 0
-          ? React.createElement('ul', { className: 'dim-jh-probeDetails' },
-              claimNotice.details.map((d, i) => React.createElement('li', { key: i }, d)))
-          : null)
-      : null,
-    // 新手任务结果（仅 Loomy，一次性领取）。
-    onboardingNotice
-      ? React.createElement('div', {
-          className: 'dim-jh-probeNotice',
-          'data-tone': onboardingNotice.tone,
-          role: onboardingNotice.tone === 'error' ? 'alert' : 'status',
-        },
-        React.createElement('div', null, onboardingNotice.text),
-        (onboardingNotice.details || []).length > 0
-          ? React.createElement('ul', { className: 'dim-jh-probeDetails' },
-              onboardingNotice.details.map((line, index) =>
-                React.createElement('li', { key: index }, line)))
-          : null)
-      : null,
-    // 弹窗被拦截：给出可点击的登录链接 + 复制按钮。不劫持当前页面（见 createAccount 的说明）。
-    // 链接 300+ 字符，用户此刻唯一动作就是复制到别处；手工框选漏一个字符会得到「授权失败」假象。
-    loginUrlForManual
-      ? React.createElement('div', {
-          className: 'dim-jh-probeNotice',
-          'data-tone': 'warn',
-          role: 'alert',
-        },
-        React.createElement('div', null, '登录窗口被浏览器拦截，请手动打开下方链接完成登录：'),
-        React.createElement('div', {
-          className: 'dim-jh-loginLinkRow',
-          'data-copy-state': loginLinkCopied === false ? 'failed' : 'idle',
-        },
-          React.createElement('a', {
-            className: 'dim-jh-loginLink',
-            href: loginUrlForManual,
-            target: '_blank',
-            rel: 'noopener noreferrer',
-          }, loginUrlForManual),
-          // type='button' 必须有：按钮若落在表单里，默认 submit 会连带提交表单。
-          React.createElement('button', {
-            className: 'dim-jh-btn',
-            type: 'button',
-            title: loginLinkCopied === false ? '复制失败：请手动选中链接后按 Ctrl+C' : '复制授权链接',
-            onClick: async () => setLoginLinkCopied(await copyToClipboard(loginUrlForManual)),
-          }, loginLinkCopied === true ? '已复制 ✓'
-            : loginLinkCopied === false ? '复制失败，请手动选中' : '复制链接')))
-      : null,
-    compensationCard,
+        ))),
+    // ⚠️ 上面三个右括号缺一不可（2026-10-26 修）：第一个关 zcDialogMask、
+    //    第二个关 .dim-jh-headerActions、**第三个关 .dim-jh-panelHead**。
+    //    此前只有两个 ⇒ panelHead 一直没闭合，把补偿卡片 / 账号列表 / 全部弹窗
+    //    都圈成了它的 flex 子项，于是补偿卡片（flex: 0 1 auto）被挤到按钮组
+    //    同一行的最右侧（用户报障「为什么最右侧显示的是补偿积分已领取」）。
+    // ⚠️ panelHead 现在有 9 个子项（2026-10-26 第二次改）：标题 / 6 条状态提示 /
+    //    排序提示三元 / 按钮组。结构由 tests/unit/jet-hub-structure-ast.spec.ts
+    //    用 AST 守着 —— 文本切片断言在括号错位时**全部通过**，只有 AST 能发现。
+    //    ⚠️ 本段（section 的直接子节点）**不得**再出现任何 .dim-jh-probeNotice：
+    //    它们一律属于 panelHead，出现在这里就会落到按钮行下方。
     phase === 'loading'
       ? React.createElement('div', { className: 'dim-jh-empty' }, '正在读取账号列表…')
       : phase === 'error'
@@ -4980,13 +5220,9 @@ function ProviderPanel({ provider, rpcCall }) {
                     + '注意额度按「出口 IP」计算 —— 多条通道共用一个出口不会增加额度，'
                     + '分别配不同代理才会各自获得独立额度。')
                 : null,
-              // 排序提示：顺序会真实影响自动选号，必须让用户知道，否则
-              // 「拖了有什么用」无从得知。仅两个以上账号时才显示。
-              accounts.length > 1
-                ? React.createElement('p', { className: 'dim-jh-orderHint' },
-                    '拖动卡片可调整顺序（也可直接拖整张卡片）。顺序即自动选号与限流换号的优先级，排在前面的账号优先使用。'
-                    + '命中限额的账号会自动沉到末尾，恢复后仍留在末尾 —— 这样额度不会因为某个号一直霸占首位而白白过期。')
-                : null,
+              // ⚠️ 排序提示**已挪到 `.dim-jh-panelHead` 里**（用户 2026-10-26
+              //    「将按钮行合并到文案行最右侧」）—— 它必须与按钮组同父级
+              //    才能排到同一行。**不要**搬回这里：搬回来会立刻变回三行。
               reorderError
                 ? React.createElement('div', {
                     className: 'dim-jh-probeNotice',
@@ -5178,7 +5414,7 @@ function ProviderPanel({ provider, rpcCall }) {
           onSubmit: (value) => void submitModelscopeKeyEdit(value),
           onClose: () => setKeyEditModal(null),
         })
-      : null));
+      : null);
 }
 
 /**
@@ -5763,30 +5999,23 @@ function readFileAsText(file) {
 }
 
 /**
- * 供应商一行的影响面摘要（模型数 / 账号数）。
+ * 供应商一行的账号摘要。
  *
- * ⚠️ 「读不到」与「确实是 0」必须区分：状态未返回时显示 `状态尚未读取`，
- * 而不是 `模型 0（已关 0）` —— 后者会让用户以为这个供应商没有模型，
+ * ⚠️ 这里**只报账号，不报模型计数**（2026-10-26 用户需求：模型总数与已关数量
+ * 在「模型列表」弹窗里已经有了，同一屏再列一遍是重复信息，还把行挤得很长）。
+ * 模型那部分曾经在这里，含 Gitee issue IKP8OF 的「已关闭时不得渲染
+ * `模型 0（已关 0）`」特判 —— 那段随模型计数一起移除了，判据本身没过时，
+ * 只是本行不再承载它。
+ *
+ * ⚠️ 「读不到」与「确实是 0」仍必须区分：状态未返回时显示 `状态尚未读取`，
+ * 而不是 `账号 0（启用 0）` —— 后者会让用户以为这个供应商没有账号，
  * 而实际上只是那一次 `provider.status` 还没回来（或失败了）。
  */
 function providerRowSummary(row) {
   if (row.models === null && row.accounts === null) return '状态尚未读取';
-  // ⚠️⚠️ **已关闭时不得渲染 `模型 0（已关 0）`**（Gitee issue IKP8OF，文案自相矛盾）。
-  //
-  // 真实形态：用户关闭了供应商，随后它的账号被全部删除 / 目录被清空 ⇒
-  // 服务端 `{total:0, disabled:0, closed:true}`。此时按计数渲染会得到
-  // 「模型 0（已关 0）」，而同一行还在「已关闭」分组里 —— 用户看到的是
-  // 「一个没有模型的供应商被标成已关闭」，既不像事实也无法理解。
-  // ⇒ 已关闭时直接说「已全部关闭」，不再报计数（关闭态下计数没有信息量）。
-  const models = row.models
-    ? (row.checked === false
-      ? '模型已全部关闭'
-      : `模型 ${row.models.total ?? 0}（已关 ${row.models.disabled ?? 0}）`)
-    : '模型 —';
-  const accounts = row.accounts
+  return row.accounts
     ? `账号 ${row.accounts.total ?? 0}（启用 ${row.accounts.enabled ?? 0}）`
     : '账号 —';
-  return `${models} · ${accounts}`;
 }
 
 /**
@@ -5797,13 +6026,13 @@ function providerRowSummary(row) {
  * 原先开关直接挂在左侧每个供应商行的右侧（!25 的形态）。那是个**破坏性批量操作**
  * （一次改动几十个模型 + 全部账号），却和「选择要看哪个供应商」这个高频无害动作
  * 挤在同一行里：既容易误点，也让左侧那条本应承担导航的窄栏长出了控件。
- * 搬进弹窗后，开关与「显示列表」里的模型开关是同一种东西 —— 点进去、看清影响面、
+ * 搬进弹窗后，开关与「模型列表」里的模型开关是同一种东西 —— 点进去、看清影响面、
  * 再决定，误点的可能性归零。
  *
  * ## 显示逻辑与模型列表弹窗保持一致（用户明确要求）
  *
  * 复用同一套结构与类名，而不是另起一套：
- * - 骨架：`dim-jh-modalOverlay--top` + `dim-jh-modalHead`（标题 / 计数 / 刷新 / 完成）
+ * - 骨架：`dim-jh-modalOverlay` + `dim-jh-modalHead`（标题 / 计数 / 刷新 / 完成）
  *   + `dim-jh-modalHint` + `dim-jh-modalBody` + `dim-jh-modelList`；
  * - 行：`dim-jh-modelRow`（`data-disabled` 表示**该供应商已关闭** → 整行淡出，
  *   与模型列表里「已关闭的模型」同一语义）+ `dim-jh-modelInfo` / `dim-jh-modelName`
@@ -5857,24 +6086,28 @@ function ProviderSwitchPanel({ providers, statuses, statusFailed, busyIds, onTog
     ? `共 ${summary.total} 个，已打开 ${summary.open}，已关闭 ${summary.closed}`
     : (statusFailed ? '状态读取失败' : '正在读取状态…');
 
-  // 已打开 ≥2 行才值得拖（与账号面板同款门槛）；任一开关提交中则整体冻结，
-  // 避免「拖到一半那行被停用」造成展示组与拖拽组错位。
+  // 任一组 ≥2 行就值得拖（2026-10-26 起**两组都能拖**：已关闭的也能调顺序）。
+  // 任一开关提交中则整体冻结，避免「拖到一半那行被停用」造成展示组与拖拽组错位。
   // ⚠️ `reordering`（排序提交中）也必须计入：提交期间界面顺序未变（不做乐观
   // 更新），再拖一次会基于旧顺序计算并把上一次移动静默覆盖（账号面板同款，
   // 那边是 `reordering ? { enabled: false } : dragPropsFor(...)`）。
-  const dragEnabled = rows.filter(row => row.checked).length >= 2
+  const dragEnabled = (rows.filter(row => row.checked).length >= 2
+    || rows.filter(row => !row.checked).length >= 2)
     && busyIds.size === 0
     && !reordering;
 
   /**
-   * 构造某一行的拖拽属性（关闭组或不允许拖时返回 enabled:false）。
+   * 构造某一行的拖拽属性（不允许拖时返回 enabled:false）。
+   *
+   * ⚠️ 2026-10-26 起**已关闭的行也能拖**（用户需求「已关闭的供应商也应该支持
+   * 调整顺序」）。组间顺序仍是固定的（已打开恒在前、已关闭恒在后），跨组拖拽
+   * 由 `nextProviderOrderAfterGroupDrop` 返回 null 拦掉 —— 见该函数注释。
    *
    * openIds / closedIds 取自 `rows` 而不是 providers+statuses 重算：rows 已经
-   * 是「分组 + 排序」后的最终展示形态，`checked === false` 恰好就是已关闭组
-   * （见 providerSwitchState：closed ⇔ checked=false），且保持声明顺序。
+   * 是「分组 + 排序」后的最终展示形态，`checked === false` 恰好就是已关闭组。
    */
   const dragPropsFor = (row) => {
-    if (!row.checked || !dragEnabled) return { enabled: false };
+    if (!dragEnabled) return { enabled: false };
     return {
       enabled: true,
       isDragging: draggingId === row.id,
@@ -5912,16 +6145,19 @@ function ProviderSwitchPanel({ providers, statuses, statusFailed, busyIds, onTog
         // ⚠️ 必须传当前的 `order`（旧顺序）：已关闭 id 的位置由「它在旧顺序里
         // 的直接前驱」决定，漏传就退化成按展示序缀尾 —— 关闭期间拖过一次之后
         // 重开就会掉到末尾（PR #63 初版的真实缺陷）。
-        const next = nextProviderOrderAfterDrop(openIds, closedIds, sourceId, row.id, dropPosition, order);
+        // 2026-10-26 起两组都能拖：`nextProviderOrderAfterGroupDrop` 会按
+        // 「源与目标各自属于哪一组」分流，跨组拖拽返回 null（组间顺序固定）。
+        const next = nextProviderOrderAfterGroupDrop(
+          openIds, closedIds, sourceId, row.id, dropPosition, order,
+        );
         if (next !== null) void onCommitOrder(next);
       },
     };
   };
 
   return React.createElement('div', {
-    // `--top`：顶部锚定。行数固定但窗口高度会变，垂直居中会让弹窗上下跳动
-    // （与模型列表同款，见 jet-hub-styles.js 中该修饰类的说明）。
-    className: 'dim-jh-modalOverlay dim-jh-modalOverlay--top',
+    // 遮罩层：垂直居中（2026-10-26 起全仓弹窗统一居中，`--top` 修饰类已删除）。
+    className: 'dim-jh-modalOverlay',
     onClick: (event) => { if (event.target === event.currentTarget) onClose(); },
   },
   React.createElement('div', {
@@ -5970,7 +6206,7 @@ function ProviderSwitchPanel({ providers, statuses, statusFailed, busyIds, onTog
     : React.createElement('p', { className: 'dim-jh-modalHint' },
         '关闭一个供应商 = 关闭它的全部模型（从对话框的模型选择里移除）并停用它的全部账号；'
         + '打开则恢复。关闭前会再确认一次。没有可关闭模型的供应商会被禁用（服务端也会拒绝）。'
-        + '拖动已打开的行可自定义顺序（顺序只保存在本机）；已关闭的供应商仍按默认顺序显示在底部。'),
+        + '拖动可自定义顺序（顺序只保存在本机）；已打开与已关闭各自排序，组间先后不变。'),
   // ⚠️ 供应商相关的提示必须在**这里**（弹窗内）显示，不能只挂在页面层：
   // 拖拽与开关切换都发生在弹窗打开期间，而弹窗遮罩是 fixed + z-index 3000，
   // 页面层的 notice 会被它整个盖住 —— 用户只会看到「操作没生效，却什么提示都没有」。
@@ -6021,6 +6257,11 @@ function ProviderSwitchPanel({ providers, statuses, statusFailed, busyIds, onTog
               onClick: (event) => { event.preventDefault(); event.stopPropagation(); },
             }, '⠿')
           : null,
+        // ⚠️ 供应商图标：左栏 rail 里一直有（同一个 `ProviderLogo`），
+        //    但这个**供应商弹窗**里的同一批清单从来没有 —— 两处列的是同一份
+        //    PROVIDERS，一有一无，用户在弹窗里只能靠读名字认供应商。
+        //    图标走 `row.id`（就是 provider id），与 `data-provider` 同源。
+        React.createElement(ProviderLogo, { provider: row.id }),
         React.createElement('span', { className: 'dim-jh-modelInfo' },
           React.createElement('strong', { className: 'dim-jh-modelName' }, row.label),
           React.createElement('code', { className: 'dim-jh-modelId' }, providerRowSummary(row))),
@@ -6041,7 +6282,7 @@ function ProviderSwitchPanel({ providers, statuses, statusFailed, busyIds, onTog
  * 「供应商 → 模型列表」统一管理屏。
  *
  * ## 它解决的问题
- * 此前模型开关只能从**某一家**供应商面板的「显示列表」进入（`ModelListPanel`），
+ * 此前模型开关只能从**某一家**供应商面板的「模型列表」进入（`ModelListPanel`），
  * 想关掉五个供应商里的若干模型就要来回切换五次。这一屏把全部供应商放进同一棵树，
  * 按需展开、统一搜索、逐家批量。
  *
@@ -6344,6 +6585,11 @@ function ModelCenterPanel({ providers, rpcCall, statuses }) {
                         React.createElement('button', { className: 'dim-jh-btn', onClick: resetFilters }, '清空筛选'))
                     : section.models.map(model => React.createElement(ModelToggle, {
                         key: model.id,
+                        // 模型中心**横跨全部供应商**，故图标必须按**分组所属**
+                        // 的那家取（`section.id`）。这里没有外层 `provider`
+                        // 可用 —— 也不能用当前选中的供应商，那会让每一行都
+                        // 顶着同一枚图标。
+                        provider: section.id,
                         model,
                         busy: sectionBusy || busyIds.has(busyKey(section.id, model.id)),
                         onToggle: (modelId, disabled) => void toggleModel(section.id, modelId, disabled),
@@ -6510,7 +6756,14 @@ function GatewayCards({ cards, renderRow, isExpanded, onToggle, onCopy, isCopied
               ? '这些条目没有回传供应商字段（上游数据异常），仍照实列出。'
               : `供应商 key：${card.provider}（模型 ID 的前缀就是它）`,
             onClick: () => onToggle(card.provider),
-          }, `${expanded ? '▾' : '▸'} ${label}`),
+          },
+            `${expanded ? '▾' : '▸'} `,
+            // ⚠️ 图标放在**按钮内部**（不是按钮旁边）：标题与图标要作为一个整体
+            //    被点击/换行。放外面时窄屏换行会把图标甩到上一行去。
+            //    `card.provider` 可能是空串（上游没回传供应商字段，卡片标题回落
+            //    到兜底名）—— `ProviderLogo` 对未知 id 返回 null，正好不留空位。
+            React.createElement(ProviderLogo, { provider: card.provider }),
+            ` ${label}`),
           React.createElement('span', { className: 'dim-jh-gatewayCardCount' },
             card.counts.fold > 0 && foldLabel !== ''
               ? `${card.counts.total} ${foldSuffix} · ${card.counts.fold} 个${foldLabel}`
@@ -6700,7 +6953,7 @@ function GatewayPanel({ status, busy, notice, onToggle, onToggleAllowLan, onRelo
   const allowLanDisabled = gatewayAllowLanSwitchDisabled(status);
   const allowLanAction = status?.allowLan ? '关闭' : '打开';
   return React.createElement('div', {
-    className: 'dim-jh-modalOverlay dim-jh-modalOverlay--top',
+    className: 'dim-jh-modalOverlay',
     onClick: (event) => { if (event.target === event.currentTarget) onClose(); },
   },
   React.createElement('div', {
@@ -7552,6 +7805,13 @@ function AggregatePanel({ rpcCall }) {
           'aria-hidden': 'true',
         }, '⠿')
       : null,
+    // ⚠️ 供应商图标（用户 2026-10-26：「给所有页面供应商和模型左侧 + 供应商图标」）。
+    //    聚合页的候选行此前只写「渠道名 · 模型 id」（`candidateRowLabel`），
+    //    整列同一种字色；而这一页恰恰是**逐条比较渠道**的地方（同一个模型在
+    //    buddy / codearts / lobsterai / loomy / … 各有一条候选），认渠道却只能
+    //    读名字。图标在这里的信息量比其它列表更大。
+    //    `candidate.provider` 就是渠道 id，与 `candidateRowLabel` 用的是同一个值。
+    React.createElement(ProviderLogo, { provider: candidate.provider }),
     React.createElement('span', { className: 'dim-jh-aggCandidateLabel' },
       candidateRowLabel(candidate)),
     // ⚠️ 只有探测过才显示到期提示 —— 否则显示「到期未知」会让用户以为查过了。
@@ -7845,7 +8105,7 @@ export function JetHubPage({ rpcCall }) {
   /**
    * 「供应商开关」弹窗的展开状态。
    *
-   * 与「显示列表」同款取舍：**关闭时不挂载**，避免每次进入设置页都为它做一次
+   * 与「模型列表」同款取舍：**关闭时不挂载**，避免每次进入设置页都为它做一次
    * 无谓的渲染；状态本身由页面级 `providerStatuses` 提供，不额外发请求。
    */
   const [showProviderSwitches, setShowProviderSwitches] = React.useState(false);

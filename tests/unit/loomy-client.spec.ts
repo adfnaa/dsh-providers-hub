@@ -121,15 +121,32 @@ describe('Loomy 客户端接线', () => {
    * 端点已通用化为 `credits.permanentLock`（CodeBuddy / WorkBuddy 共用），
    * 故这里断言的是「带 provider 的通用调用」而不是老的裸端点名 ——
    * ⚠️ **漏传 provider 会锁错对象**（三个 provider 各有一份状态）。
+   *
+   * ⚠️ 2026-10-26 用户要求「解锁/锁定永久积分改为图标+永久积分」：按钮上的文字
+   * 已**固定**为「永久积分」，锁定/解锁的差别只剩图标形态与 `data-kind`。
+   * 因此下面断言的不再是「按钮文字随状态切换」，而是：
+   * ① 文字固定（不能有人把状态又塞回文字里，那会与图标重复且宽度跳动）；
+   * ② `aria-label` 必须**说动作**（读屏用户看不到图标，只念「永久积分」等于没信息）；
+   * ③ 两个动作字面量都得在（它们就是 aria-label 的取值，缺一个等于某状态无标签）。
    */
   it('Loomy 渲染「锁定 / 解锁永久积分」按钮并走通用 credits.permanentLock', () => {
     expect(hubSource).toContain('supportsPermanentLock')
     expect(hubSource).toContain("'credits.permanentLock'")
     expect(hubSource).toMatch(/rpcCall\('credits\.permanentLock', \{ provider \}\)/)
     expect(hubSource).toMatch(/rpcCall\('credits\.permanentLock', \{ provider, locked: next \}\)/)
-    // 文案随状态切换
+    // 两个动作字面量都在（= aria-label 的两种取值）
     expect(hubSource).toContain("'解锁永久积分'")
     expect(hubSource).toContain("'锁定永久积分'")
+    // 按钮文字固定为「永久积分」，不再随状态切换
+    expect(hubSource).toContain("lockBusy ? '处理中…' : '永久积分'")
+    // ⚠️ 不能用 not.toContain("permanentLocked ? '解锁永久积分' : '锁定永久积分'")
+    //    —— aria-label 用的就是这个三元，那样写会打到它自己。
+    //    正确的判据是**次数**：两个动作字面量各只允许出现一次（都在 aria-label 上），
+    //    文字子节点若又长出三元就会变成两次。
+    expect((hubSource.match(/'解锁永久积分'/g) ?? []).length, '「解锁永久积分」只允许出现在 aria-label 里一次')
+      .toBe(1)
+    expect((hubSource.match(/'锁定永久积分'/g) ?? []).length, '「锁定永久积分」只允许出现在 aria-label 里一次')
+      .toBe(1)
   })
 
   it('锁定状态在面板挂载时读取一次（且只对支持的 provider 发请求）', () => {
