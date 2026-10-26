@@ -111,8 +111,36 @@ export const BODY_LIMIT = 300 * 1024 * 1024
  *
  * 取值：足够让刚被 abort 的流把已缓冲的帧刷给客户端（避免连接重置），又短到
  * 用户感知不到延迟。超时后由 `closeAllConnections()` 强制断开。
+ *
+ * ⚠️ **光有这个窗口不够**（2026-10-26 审计实测）：窗口期内若只是干等，它
+ * **结构性 100% 失效** —— `= 0` 与 `= 250` 的客户端输出逐字节相同，每一次都
+ * 走到强制断开。必须配合 {@link CLOSE_IDLE_POLL_MS} 的轮询才能真正「救下」
+ * 正常收尾的连接。
  */
 export const CLOSE_GRACE_MS = 250
+
+/**
+ * 宽限期内**轮询 `closeIdleConnections()`** 的间隔。
+ *
+ * ⚠️⚠️ 存在的理由（2026-10-26 审计打穿「宽限窗口」的实现）：
+ *
+ * `server.close()` 在返回前会**自己**调一次 `closeIdleConnections()`，但那一刻
+ * 响应通常还在写（`response.end()` 发生在 `close()` 之后几毫秒）⇒ socket 不算
+ * idle ⇒ **那一次调用无效**。此后上一版代码再也不调，只能干等到
+ * {@link CLOSE_GRACE_MS} 超时 ⇒ 每一次带在途连接的 close 都强制断开。
+ *
+ * 实测证据（审计 V1/V2）：`CLOSE_GRACE_MS = 0` 与 `= 250` 两种配置下，客户端
+ * 收到的**字节数逐字节相同**（4979527B）、`err = null`、`ended = true`
+ * ⇒ 250ms 是**纯延迟**，注释里「绝大多数情况在这里就完事」「避免连接重置」
+ * 两句都不成立。
+ *
+ * 加上轮询后（审计 V3 实证）：每 20ms 扫一次 ⇒ 流一收尾 socket 立刻被回收
+ * ⇒ `close()` 回调 **1ms** 就触发，**根本走不到强制断开**。
+ *
+ * 取值 20ms：远小于宽限窗口（250ms）⇒ 窗口内能扫 12 次，足够覆盖「流收尾 →
+ * socket 变 idle」的任意时刻；又不会让定时器本身成为可测的 CPU 开销。
+ */
+export const CLOSE_IDLE_POLL_MS = 20
 
 /**
  * 强制断开之后，等底层确认关闭的**上限**。
@@ -694,10 +722,36 @@ export function createOpenAiGateway(options: OpenAiGatewayOptions): OpenAiGatewa
       })
       // 先挂上 catch，避免宽限竞速期间产生 unhandledRejection。
       const settled = closed.then(() => 'ok' as const, () => 'err' as const)
+      // ⚠️⚠️ **宽限期内必须周期性调 `closeIdleConnections()`**（2026-10-26 审计）。
+      //
+      // 上一版只是「干等 250ms」——实测那个窗口**结构性 100% 失效**：
+      // `CLOSE_GRACE_MS = 0` 与 `= 250` 的客户端输出**逐字节相同**（4979527B），
+      // 即每一次带在途连接的 close 都必然走到强制断开，注释里「绝大多数情况在
+      // 这里就完事」「避免连接重置」两句都不成立。
+      //
+      // 根因：`server.close()` 返回前会**自己**调一次 `closeIdleConnections()`，
+      // 但那一刻响应还在写（`response.end()` 发生在 `close()` 之后几毫秒）⇒
+      // socket 不是 idle ⇒ 那一次调用无效。之后代码**再也不调**，只能干等超时。
+      //
+      // ⇒ 修法：宽限期内每 {@link CLOSE_IDLE_POLL_MS} 轮询一次。流一旦收尾、
+      //   socket 变 idle，下一次轮询就把它回收 ⇒ `close()` 回调随即触发，
+      //   根本走不到强制断开。审计已实证：轮询后 close 回调 **1ms** 就触发。
+      const idleSweeper = typeof current.closeIdleConnections === 'function'
+        ? setInterval(() => {
+          // 立刻补扫一次：`server.close()` 那次自扫很可能落在「响应还在写」的
+          // 时刻（见上面根因），所以第一个 tick 不能等满一个周期。
+          current.closeIdleConnections()
+        }, CLOSE_IDLE_POLL_MS)
+        : undefined
+      idleSweeper?.unref?.()
+      // ⚠️ 首个 tick 前先手动补扫一次：`setInterval` 的第一个回调要等一个周期，
+      // 而「响应刚 end」这个瞬间往往就在这个周期内 —— 不补的话白等一个周期。
+      if (typeof current.closeIdleConnections === 'function') current.closeIdleConnections()
       const raced = await Promise.race([
         settled,
         new Promise<'timeout'>((resolve) => setTimeout(() => resolve('timeout'), CLOSE_GRACE_MS).unref?.()),
       ])
+      if (idleSweeper !== undefined) clearInterval(idleSweeper)
       if (raced === 'timeout') {
         outcome = 'forced'
         // ⚠️ 强制断开后**仍要等 close 的回调**：否则下一次 `listen()` 可能与尚未

@@ -135,8 +135,10 @@ describe('修复验证：Issue #11', () => {
     // 换绑必须真的成功
     expect(runtime.isGatewayRunning()).toBe(true)
     expect(runtime.gatewayAddress()?.host).toBe('0.0.0.0')
-    // 强制断开必须有痕迹（不能静默）
-    expect(logs.some((l) => l.includes('强制断开'))).toBe(true)
+    // ⚠️ 这里**不再**断言「强制断开」——2026-10-26 加了 `CLOSE_IDLE_POLL_MS`
+    // 轮询后，本用例的流**守 abort**（abort 后立即收尾）⇒ socket 会在宽限窗口内
+    // 变 idle 被回收 ⇒ **根本走不到强制断开**（那是修复生效的证据）。
+    // 「强制断开」这条腿由下面「流完全无视 abort」的用例单独锁住。
 
     agent.destroy(); req.destroy()
   }, 40000)
@@ -609,6 +611,128 @@ describe('修复验证：Issue #11', () => {
       expect(elapsed).toBeLessThan(3000)
     } finally {
       http.Server.prototype.closeAllConnections = origCloseAll
+      rmSync(home, { recursive: true, force: true })
+    }
+  }, 30_000)
+
+  /**
+   * ★★ 宽限窗口必须**真的**生效（2026-10-26 审计打穿「写了等于没写」）。
+   *
+   * 审计实测：`CLOSE_GRACE_MS = 0` 与 `= 250` 的客户端输出**逐字节相同**
+   * （4979527B / `err=null` / `ended=true`）⇒ 那 250ms 是**纯延迟**，
+   * 每一次带在途连接的 close 都必然走到强制断开，注释里「绝大多数情况在这里
+   * 就完事」「避免连接重置」两句都不成立。
+   *
+   * 根因：`server.close()` 返回前**自己**调的那次 `closeIdleConnections()` 落在
+   * 「响应还在写」的时刻（`response.end()` 在 `close()` 之后几毫秒）⇒ socket 不算
+   * idle ⇒ 无效；此后上一版代码再也不调，只能干等超时。
+   *
+   * 修法：宽限期内每 `CLOSE_IDLE_POLL_MS`(20ms) 轮询一次 + 首个 tick 前手动补扫。
+   */
+  it('★★ 流在宽限内收尾时必须**不**强制断开（轮询让宽限真正生效）', async () => {
+    const { createOpenAiGateway } = await import('../../src/openai-gateway/server.js')
+    const home = mkdtempSync(join(tmpdir(), 'gw-lifecycle-grace-'))
+    const warns: string[] = []
+    try {
+      const port = await freePort()
+      const gateway = createOpenAiGateway({
+        home,
+        env: { ...process.env, DSH_OPENAI_GATEWAY_API_KEY: 'k', DSH_OPENAI_GATEWAY_PORT: String(port) },
+        logger: {
+          info: () => {},
+          warn: (m: string) => { warns.push(m) },
+          error: () => {},
+        },
+        llm: {
+          listProviders: () => ['fake'],
+          listModels: async () => [{ id: 'fake-model', name: 'fake' }],
+          resolveModelInfo: async () => ({ id: 'fake-model' }),
+          async *stream(options: { signal?: AbortSignal }) {
+            yield { type: 'text-delta', text: 'hello' } as never
+            // abort 后 50ms 收尾 —— 远早于 250ms 宽限
+            await new Promise<void>((resolve) => {
+              const s = options?.signal
+              if (s === undefined) return
+              if (s.aborted) return resolve()
+              s.addEventListener('abort', () => resolve(), { once: true })
+            })
+            await new Promise<void>((r) => setTimeout(r, 50))
+          },
+        } as never,
+      })
+      await gateway.start()
+
+      const probe = request({
+        host: '127.0.0.1', port, path: '/v1/chat/completions', method: 'POST', timeout: 20000,
+        headers: { 'content-type': 'application/json', authorization: 'Bearer k' },
+      }, (res) => { res.resume() })
+      probe.on('error', () => {})
+      probe.end(JSON.stringify({ model: 'fake/fake-model', stream: true, messages: [{ role: 'user', content: 'hi' }] }))
+      await new Promise((r) => setTimeout(r, 200))
+
+      const t0 = Date.now()
+      await gateway.close()
+      const elapsed = Date.now() - t0
+      probe.destroy()
+
+      // ⚠️ 修复前这里是 true（审计实测：每一次都强制断开）
+      expect(warns.some((w) => w.includes('强制断开'))).toBe(false)
+      // 且必须明显快于「干等满 250ms 再强制断开」
+      expect(elapsed).toBeLessThan(250)
+    } finally {
+      rmSync(home, { recursive: true, force: true })
+    }
+  }, 30_000)
+
+  /**
+   * ★ 反向对照：轮询**救不了**「根本不收尾」的连接 —— 强制断开这条腿必须保留。
+   *
+   * ⚠️ 没有这条，把 `closeAllConnections()` 整段删掉也不会红（缺陷1 只看
+   * 「快速返回」，而轮询会让它快速返回）。
+   */
+  it('★ 流完全无视 abort 时仍必须强制断开（轮询不得取代强制断开）', async () => {
+    const { createOpenAiGateway } = await import('../../src/openai-gateway/server.js')
+    const home = mkdtempSync(join(tmpdir(), 'gw-lifecycle-noabort-'))
+    const warns: string[] = []
+    try {
+      const port = await freePort()
+      const gateway = createOpenAiGateway({
+        home,
+        env: { ...process.env, DSH_OPENAI_GATEWAY_API_KEY: 'k', DSH_OPENAI_GATEWAY_PORT: String(port) },
+        logger: {
+          info: () => {},
+          warn: (m: string) => { warns.push(m) },
+          error: () => {},
+        },
+        llm: {
+          listProviders: () => ['fake'],
+          listModels: async () => [{ id: 'fake-model', name: 'fake' }],
+          resolveModelInfo: async () => ({ id: 'fake-model' }),
+          async *stream() {
+            yield { type: 'text-delta', text: 'hi' } as never
+            // 完全无视 abort
+            await new Promise<void>(() => {})
+          },
+        } as never,
+      })
+      await gateway.start()
+      const agent = new Agent({ keepAlive: true, maxSockets: 1 })
+      const req = request({
+        host: '127.0.0.1', port, path: '/v1/chat/completions', method: 'POST', agent, timeout: 30000,
+        headers: { 'content-type': 'application/json', authorization: 'Bearer k' },
+      }, (res) => { res.resume() })
+      req.on('error', () => {})
+      req.end(JSON.stringify({ model: 'fake/fake-model', stream: true, messages: [{ role: 'user', content: 'hi' }] }))
+      await new Promise((r) => setTimeout(r, 300))
+
+      const t0 = Date.now()
+      await gateway.close()
+      const elapsed = Date.now() - t0
+      agent.destroy(); req.destroy()
+
+      expect(warns.some((w) => w.includes('强制断开'))).toBe(true)
+      expect(elapsed).toBeLessThan(3000)
+    } finally {
       rmSync(home, { recursive: true, force: true })
     }
   }, 30_000)
