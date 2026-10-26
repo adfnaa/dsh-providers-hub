@@ -189,6 +189,10 @@ describe('修复验证：Issue #11', () => {
       const id = ++n
       return {
         async start() { events.push(`start#${id}`) },
+        // ⚠️ 换绑现在走 `detachListen()` 交端口 + 后台 `close({drainActiveMs})`
+        // 排水（IKQODR 缺陷 2）⇒ 假实例**必须**实现 detachListen，否则那条腿被
+        // try/catch 静默跳过，事件序列里就看不到「交出端口」这一步。
+        detachListen() { events.push(`detach#${id}`) },
         async close() {
           events.push(`close#${id}:begin`)
           await new Promise((r) => setTimeout(r, 100))
@@ -223,16 +227,25 @@ describe('修复验证：Issue #11', () => {
     // 只数 start/close 的次数**抓不到它**（原 bug 下 start=2、close=1，
     // 而 `close >= start - 1` 恰好成立 ⇒ 恒真）。
     //
-    // 正确实现（串行化）下，每次重建都必须在**前一个实例彻底关掉之后**才开始。
+    // ⚠️ 判据更新（IKQODR 缺陷 2 之后）：换绑**不再等** close 完成，而是
+    // 「detachListen 交端口 → 新实例立刻 start → 旧实例后台排水」⇒ 旧实例的
+    // `close#N:end` 出现在 `start#N+1` 之后是**设计如此**，不是泄漏。
+    //
+    // 真正的泄漏判据变成：**旧实例是否交出了端口**。没 detach 就让新实例起来
+    // （或旧实例压根没人管）才是泄漏 —— 那会让两个实例同时持有监听。
     const firstStartOf = (id: number): number => events.indexOf(`start#${id}`)
-    const closeEndOf = (id: number): number => events.indexOf(`close#${id}:end`)
+    const detachOf = (id: number): number => events.indexOf(`detach#${id}`)
+    const closeBeginOf = (id: number): number => events.indexOf(`close#${id}:begin`)
     let overlaps = 0
     for (let id = 2; id <= n; id += 1) {
       const started = firstStartOf(id)
-      const prevClosed = closeEndOf(id - 1)
+      // 前一个实例必须在后一个 start **之前**交出端口（detach），且它的排水
+      // 必须已经发起（close:begin）—— 两者缺一都说明旧实例没人管。
+      const prevDetached = detachOf(id - 1)
+      const prevClosing = closeBeginOf(id - 1)
       if (started === -1) continue
-      // 前一个实例压根没被关（或关在它启动之后）⇒ 重叠。
-      if (prevClosed === -1 || prevClosed > started) overlaps += 1
+      if (prevDetached === -1 || prevClosing === -1) { overlaps += 1; continue }
+      if (prevDetached > started || prevClosing > started) { overlaps += 1; continue }
     }
     expect(overlaps).toBe(0)
 

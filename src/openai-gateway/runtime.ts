@@ -1,6 +1,6 @@
 import { isGatewayEnabled, isGatewayHostFromEnv, WILDCARD_GATEWAY_HOST } from './config.js'
 import type { ApiKeySource } from './auth.js'
-import type { OpenAiGateway } from './server.js'
+import { CLOSE_DRAIN_ACTIVE_MS, type OpenAiGateway } from './server.js'
 import type { RpcGatewayLastError } from '../types.js'
 
 /**
@@ -146,10 +146,17 @@ export function gatewayApiKey(): ApiKeySource | null {
  *
  * 关闭失败**不代表实例还活着**：调用方在调用前就已经把 `running` 复位了，
  * 所以这里只需把失败降级成一条日志（含实例身份，便于排查是哪一个）。
+ *
+ * @param drainActiveMs 给在途请求的排水窗口（见 `OpenAiGateway.close` 的语义表）。
+ *   缺省 `0` = 立刻中断 —— **用户主动关网关**的预期语义。
  */
-async function closeQuietly(gateway: OpenAiGateway, reason: string): Promise<void> {
+async function closeQuietly(
+  gateway: OpenAiGateway,
+  reason: string,
+  drainActiveMs = 0,
+): Promise<void> {
   try {
-    await gateway.close()
+    await gateway.close({ drainActiveMs })
   } catch (error) {
     const detail = error instanceof Error ? error.message : String(error)
     console.warn(`[openai-gateway] 关闭实例失败（${reason}）：${detail}`)
@@ -283,11 +290,33 @@ async function convergeOnce(): Promise<void> {
     lastError = null
     return
   }
-  // 需要（重）建：先关旧实例（换绑必须重建——listen 的地址创建时定格）。
+  // 需要（重）建：换绑必须重建（`listen()` 的地址在创建时定格）。
+  //
+  // ⚠️⚠️ 换绑**不能**走「先 await close() 再起新实例」（Gitee issue IKQODR 缺陷 2）：
+  // 那样叠加出两个用户可见后果 —— ① 在途流被 `close()` 当场 abort（实测一轮 6 帧
+  // 的流只收到 3 帧）；② 空窗期下游全被拒（实测 `ECONNREFUSED`）。
+  //
+  // 改成「先交端口 → 新实例接管 → 旧实例后台排水」：
+  // - `detachListen()` 同步停 accept 并释放端口（实测 Node 24 之后同端口可立即
+  //   `listen()`，已建立连接不受影响）⇒ 空窗期缩到近乎为零；
+  // - 排水**不阻塞**换绑：`void` 出去，新实例立刻能起。旧实例多活一会儿没有任何
+  //   用户可见成本（端口已交出、新连接已由新实例接管）。
   if (running !== undefined) {
     const stale = running
     running = undefined
-    await closeQuietly(stale, '换绑重建')
+    // ⚠️ `detachListen` 是**同步**的，且必须在起新实例**之前**调用（否则端口还被
+    // 旧实例占着 ⇒ 新实例 `listen` 撞 EADDRINUSE）。
+    try {
+      stale.detachListen()
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error)
+      console.warn(`[openai-gateway] 交出监听端口失败（换绑重建）：${detail}`)
+    }
+    // 后台排水：给在途请求跑完的窗口（`CLOSE_DRAIN_ACTIVE_MS`），不 await。
+    void stale.close({ drainActiveMs: CLOSE_DRAIN_ACTIVE_MS }).catch((error: unknown) => {
+      const detail = error instanceof Error ? error.message : String(error)
+      console.warn(`[openai-gateway] 旧实例排水失败（换绑重建）：${detail}`)
+    })
   }
   if (factory === undefined) {
     // 装配异常：没有工厂就永远起不来，必须让面板看见（Issue #11 建议 ②）。
@@ -393,7 +422,18 @@ export async function disposeGatewayRuntime(): Promise<void> {
     // ⚠️ 这里不能抛（Issue #11）：本函数由 `ctx.effect` 的清理回调调用，
     // 抛错会变成一条无主的 unhandledRejection，而卸载流程必须走完（下面还要
     // 清密钥，否则热重载后新实例会沿用旧配置）。
-    await closeQuietly(gateway, '插件卸载')
+    //
+    // ⚠️ 卸载给在途请求**排水窗口**（Gitee issue IKQODR 缺陷 2）：插件重载时
+    // 用户并没有要求中断任何请求。但这里**不能**真的等满 `CLOSE_DRAIN_ACTIVE_MS`
+    // （10 分钟）—— 卸载是同步契约，等那么久会让 `ctx.effect` 的清理回调挂死。
+    // 折中：先交端口（不砍请求），排水交给后台、不 await。
+    try {
+      gateway.detachListen()
+    } catch { /* 已 detach，忽略 */ }
+    void gateway.close({ drainActiveMs: CLOSE_DRAIN_ACTIVE_MS }).catch((error: unknown) => {
+      const detail = error instanceof Error ? error.message : String(error)
+      console.warn(`[openai-gateway] 卸载排水失败：${detail}`)
+    })
   }
   // 密钥一并清掉：热重载后的新实例会重新解析，避免旧密钥被新配置继续使用。
   lastApiKey = null

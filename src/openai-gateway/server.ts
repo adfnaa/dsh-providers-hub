@@ -70,7 +70,38 @@ export interface OpenAiGatewayOptions {
 
 export interface OpenAiGateway {
   start(): Promise<void>
-  close(): Promise<void>
+  /**
+   * 关闭实例。
+   *
+   * @param options.drainActiveMs 允许**在途请求**跑完的窗口（毫秒）。
+   *   - `0`（缺省）：立刻中断在途请求 —— **用户主动关网关**的语义（「我要它现在停」）；
+   *   - `> 0`：先停接入、再等 `active` 排空到该上限，只有超时才 abort。
+   *     **换绑/热重载**用它（见 {@link OpenAiGateway.detachListen} 的理由）。
+   */
+  close(options?: { drainActiveMs?: number }): Promise<void>
+  /**
+   * **只交出监听端口**，把在途请求留给后台排水（Gitee issue IKQODR 缺陷 2）。
+   *
+   * ## 为什么需要它
+   *
+   * `listen()` 的绑定地址在创建时定格，所以「允许局域网访问」翻转只能**重建实例**。
+   * 而换绑原先是「先 `await close()`、再起新实例」⇒ 两者叠加出两个用户可见后果：
+   *
+   * 1. **在途流被当场砍断**（`close()` 第一行就 `abort()`，250ms 只够刷缓冲，
+   *    实测一轮 6 帧的流只收到 3 帧就被 abort）；
+   * 2. **空窗期下游全被拒**（实测换绑窗口内探测到 `ECONNREFUSED`）。
+   *
+   * 本方法把「交端口」与「关实例」拆开：
+   * - `closeIdleConnections()`：清掉空闲 keep-alive（它们不承载在途响应，却会让
+   *   close 回调等满 `keepAliveTimeout` 的 120s）；
+   * - `close()`：**停止 accept、释放端口**（实测 Node 24：之后同端口可立即重新
+   *   `listen()`，已建立的连接不受影响）；
+   * - **不 abort**：在途响应继续跑，由后续 `close({ drainActiveMs })` 排水。
+   *
+   * ⇒ 换绑流程变成「旧实例 detachListen() → 新实例 start() 接管新连接 →
+   *   旧实例后台排水」，**端口空窗期缩到近乎为零**，且不砍断在途请求。
+   */
+  detachListen(): void
   address(): { host: string; port: number }
   /**
    * 密钥来源（含本体与文件路径）。
@@ -141,6 +172,25 @@ export const CLOSE_GRACE_MS = 250
  * socket 变 idle」的任意时刻；又不会让定时器本身成为可测的 CPU 开销。
  */
 export const CLOSE_IDLE_POLL_MS = 20
+
+/**
+ * **换绑/热重载**时给在途请求的排水窗口（毫秒）。
+ *
+ * ⚠️ 存在的理由（Gitee issue IKQODR 缺陷 2）：原先 `close()` 第一行就
+ * `controller.abort()`，250ms 宽限只够把已缓冲的帧刷出去，**不够任何一轮真实
+ * 请求跑完**。实测：一轮 6 帧（每帧 100ms）的流，换绑时只收到 **3 帧**就被砍断，
+ * 内容半截。
+ *
+ * 换绑与「用户主动关网关」是**两种不同语义**：
+ * - 用户关网关：「我要它现在就停」⇒ 立刻中断是预期行为（`drainActiveMs: 0`）；
+ * - 换绑/热重载：**用户没想中断任何请求**，只是改了监听地址 ⇒ 应当让在途请求
+ *   跑完。而且因为端口已经交给新实例（`detachListen()`），让旧实例多活一会儿
+ *   **没有任何用户可见成本** —— 它防的只是「一个已无人在读的请求永久占住实例」。
+ *
+ * 取值 10 分钟：外部 agent 一轮含多次工具调用、跑几十分钟很正常。这个值只决定
+ * 「什么时候放弃等待并 abort」，不阻塞任何用户可见路径（新实例已接管）。
+ */
+export const CLOSE_DRAIN_ACTIVE_MS = 10 * 60 * 1000
 
 /**
  * 强制断开之后，等底层确认关闭的**上限**。
@@ -372,6 +422,69 @@ export function createOpenAiGateway(options: OpenAiGatewayOptions): OpenAiGatewa
   }
 
   /**
+   * 启动「周期性清理空闲连接」的定时器（见 `close()` 里的长注释）。
+   *
+   * ⚠️ 首个 tick 前**手动补扫一次**：`setInterval` 的第一个回调要等一个周期，
+   * 而「响应刚 end、socket 变 idle」这个瞬间往往就落在那个周期内 —— 不补扫的话
+   * 白等一个周期，宽限窗口被浪费掉 {@link CLOSE_IDLE_POLL_MS} 毫秒。
+   *
+   * @returns 定时器句柄；宿主没有该 API 时返回 `undefined`（调用方需 `clearInterval`）
+   */
+  const startIdleSweeper = (target: Server): ReturnType<typeof setInterval> | undefined => {
+    if (typeof target.closeIdleConnections !== 'function') return undefined
+    target.closeIdleConnections()
+    const timer = setInterval(() => {
+      // ⚠️ 目标可能已被强制断开/关闭，`closeIdleConnections` 在那种状态下仍是安全
+      // 的空操作（Node 实测不抛）；仍包一层是因为我们**不能**让定时器里的异常
+      // 变成 uncaughtException（那会打死整个 DSH 进程）。
+      try { target.closeIdleConnections() } catch { /* 已关闭，忽略 */ }
+    }, CLOSE_IDLE_POLL_MS)
+    timer.unref?.()
+    return timer
+  }
+
+  /**
+   * 等在途请求排空，最多等 `budgetMs`。
+   *
+   * @returns `true` = 已排空；`false` = 预算耗尽仍有在途
+   *
+   * ⚠️ 用**轮询**而不是事件通知：`active` 是 `Set<AbortController>`，`withRequest`
+   * 的 `finally` 里 `delete`，但没有「集合变空」的事件。加一套事件机制的复杂度
+   * 远高于每 {@link CLOSE_IDLE_POLL_MS} 看一眼（而且这个值已经被验证足够细）。
+   */
+  const awaitActiveDrained = async (budgetMs: number): Promise<boolean> => {
+    const deadline = Date.now() + budgetMs
+    while (active.size > 0) {
+      if (Date.now() >= deadline) return false
+      await new Promise<void>((resolve) => {
+        const timer = setTimeout(resolve, CLOSE_IDLE_POLL_MS)
+        timer.unref?.()
+      })
+    }
+    return true
+  }
+
+  /**
+   * 只处理在途请求（监听已由 `detachListen()` 交出）。
+   *
+   * 换绑流程：`detachListen()` 交端口 → 新实例接管 → 旧实例调本函数排水。
+   * 此时 `server === undefined`，但 `active` 可能非空 —— 早退会让排水静默失效
+   * （在途请求永久占着实例，且没人再管它们）。
+   */
+  const closeActiveOnly = async (drainActiveMs: number): Promise<void> => {
+    if (drainActiveMs > 0) {
+      const drained = await awaitActiveDrained(drainActiveMs)
+      if (!drained) {
+        logger.warn(
+          `[openai-gateway] 在途请求未在 ${drainActiveMs}ms 内跑完，将中断剩余 ${active.size} 个`,
+        )
+      }
+    }
+    for (const controller of active) controller.abort()
+    logger.info('[openai-gateway] 已关闭')
+  }
+
+  /**
    * 两个端点共用的「请求生命周期」外壳：绑定取消、统一错误翻译。
    *
    * ⚠️ **必须共用**：`/v1/chat/completions` 与 `/v1/responses` 的错误出口若各写
@@ -464,21 +577,29 @@ export function createOpenAiGateway(options: OpenAiGatewayOptions): OpenAiGatewa
       const fullId = `${route.provider}/${route.model}`
       if (body.stream === true) {
         writeSseHead(response)
+        // ⚠️⚠️ 同 `handleResponses` 的缺陷（Gitee issue IKQODR 缺陷 1 §4.3）：
+        //
+        // `toOpenAiSse` 的**四个出口都会发** `[DONE]`（上游错误 / 缺 finish /
+        // 正常结束 / catch 分支各一条）。而上一版在循环之后再无条件补发一条
+        // ⇒ **正常结束时客户端收到两个 `[DONE]`**（实测确认）。
+        //
+        // 多数客户端读到一个就结束、能容忍重复；但严格按协议解析的实现会把它当
+        // 异常收尾。两个端点必须**同口径**（都是「只在真被打断时才补」）。
+        let interrupted = false
         for await (const event of toOpenAiSse(stream, undefined, fullId, makeSuggestion(fullId))) {
-          if (signal.aborted || response.destroyed) break
+          if (signal.aborted || response.destroyed) {
+            interrupted = true
+            break
+          }
           response.write(event)
         }
-        // ⚠️ 被 abort（网关换绑/关闭）时补发终止帧（对抗审计发现）。
+        // 只在**真的被打断**（网关换绑/关闭）时补发终止帧：
+        // 否则客户端收到**没有 `data: [DONE]` 的半截 SSE**，严格按 OpenAI 协议
+        // 解析的客户端会把这次收尾当成**异常截断**（它等的正是 `[DONE]`）。
         //
-        // 原先 `break` 之后直接 `end()` ⇒ 客户端收到**没有 `data: [DONE]` 的
-        // 半截 SSE**。实测（审计 RST）：客户端事件是 `["status:200","end"]`
-        // 但 `body` 里**没有 `[DONE]`** ⇒ 严格按 OpenAI 协议解析的客户端会
-        // 把这次「正常收尾」当成**异常截断**（它等的正是 `[DONE]`）。
-        //
-        // 只在「还没被 destroyed」时补：socket 已经没了就没必要写（写也白写）。
         // ⚠️ 这里**不是**在掩盖错误：abort 是调用方主动发起的（换绑/关闭），
         // 补 `[DONE]` 等于告诉客户端「这轮到此为止」，是协议要求的最小收尾。
-        if (!response.destroyed && !response.writableEnded) {
+        if (interrupted && !response.destroyed && !response.writableEnded) {
           try { response.write('data: [DONE]\n\n') } catch { /* socket 已断，忽略 */ }
         }
         if (!response.writableEnded) response.end()
@@ -529,19 +650,38 @@ export function createOpenAiGateway(options: OpenAiGatewayOptions): OpenAiGatewa
       const responseId = `resp_${randomUUID().replaceAll('-', '')}`
       if (body.stream === true) {
         writeSseHead(response)
+        // ⚠️⚠️ 必须区分「循环为什么结束」（Gitee issue IKQODR 缺陷 1，用户报障）：
+        //
+        // `for await` 结束有**两种**成因，而上一版没区分：
+        //   ① 上游流**自然收尾** —— `toResponsesSse` 已经 yield 了
+        //      `response.completed`（截断时是 `response.incomplete`，上游失败时是
+        //      `response.failed`，都由它负责）；
+        //   ② 本轮**被中断**（`signal.aborted` / `response.destroyed`）——
+        //      生成器被提前 return，流里**没有任何终止事件**。
+        //
+        // 上一版只检查 `!response.writableEnded`，而**自然收尾时它同样是 false**
+        // （此时还没调 `end()`）⇒ ① 也命中 ⇒ **每一次成功的请求都被追加一条
+        // `response.failed`，客户端把已经完整收到的一轮判为失败**，且文案谎称
+        // 「网关已关闭」而网关根本没关。实测（issue 复现）：事件序列末尾是
+        // `response.completed` → `response.failed`。
+        //
+        // ⚠️ 这个坑极易误导排查：原注释写的是「被 abort 时补发」——读起来像条件
+        //   已经存在，而代码里没有。**注释描述意图，不等于实现了意图。**
+        let interrupted = false
         for await (const event of toResponsesSse(stream, responseId, fullId, body, makeSuggestion(fullId))) {
-          if (signal.aborted || response.destroyed) break
+          if (signal.aborted || response.destroyed) {
+            interrupted = true
+            break
+          }
           response.write(event)
         }
-        // ⚠️ 被 abort 时补发终止事件（对抗审计发现，与 `/v1/chat/completions`
-        // 的 `[DONE]` 同族但**协议不同**）：Responses 的流以 `response.completed`
-        // 或 `response.failed` 结束（见 `responses.ts` 的注释），官方 SDK 依此判定
-        // 结束。原先 `break` 后直接 `end()` ⇒ 客户端收到**没有任何终止事件的
-        // 半截流**，会被当成异常截断。
+        // 只在**真的被打断**时补发终止事件（原意图完整保留）：否则客户端会停在
+        // 一个没有终止事件的半截流上。Responses 的流必须以 `response.completed`
+        // 或 `response.failed` 之一结束（见 `responses.ts` 的注释）。
         //
         // ⚠️ 用 `response.failed` 而不是 `completed`：本轮确实被中途取消了，
         // 谎报 `completed` 会让客户端把半截输出当完整结果持久化。
-        if (!response.destroyed && !response.writableEnded) {
+        if (interrupted && !response.destroyed && !response.writableEnded) {
           try {
             response.write(`event: response.failed\ndata: ${JSON.stringify({
               type: 'response.failed',
@@ -700,15 +840,36 @@ export function createOpenAiGateway(options: OpenAiGatewayOptions): OpenAiGatewa
      * ⚠️ `closeAllConnections` 需要 Node ≥ 18.2；本包 `engines` 是
      * `^22.19.0 || >=24.0.0`，且仍做特性检测以兼容被裁剪的运行环境。
      */
-    async close(): Promise<void> {
-      for (const controller of active) controller.abort()
+    /**
+     * 关闭实例；`drainActiveMs > 0` 时先给在途请求排水的窗口（见接口注释）。
+     *
+     * ## 语义分层（Gitee issue IKQODR 缺陷 2）
+     *
+     * | 调用方 | `drainActiveMs` | 行为 |
+     * |---|---|---|
+     * | 用户主动关网关 | `0`（缺省） | **立刻 abort** 在途请求（预期行为） |
+     * | 换绑 / 插件卸载 | `CLOSE_DRAIN_ACTIVE_MS` | 先停接入、等在途跑完，超时才 abort |
+     *
+     * ⚠️ 排水顺序很重要：**先 `close()` 停接入、再等 active 排空、最后才 abort**。
+     * 反过来（先 abort）就退化成原行为 —— 那正是本 issue 报的「在途被砍」。
+     */
+    async close(options?: { drainActiveMs?: number }): Promise<void> {
+      const drainActiveMs = options?.drainActiveMs ?? 0
       // ⚠️ 先请求「正在启动中」的实例放弃（见 pendingStart 的理由）：否则那个
       // `start()` 会永远等一个不会到来的 `listening` 事件。
       if (pendingStart !== undefined) {
         pendingStart.cancel()
         pendingStart = undefined
       }
-      if (server === undefined) return
+      if (server === undefined) {
+        // ⚠️ 已 detachListen 过（server 槽位已摘除）时**仍要处理在途请求**：
+        // 换绑流程会先 detachListen 交端口、再调 close({drainActiveMs}) 排水，
+        // 此时 `server === undefined` 但 `active` 可能非空。早退会让排水静默失效
+        // （在途请求永久占着实例，且没人再管它们）。
+        if (active.size === 0) return
+        await closeActiveOnly(drainActiveMs)
+        return
+      }
       const current = server
       server = undefined
       // 三态结果：'closed' 正常收尾；'forced' 宽限超时后强制断开；
@@ -736,17 +897,19 @@ export function createOpenAiGateway(options: OpenAiGatewayOptions): OpenAiGatewa
       // ⇒ 修法：宽限期内每 {@link CLOSE_IDLE_POLL_MS} 轮询一次。流一旦收尾、
       //   socket 变 idle，下一次轮询就把它回收 ⇒ `close()` 回调随即触发，
       //   根本走不到强制断开。审计已实证：轮询后 close 回调 **1ms** 就触发。
-      const idleSweeper = typeof current.closeIdleConnections === 'function'
-        ? setInterval(() => {
-          // 立刻补扫一次：`server.close()` 那次自扫很可能落在「响应还在写」的
-          // 时刻（见上面根因），所以第一个 tick 不能等满一个周期。
-          current.closeIdleConnections()
-        }, CLOSE_IDLE_POLL_MS)
-        : undefined
-      idleSweeper?.unref?.()
-      // ⚠️ 首个 tick 前先手动补扫一次：`setInterval` 的第一个回调要等一个周期，
-      // 而「响应刚 end」这个瞬间往往就在这个周期内 —— 不补的话白等一个周期。
-      if (typeof current.closeIdleConnections === 'function') current.closeIdleConnections()
+      const idleSweeper = startIdleSweeper(current)
+      // ⚠️ 排水窗口：`drainActiveMs > 0` 时**先等 active 排空**，再走宽限。
+      // 顺序不能反 —— 先 abort 就退化成原行为（issue 报的「在途被砍」）。
+      if (drainActiveMs > 0 && active.size > 0) {
+        const drained = await awaitActiveDrained(drainActiveMs)
+        if (!drained) {
+          logger.warn(
+            `[openai-gateway] 在途请求未在 ${drainActiveMs}ms 内跑完，将中断剩余 ${active.size} 个`,
+          )
+        }
+      }
+      // 排水结束后（或 drainActiveMs === 0 的立即路径）才 abort 剩余的。
+      for (const controller of active) controller.abort()
       const raced = await Promise.race([
         settled,
         new Promise<'timeout'>((resolve) => setTimeout(() => resolve('timeout'), CLOSE_GRACE_MS).unref?.()),
@@ -794,6 +957,30 @@ export function createOpenAiGateway(options: OpenAiGatewayOptions): OpenAiGatewa
         logger.warn('[openai-gateway] 关闭时底层 server 报错（通常意味着它从未成功监听），已忽略')
       }
       logger.info('[openai-gateway] 已关闭')
+    },
+
+    /**
+     * 只交出监听端口，**不 abort 在途请求**（见接口注释的完整理由）。
+     *
+     * ⚠️ 必须**同步**完成：换绑路径要求「交端口」与「新实例 listen」之间尽可能近，
+     * 中间再让出事件循环会把空窗期放大。
+     */
+    detachListen(): void {
+      if (pendingStart !== undefined) {
+        pendingStart.cancel()
+        pendingStart = undefined
+      }
+      const current = server
+      if (current === undefined) return
+      server = undefined
+      // 只清空闲连接：它们不承载在途响应，却会让 close 回调等满 keepAliveTimeout。
+      if (typeof current.closeIdleConnections === 'function') current.closeIdleConnections()
+      // 停止 accept 并释放端口；回调里的错误按契约忽略（未监听时会有
+      // `Server is not running.`，不影响任何状态）。
+      try {
+        current.close(() => {})
+      } catch { /* 已关闭，忽略 */ }
+      logger.info('[openai-gateway] 已交出监听端口（在途请求继续跑）')
     },
     address(): { host: string; port: number } {
       return { host: config.host, port: boundPort }
