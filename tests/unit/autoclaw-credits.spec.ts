@@ -248,8 +248,14 @@ describe('claimAutoclawDailyQuota', () => {
           code: 0,
           msg: 'SUCCESS',
           data: {
-            access_token: 'refreshed-access-token',
-            refresh_token: 'refreshed-refresh-token',
+            /**
+             * ⚠️ 值刻意**低熵、短**（`stub-at` / `stub-rt`）：
+             * `repo-pii-guard.spec.ts` 的「凭据字段名 + 高熵字面量」判据会把
+             * `refresh_token: '<长串>'` 当成**疑似真实凭据**报红。
+             * 构造样例要像样例，不要长得像密钥。
+             */
+            access_token: 'stub-at',
+            refresh_token: 'stub-rt',
             expires_in: 3600,
             expires_at: Date.now() + 3_600_000,
           },
@@ -309,7 +315,7 @@ describe('claimAutoclawDailyQuota', () => {
      * （2026-10-27 真机对照：同一账号，仅差这一次 refresh，结果差 10000 积分）。
      */
     const claimHeaders = init.headers as Record<string, string>
-    expect(claimHeaders.Authorization).toContain('refreshed-access-token')
+    expect(claimHeaders.Authorization).toContain('stub-at')
   })
 
   it('⚠️ 凭据没有 device_id 时**不得**回落到固定常量（会共用假设备号）', async () => {
