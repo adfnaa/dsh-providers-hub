@@ -10,8 +10,9 @@ import { AccountPool } from './account-pool.js'
 import { createModelCatalog, isCatalogFreshFor, type CatalogEntry, type ModelCatalog } from './model-catalog.js'
 import { RemoteCatalogGate } from './remote-catalog-gate.js'
 import { broadcastCatalogChanged } from './catalog-broadcast.js'
+import { claimCodeArtsBenefit } from './codearts-credits.js'
 import { nextUtc8DayStartMs } from './model-queue.js'
-import { isCodeArtsBenefitModel } from './models.js'
+import { isCodeArtsBenefitModelKnown } from './models.js'
 import { normalizeHarnessMessages } from './message-shape.js'
 import { signRequestHuawei } from './sign.js'
 // ⚠️ `detailFieldText`（`detail` 那条腿）**只留一份实现** —— 本仓库 6 份同义的
@@ -131,6 +132,19 @@ export const CODEARTS_DEFAULT_EFFORT = 'on'
 const BENEFIT_NOT_FOUND_CODE = 'BENEFIT_NOT_FOUND'
 /** CodeArts 在账号没有 benefit 包时下发的事件 error_code。 */
 const CODEARTS_BENEFIT_NOT_FOUND_ERROR_CODE = 'InferHub.4004.200'
+
+/**
+ * 「模型未注册」的稳定失败码 —— 用于反向补 `maas_type: benefit`。
+ *
+ * CodeArts 对**只按 benefit 通道注册**的模型（如 `glm-5.3-flash`）会以
+ * HTTP 200 + SSE `InferHub.002002009.404 The model is not registered` 拒绝
+ * 不带 `maas_type: benefit` 的请求；带上该头才能出流。它与
+ * {@link BENEFIT_NOT_FOUND_CODE} 恰好**互为镜像**：一个说「该带头却没带」，
+ * 一个说「不该带却带了」。`stream()` 两条都要能自愈。
+ */
+const MODEL_NOT_REGISTERED_CODE = 'MODEL_NOT_REGISTERED'
+/** CodeArts 在「该模型只按 benefit 通道注册」时下发的事件 error_code。 */
+const CODEARTS_MODEL_NOT_REGISTERED_ERROR_CODE = 'InferHub.002002009.404'
 
 /**
  * 额度用尽时抛出的错误码 —— **字面量 `'QUOTA_EXCEEDED'`，不是 harness 常量**。
@@ -850,6 +864,16 @@ export function isSseQuotaExhaustedErrorCode(code: string, message: string): boo
  */
 export function isBenefitNotFoundBody(body: string): boolean {
   return body.includes(CODEARTS_BENEFIT_NOT_FOUND_ERROR_CODE)
+}
+
+/**
+ * 错误体是否是「该模型只按 benefit 通道注册」（`InferHub.002002009.404`）。
+ *
+ * 与 {@link isBenefitNotFoundBody} 互为镜像：一个说「该带头却没带」，
+ * 一个说「不该带却带了」。判据同样按**实测全等**，不放松成前缀。
+ */
+export function isModelNotRegisteredBody(body: string): boolean {
+  return body.includes(CODEARTS_MODEL_NOT_REGISTERED_ERROR_CODE)
 }
 
 /**
@@ -1723,24 +1747,61 @@ export class CodeArtsAdapter extends LlmAdapter {
     // 该账号不带 benefit 包时去掉 `maas_type: benefit` 头重试一次：
     // 只试一次，避免与真实失败互相掩盖。
     let benefitHeaderDropped = false
+    // 反向：该模型只按 benefit 通道注册（不带该头 → InferHub.002002009.404）
+    // 时补上该头重试一次。与 `benefitHeaderDropped` 互斥且各只一次，因此
+    // 两者叠加最多两轮，不会来回乒乓。
+    let benefitHeaderPromoted = false
+    /**
+     * 本轮请求**实际带上了** `maas_type: benefit` 没有。
+     *
+     * ⚠️ 去头自愈必须以此为准，而不是「该模型是 benefit 模型」：若首轮根本没带
+     * 该头，收到的 `4004.200` 只能来自**别处**（本机另有一个会重签 CodeArts
+     * 请求的压缩插件 billion-context，它按自己的名单补该头），此时「去掉头」
+     * 是**逐字节相同的重发**，只会白白用掉唯一一次自愈名额并把它锁死
+     * （`benefitHeaderDropped` 同时挡住补头方向，见下方 catch）。
+     */
+    let benefitHeaderSent = false
+    // ⚠️ 限时福利领取只试一次（对标 codearts2api 的 `benefit_auto_claim`：领取幂等，
+    // 但上游若仍报 benefit-not-found 就该降级了，反复领只是白打接口）。
+    let benefitClaimAttempted = false
     // 因限流已尝试过的账号 id：保证每个账号只试一次，试完才判定"全部受限"。
     const rateLimitTried = new Set<string>()
     if (currentAccountId) rateLimitTried.add(currentAccountId)
-    // benefit（免费额度）模型判定在重试循环外先算好：它要读 benefit 集合缓存
-    // （`~/.cache/deveco/codearts_benefit_models.json`），不宜每轮重试都做 IO。
-    // 集合来自 gateway/config 的模型清单 ∪ 静态兜底（见 isCodeArtsBenefitModel），
-    // 使后端新增 benefit 模型时无需改代码即可自动识别。
-    const isBenefitModel = isCodeArtsBenefitModel(options.model)
+    // 该模型要不要带 `maas_type: benefit`：**唯一权威来源是远端 gateway/config
+    // 的模型清单**。官方 CodeArts Agent 内核的判据与此完全一致 —— 它只在
+    // `chat.headers` 钩子里写 `if (model_id ∈ gatewayConfig.models) headers.maas_type
+    // = "benefit"`，没有任何静态表（2026-10-26 逆向 `agentkernelServer-win32-x64.exe`）。
+    // 本仓库曾另有一张静态兜底表，两次都因后端改注册通道而误判，已删除：
+    // 猜错的代价是**首条消息直接报 4004.200**，比「首次多一轮 404 往返」贵得多。
+    const benefitHeaderCertain = isCodeArtsBenefitModelKnown(options.model)
+    /**
+     * 领一次限时福利（幂等）。`true` = 领到 ⇒ 调用方**保持** `maas_type: benefit`
+     * 头重试；`false` = 领不到 ⇒ 退回既有的去头降级。
+     *
+     * ⚠️ 只由调用方的 `benefitClaimAttempted` 保证「一次」；这里自身不记状态，
+     * 好让 SSE 与 4xx 两条通道**共用同一个门禁**（与 `benefitHeaderDropped`
+     * 同构 —— 两条通道各试一次会把一个上游条件放大成两轮）。
+     */
+    const claimBenefitOnce = async (): Promise<boolean> => {
+      // 闭包里拿不到外层「credential 已判非空」的收窄（`let` 可变），自己再判一次。
+      if (credential === undefined) return false
+      try {
+        return (await claimCodeArtsBenefit(credential, this.fetchImpl)) === 'success'
+      } catch {
+        // 领取路径的任何异常都不得掩盖原失败：领不到就走降级。
+        return false
+      }
+    }
     for (;;) {
-      // benefit（免费额度）模型（glm-5.3-flash、deepseek-v4.1-flash 等）后端要求
-      // maas_type: benefit 头参与 SDK-HMAC-SHA256 签名，否则返回
-      // InferHub.002002009.404 "model is not registered"。
-      //
-      // 判定必须是**动态**的：早期只硬编码 glm-5.3-flash 一个模型，导致
-      // deepseek-v4.1-flash 等其它 benefit 模型调用失败（用户报障：
-      // 发消息后报 Insufficient Balance / QUOTA —— 缺该头时后端按非 benefit
-      // 通道处理该模型）。实证见 CODEARTS_BENEFIT_FALLBACK 注释。
-      const extraSignedHeaders = isBenefitModel && !benefitHeaderDropped ? { maas_type: 'benefit' } : undefined
+      // `maas_type: benefit` 参与 SDK-HMAC-SHA256 签名（不签就 401），故只能在这里
+      // 决定。首次是否带只看 `benefitHeaderCertain`（远端 gateway/config 确认）；
+      // 其余一律先发常规请求 —— 与官方内核「model_id ∈ gatewayConfig.models 才写该头」
+      // 同一口径。后端若另有安排，由下方两个自愈方向兜住（各一次）。
+      const extraSignedHeaders = !benefitHeaderDropped
+        && (benefitHeaderCertain || benefitHeaderPromoted)
+        ? { maas_type: 'benefit' }
+        : undefined
+      benefitHeaderSent = extraSignedHeaders !== undefined
       const signed = await signRequestHuawei(
         credential.access_key_id,
         credential.secret_access_key,
@@ -1817,11 +1878,33 @@ export class CodeArtsAdapter extends LlmAdapter {
             // 落入下方排队重试
           } else if (
             error instanceof LlmError
+            && error.code === MODEL_NOT_REGISTERED_CODE
+            && !benefitHeaderSent
+            && !benefitHeaderDropped
+            && !benefitHeaderPromoted
+          ) {
+            // 反向自愈：该模型只按 benefit 通道注册，而我们这次**没带**该头
+            // （见上方 `benefitHeaderCertain` 的说明）。补上该头重放一次。
+            //
+            // ⚠️ 这里**不再**要求「该模型是 benefit 模型」：那正是被删掉的静态
+            // 表才能回答的问题，而它过时正是本类缺陷的根源。判据改成「本轮没带
+            // 头 + 上游说未注册」，对新模型同样成立，代价最多多一轮往返。
+            benefitHeaderPromoted = true
+            continue
+          } else if (
+            error instanceof LlmError
             && error.code === BENEFIT_NOT_FOUND_CODE
-            && isBenefitModel
+            && benefitHeaderSent
             && !benefitHeaderDropped
           ) {
-            // 该账号没有 benefit 包：去掉 maas_type 头重试一次
+            // 上游报「benefit not found」。两种解读**可能都成立**：
+            // ① 该账号没有 benefit 包；② 有资格但**还没领取**（领取幂等）。
+            // 先领一次：领到就**保持**该头重放；领不到才去头降级。
+            if (!benefitClaimAttempted) {
+              benefitClaimAttempted = true
+              if (await claimBenefitOnce()) continue // 保持 maas_type: benefit 重放
+            }
+            // 没领到（或已试过领取）⇒ 去头降级（只试一次）。
             benefitHeaderDropped = true
             continue
           } else {
@@ -1941,8 +2024,27 @@ export class CodeArtsAdapter extends LlmAdapter {
         // 「只试一次，避免与真实失败互相掩盖」），且 issue 自己给的证据是
         // 「去掉请求头后密集取样 9 次全部 200」——那说明的正是**去头即通**，
         // 而非「需要多次退避」。按证据改，不按建议改。
-        if (isBenefitModel && !benefitHeaderDropped && isBenefitNotFoundBody(errorText)) {
+        //
+        // ⚠️ 与 SSE 通道**共用同一对门禁**（`benefitClaimAttempted` /
+        // `benefitHeaderDropped`）⇒ 先领一次；领不到才去头，且两条通道叠加
+        // 也只各一次，不会把请求放大成多轮。
+        if (benefitHeaderSent && !benefitHeaderDropped && isBenefitNotFoundBody(errorText)) {
+          if (!benefitClaimAttempted) {
+            benefitClaimAttempted = true
+            if (await claimBenefitOnce()) continue // 保持 maas_type: benefit 重放
+          }
           benefitHeaderDropped = true
+          continue
+        }
+        // 反向自愈的 4xx 孪生分支：与 SSE 通道同源同判据（本仓库红线：
+        // 同一语义不得有两套判据）。只在该头**未带**时才补，且各只一次。
+        if (
+          !benefitHeaderSent
+          && !benefitHeaderDropped
+          && !benefitHeaderPromoted
+          && isModelNotRegisteredBody(errorText)
+        ) {
+          benefitHeaderPromoted = true
           continue
         }
         // 限流处理：记录当前账号在该模型上的重置时间，然后切换账号重试
@@ -2359,6 +2461,10 @@ export class CodeArtsAdapter extends LlmAdapter {
             if (data.error_code === CODEARTS_BENEFIT_NOT_FOUND_ERROR_CODE) {
               // 账号没有 benefit 包（积分制账户）：交给 stream() 去掉该头重试
               throw new LlmError(`codearts: ${message}`, BENEFIT_NOT_FOUND_CODE, { status: 200 })
+            }
+            if (data.error_code === CODEARTS_MODEL_NOT_REGISTERED_ERROR_CODE) {
+              // 该模型只按 benefit 通道注册：交给 stream() 补上该头重试
+              throw new LlmError(`codearts: ${message}`, MODEL_NOT_REGISTERED_CODE, { status: 200 })
             }
             throw new LlmError(`codearts: ${message}`, 'INVALID_REQUEST', { status: 200 })
           }
