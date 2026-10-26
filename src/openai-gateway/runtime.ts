@@ -379,7 +379,20 @@ async function convergeOnce(): Promise<void> {
     // 极短延迟；第一次失败往往就是这个窗口。重试一次（换新实例、新 socket）
     // 能把「换绑后无监听」压到近乎不可能。仍失败则如实记 `lastError`。
     if (replaced !== undefined) {
-      const retry = factory()
+      // ⚠️ `factory()` 在这里**也要**包 try/catch（对抗审计 P2-2）：主路径已经显式
+      // 守卫了同一风险（注释写着「工厂按契约不该抛，但契约靠的是调用方自觉；
+      // 单例模块级代码不能赌」），**重试这一发漏了**。实测：factory 第三次调用抛错
+      // ⇒ 异常**逃出 `applyGatewayDesiredState()`**，而 `lastError = null`、
+      // `running = false` ⇒ 面板把「启动失败」显示成「用户主动关闭」，
+      // 且 `jet-hub-rpc.ts` 的 `await applyGatewayDesiredState()` 变成一次失败操作。
+      let retry: OpenAiGateway | undefined
+      try {
+        retry = factory()
+      } catch (retryFactoryError) {
+        const detail = retryFactoryError instanceof Error ? retryFactoryError.message : String(retryFactoryError)
+        failure = retryFactoryError
+        console.error(`[openai-gateway] 换绑重试时实例工厂抛出异常：${detail}`)
+      }
       if (retry !== undefined) {
         starting = retry
         try {

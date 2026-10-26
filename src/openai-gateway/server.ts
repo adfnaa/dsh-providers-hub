@@ -294,6 +294,33 @@ export function createOpenAiGateway(options: OpenAiGatewayOptions): OpenAiGatewa
   const logger = options.logger ?? defaultLogger
   let server: Server | undefined
   /**
+   * **是否正在监听**（`server` 句柄存在 ≠ 在监听）。
+   *
+   * ⚠️⚠️ 引入理由（对抗审计 P0）：`detachListen()` 必须让「端口已交出」，但
+   * **不能丢掉 `server` 句柄** —— 那是 `close()` 唯一能调 `closeAllConnections()`
+   * 强制断开的手段。上一版把 `server = undefined`，于是已 detach 的实例走
+   * `closeActiveOnly()`，**只 abort 不断连**：`abort()` 是**拉模型**，上游若卡住
+   * （永不 resolve 的 await）就永远读不到 `signal.aborted` ⇒ `active` 永不清空
+   * ⇒ **socket 永不断开、客户端永久静默**（实测等满 20s 仍挂着），而 `close()`
+   * 还打「已关闭」+「将中断剩余 N 个」两句谎话。
+   *
+   * ⇒ 拆成两个概念：`server` = 句柄（用于强制断开，detach 后仍保留）；
+   *   `listening` = 是否在 accept 新连接（detach 后置 false）。
+   */
+  let listening = false
+  /**
+   * **已摘除但可能仍有在途 socket** 的 server 句柄。
+   *
+   * ⚠️⚠️ 存在的理由（对抗审计 P1-b）：`close()` 一旦把 `server` 置 `undefined`，
+   * 后续再调 `close()` 就走 `closeActiveOnly()` —— 那里**没有任何句柄**可以调
+   * `closeAllConnections()`。于是「先排水 10 分钟的旧实例，后来想强关它」这件事
+   * 做不到：实测第二次 `close({drainActiveMs:0})` 之后客户端仍挂着
+   * （事件只有 `status:200`、没有 `aborted`）。
+   *
+   * ⇒ 记住最后一个句柄，让「再次 close」仍能强制断开。
+   */
+  let retired: Server | undefined
+  /**
    * 正在启动中（已 `listen()` 但还没收到 `listening`）的实例。
    *
    * ⚠️ 存在的理由（对抗审计 P1）：`close()` 只看 `server` 槽位，而槽位现在只在
@@ -481,6 +508,15 @@ export function createOpenAiGateway(options: OpenAiGatewayOptions): OpenAiGatewa
       }
     }
     for (const controller of active) controller.abort()
+    // ⚠️ abort 是**拉模型**，上游卡住时它永远读不到 ⇒ 必须有**强制断开**兜底
+    // （对抗审计 P0/P1-b）。句柄取自 `retired`（`server` 已被摘除）。
+    if (active.size > 0 && retired !== undefined) {
+      try {
+        if (typeof retired.closeAllConnections === 'function') retired.closeAllConnections()
+        else if (typeof retired.closeIdleConnections === 'function') retired.closeIdleConnections()
+        logger.warn('[openai-gateway] 在途请求未自行收尾，已强制断开')
+      } catch { /* 已关闭，忽略 */ }
+    }
     logger.info('[openai-gateway] 已关闭')
   }
 
@@ -740,7 +776,7 @@ export function createOpenAiGateway(options: OpenAiGatewayOptions): OpenAiGatewa
 
   return {
     async start(): Promise<void> {
-      if (server !== undefined) return
+      if (listening) return
       const current = createServer(requestHandler)
       // ⚠️ **必须显式设置**（Issue IKKUBJ）：不设就落到 Node 默认的 5 秒，而那个
       // 默认值对「人读着回复、隔几分钟再问一句」的用法完全不够 —— 服务端已发 FIN，
@@ -794,6 +830,7 @@ export function createOpenAiGateway(options: OpenAiGatewayOptions): OpenAiGatewa
           boundPort = typeof address === 'object' && address !== null ? address.port : config.port
           // 只在真正监听成功后占槽位（见上面的竞态说明）。
           server = current
+          listening = true
           resolve()
         }
         current.once('error', onError)
@@ -862,16 +899,20 @@ export function createOpenAiGateway(options: OpenAiGatewayOptions): OpenAiGatewa
         pendingStart = undefined
       }
       if (server === undefined) {
-        // ⚠️ 已 detachListen 过（server 槽位已摘除）时**仍要处理在途请求**：
-        // 换绑流程会先 detachListen 交端口、再调 close({drainActiveMs}) 排水，
-        // 此时 `server === undefined` 但 `active` 可能非空。早退会让排水静默失效
-        // （在途请求永久占着实例，且没人再管它们）。
+        // 从未成功 listen 过（连句柄都没有）⇒ 没有 socket 可断，只需处理在途。
         if (active.size === 0) return
         await closeActiveOnly(drainActiveMs)
         return
       }
+      // ⚠️⚠️ `current` 可能来自**已 detachListen** 的实例（`listening === false`）：
+      // 此时它已不 accept 新连接，但 `server` 句柄**仍在**（那是下面
+      // `closeAllConnections()` 唯一的抓手）。detach 后调用 `current.close()` 会
+      // 回 `Server is not running.`，被下面的 `settled` 吞成 'err'，不影响流程。
       const current = server
+      const wasListening = listening
       server = undefined
+      listening = false
+      retired = current
       // 三态结果：'closed' 正常收尾；'forced' 宽限超时后强制断开；
       // 'failed' close() 本身抛错（例如 server 从未成功 listen）。
       let outcome: 'closed' | 'forced' | 'failed' = 'closed'
@@ -879,6 +920,11 @@ export function createOpenAiGateway(options: OpenAiGatewayOptions): OpenAiGatewa
         // ⚠️ `close()` 在「server 未在监听」时会回一个 Error 给回调（而不是抛）。
         // 按契约 `close()` 不向调用方抛错 —— 调用方是 runtime 的收敛链，抛出去会
         // 让「关闭」这一步失败，进而把后续的重建也跳过（见 runtime 的注释）。
+        //
+        // ⚠️ 已 detach 的实例（`wasListening === false`）调 `close()` 会立刻回
+        // `Server is not running.` —— 直接 resolve 而不是 reject：那是**预期状态**
+        // （端口早就交出去了），不是错误。
+        if (!wasListening) { resolve(); return }
         current.close((error?: Error) => (error === undefined ? resolve() : reject(error)))
       })
       // 先挂上 catch，避免宽限竞速期间产生 unhandledRejection。
@@ -897,64 +943,85 @@ export function createOpenAiGateway(options: OpenAiGatewayOptions): OpenAiGatewa
       // ⇒ 修法：宽限期内每 {@link CLOSE_IDLE_POLL_MS} 轮询一次。流一旦收尾、
       //   socket 变 idle，下一次轮询就把它回收 ⇒ `close()` 回调随即触发，
       //   根本走不到强制断开。审计已实证：轮询后 close 回调 **1ms** 就触发。
+      // ⚠️⚠️ **定时器必须在 `finally` 里清理**（对抗审计 P1-1）：
+      // 下面每一步都可能抛（最现实的是 `logger.warn` —— 宿主 logger 由外部注入，
+      // 不保证不抛）。上一版把 `clearInterval` 放在 `await Promise.race` **之后**，
+      // 一旦中间抛错它就永不执行 ⇒ 20ms 定时器**永久空转**，且泄漏的 interval
+      // 钉住已关闭的 Server 引用（该 Server 永不回收）。
+      // 实测：让 `logger.warn` 抛错 ⇒ close 抛错后 400ms 内 `closeIdleConnections`
+      // 又被调用 13 次、永不停止（`unref` 只保证不钉住进程，不保证不空转）。
       const idleSweeper = startIdleSweeper(current)
-      // ⚠️ 排水窗口：`drainActiveMs > 0` 时**先等 active 排空**，再走宽限。
-      // 顺序不能反 —— 先 abort 就退化成原行为（issue 报的「在途被砍」）。
-      if (drainActiveMs > 0 && active.size > 0) {
-        const drained = await awaitActiveDrained(drainActiveMs)
-        if (!drained) {
-          logger.warn(
-            `[openai-gateway] 在途请求未在 ${drainActiveMs}ms 内跑完，将中断剩余 ${active.size} 个`,
-          )
+      try {
+        // ⚠️ 排水窗口：`drainActiveMs > 0` 时**先等 active 排空**，再走宽限。
+        // 顺序不能反 —— 先 abort 就退化成原行为（issue 报的「在途被砍」）。
+        if (drainActiveMs > 0 && active.size > 0) {
+          const drained = await awaitActiveDrained(drainActiveMs)
+          if (!drained) {
+            logger.warn(
+              `[openai-gateway] 在途请求未在 ${drainActiveMs}ms 内跑完，将中断剩余 ${active.size} 个`,
+            )
+          }
         }
-      }
-      // 排水结束后（或 drainActiveMs === 0 的立即路径）才 abort 剩余的。
-      for (const controller of active) controller.abort()
-      const raced = await Promise.race([
-        settled,
-        new Promise<'timeout'>((resolve) => setTimeout(() => resolve('timeout'), CLOSE_GRACE_MS).unref?.()),
-      ])
-      if (idleSweeper !== undefined) clearInterval(idleSweeper)
-      if (raced === 'timeout') {
-        outcome = 'forced'
-        // ⚠️ 强制断开后**仍要等 close 的回调**：否则下一次 `listen()` 可能与尚未
-        // 释放的端口撞车（EADDRINUSE），把一个可恢复的换绑变成永久失效。
-        // 强制断开本身是同步生效的，这里只是等内核确认，耗时可忽略。
-        if (typeof current.closeAllConnections === 'function') current.closeAllConnections()
-        else if (typeof current.closeIdleConnections === 'function') current.closeIdleConnections()
-        // ⚠️⚠️ 这个等待**必须有上限**（审计发现，P1）：`close()` 的对外承诺是
-        // 「一定在有限时间内返回」，而上一版这里是裸 `await settled` —— 一旦底层
-        // 回调不触发（被 patch 的 server、异常 socket 状态、或 fallback 分支下
-        // `closeIdleConnections` 对在途 socket 无效），`close()` 就**永不返回**。
-        // 而 `close()` 的调用方是收敛队列：队列会因此永久卡死 ⇒ **用户再也打不开
-        // 网关，且无任何自愈路径**（`disposeGatewayRuntime` 只挂在插件卸载上，
-        // 生产路径里没人调）。那比原 bug 更糟 —— 原 bug 至少 120s 后会自愈。
-        // 宁可留下一个已强制断开的僵尸 server 槽位（下面已置 undefined，
-        // 下次 listen 会新建），也不能让调用方永久悬挂。
-        const drain = await Promise.race([
+        // 排水结束后（或 drainActiveMs === 0 的立即路径）才 abort 剩余的。
+        for (const controller of active) controller.abort()
+        // ⚠️⚠️ **已 detach 的实例不能靠 `settled` 判「是否还需要强制断开」**
+        // （对抗审计 P0 的修法要点）：detach 后 `current.close()` 立刻回
+        // `Server is not running.` ⇒ `settled` 立即 resolve ⇒ `raced` 永远是 'ok'
+        // ⇒ **永不进入强制断开分支** ⇒ 上游卡住时 socket 永久泄漏。
+        //
+        // 判据改为「**还有没有在途请求**」：有就等宽限，宽限后仍未清空就强制断开。
+        // 这才是 `close()` 该有的语义 —— 它承诺的是「在有限时间内关闭」，
+        // 而不是「调了 server.close() 就算完」。
+        const raced = await Promise.race([
           settled,
-          new Promise<'drain-timeout'>((resolve) => setTimeout(() => resolve('drain-timeout'), CLOSE_DRAIN_MS).unref?.()),
+          new Promise<'timeout'>((resolve) => setTimeout(() => resolve('timeout'), CLOSE_GRACE_MS).unref?.()),
         ])
-        if (drain === 'drain-timeout') {
-          // 留痕：这说明内核/底层没有在强制断开后确认关闭，属于需要排查的异常。
-          logger.warn(
-            `[openai-gateway] 强制断开后底层仍未在 ${CLOSE_DRAIN_MS}ms 内确认关闭，已放弃等待（下次启动会新建监听）`,
-          )
+        // detach 路径的补充判据（见上）：`settled` 已 resolve 但仍有在途 ⇒ 也要强制断开。
+        const needsForce = raced === 'timeout'
+          || (!wasListening && active.size > 0)
+        if (needsForce) {
+          outcome = 'forced'
+          // ⚠️ 强制断开后**仍要等 close 的回调**：否则下一次 `listen()` 可能与尚未
+          // 释放的端口撞车（EADDRINUSE），把一个可恢复的换绑变成永久失效。
+          // 强制断开本身是同步生效的，这里只是等内核确认，耗时可忽略。
+          if (typeof current.closeAllConnections === 'function') current.closeAllConnections()
+          else if (typeof current.closeIdleConnections === 'function') current.closeIdleConnections()
+          // ⚠️⚠️ 这个等待**必须有上限**（审计发现，P1）：`close()` 的对外承诺是
+          // 「一定在有限时间内返回」，而上一版这里是裸 `await settled` —— 一旦底层
+          // 回调不触发（被 patch 的 server、异常 socket 状态、或 fallback 分支下
+          // `closeIdleConnections` 对在途 socket 无效），`close()` 就**永不返回**。
+          // 而 `close()` 的调用方是收敛队列：队列会因此永久卡死 ⇒ **用户再也打不开
+          // 网关，且无任何自愈路径**（`disposeGatewayRuntime` 只挂在插件卸载上，
+          // 生产路径里没人调）。那比原 bug 更糟 —— 原 bug 至少 120s 后会自愈。
+          // 宁可留下一个已强制断开的僵尸 server 槽位（下面已置 undefined，
+          // 下次 listen 会新建），也不能让调用方永久悬挂。
+          const drain = await Promise.race([
+            settled,
+            new Promise<'drain-timeout'>((resolve) => setTimeout(() => resolve('drain-timeout'), CLOSE_DRAIN_MS).unref?.()),
+          ])
+          if (drain === 'drain-timeout') {
+            // 留痕：这说明内核/底层没有在强制断开后确认关闭，属于需要排查的异常。
+            logger.warn(
+              `[openai-gateway] 强制断开后底层仍未在 ${CLOSE_DRAIN_MS}ms 内确认关闭，已放弃等待（下次启动会新建监听）`,
+            )
+          }
+        } else if (raced === 'err') {
+          outcome = 'failed'
         }
-      } else if (raced === 'err') {
-        outcome = 'failed'
-      }
-      if (outcome === 'forced') {
-        // 这条日志是**诊断的出口**：不记的话，用户在 Issue #11 里看到的就是
-        // 「网关没了但什么都没说」。warn 而非 info —— 说明有请求被强制中断。
-        logger.warn(
-          `[openai-gateway] 关闭时仍有在途连接未在 ${CLOSE_GRACE_MS}ms 内收尾，已强制断开`,
-        )
-      } else if (outcome === 'failed') {
-        // ⚠️ 实测可达：对**从未成功 listen** 的 server 调 close()，回调会收到
-        // `Error: Server is not running.`。这不影响后续重建（实例已从 server 槽位
-        // 摘除），但必须留痕 —— 静默吞掉会让「为什么上一轮没起来」无从排查。
-        logger.warn('[openai-gateway] 关闭时底层 server 报错（通常意味着它从未成功监听），已忽略')
+        if (outcome === 'forced') {
+          // 这条日志是**诊断的出口**：不记的话，用户在 Issue #11 里看到的就是
+          // 「网关没了但什么都没说」。warn 而非 info —— 说明有请求被强制中断。
+          logger.warn(
+            `[openai-gateway] 关闭时仍有在途连接未在 ${CLOSE_GRACE_MS}ms 内收尾，已强制断开`,
+          )
+        } else if (outcome === 'failed') {
+          // ⚠️ 实测可达：对**从未成功 listen** 的 server 调 close()，回调会收到
+          // `Error: Server is not running.`。这不影响后续重建（实例已从 server 槽位
+          // 摘除），但必须留痕 —— 静默吞掉会让「为什么上一轮没起来」无从排查。
+          logger.warn('[openai-gateway] 关闭时底层 server 报错（通常意味着它从未成功监听），已忽略')
+        }
+      } finally {
+        if (idleSweeper !== undefined) clearInterval(idleSweeper)
       }
       logger.info('[openai-gateway] 已关闭')
     },
@@ -972,7 +1039,12 @@ export function createOpenAiGateway(options: OpenAiGatewayOptions): OpenAiGatewa
       }
       const current = server
       if (current === undefined) return
-      server = undefined
+      // ⚠️⚠️ **句柄必须保留**（对抗审计 P0）：`server` 是 `close()` 唯一能调
+      // `closeAllConnections()` 强制断开的抓手。上一版这里置了 `server = undefined`，
+      // 于是已 detach 的实例在 `close()` 里走 `closeActiveOnly()` —— **只 abort
+      // 不断连**，而上游卡住时 abort 永远读不到 ⇒ socket 永久泄漏、客户端永久静默。
+      // 只把 `listening` 置 false（表示「不再 accept」）。
+      listening = false
       // 只清空闲连接：它们不承载在途响应，却会让 close 回调等满 keepAliveTimeout。
       if (typeof current.closeIdleConnections === 'function') current.closeIdleConnections()
       // 停止 accept 并释放端口；回调里的错误按契约忽略（未监听时会有
