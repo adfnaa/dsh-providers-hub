@@ -101,6 +101,7 @@ import {
 import {
   candidateKeyOf,
   candidateRowLabel,
+  candidateRowParts,
   candidateStateOf,
   candidateToggleAction,
   describeCandidateState,
@@ -7734,6 +7735,9 @@ function AggregatePanel({ rpcCall }) {
     // ⚠️ 未参与的候选整行淡化（与升级前「已拒绝」的视觉一致），但**仍可点**（那是恢复路径）。
     const inactive = candidateStateOf(canonicalId, candidate, rejections) !== 'allowed';
     const draggable = options.draggable === true;
+    // 分格渲染用的字段（渠道 / 真实 id / 倍率 / 补丁）—— 由纯函数拆好，
+    // 渲染层只消费，**不在这里再拼一遍字符串**（见 `candidateRowParts` 的注释）。
+    const parts = candidateRowParts(candidate);
     return React.createElement('div', {
       className: 'dim-jh-aggCandidate'
         + (inactive ? ' dim-jh-aggCandidateRejected' : '')
@@ -7818,8 +7822,41 @@ function AggregatePanel({ rpcCall }) {
     //    读名字。图标在这里的信息量比其它列表更大。
     //    `candidate.provider` 就是渠道 id，与 `candidateRowLabel` 用的是同一个值。
     React.createElement(ProviderLogo, { provider: candidate.provider }),
-    React.createElement('span', { className: 'dim-jh-aggCandidateLabel' },
-      candidateRowLabel(candidate)),
+    // ── 候选行的文字部分：拆成**四个独立格子**（用户 2026-10-27「美化聚合页模型列表」）──
+    // ⚠️ 原先这里是 `candidateRowLabel(candidate)` 一个字符串直接塞进 span，
+    //    于是「渠道名 · 模型 id · 倍率」三者在视觉上完全同权、同色、同字号 ——
+    //    而这一页正是**逐条比较渠道**的地方，最该被一眼区分的是「哪家渠道」
+    //    和「哪个模型」，倍率只是附注。同权渲染让整列看起来是一堆等长的灰点。
+    // ⇒ 用 `candidateRowParts` 拿字段，分格渲染：
+    //    渠道名（次要色小字）· 模型 id（主色、等宽数字、可省略号）· 倍率（徽章）· 补丁（角标）。
+    // ⚠️ 绝不能反过来「先拼成 `buddy · m · x0.15` 再 split」：模型 id 里本来就含 `·`
+    //    （真实存在），split 会错位。拆分必须在纯函数里做完（见 candidateRowParts）。
+    // ⚠️ 整行的完整文案仍挂在 `title` 上 —— 模型 id 过长时会被省略号截断，
+    //    悬停必须能读到全文，否则用户分不清 `deepseek-v4.1-flash` 与
+    //    `deepseek-v4.1-flash-thinking`（前 20 个字符完全一样）。
+    React.createElement('span', {
+      className: 'dim-jh-aggCandidateLabel',
+      title: candidateRowLabel(candidate),
+    },
+    React.createElement('span', { className: 'dim-jh-aggCandidateProvider' }, parts.provider),
+    React.createElement('span', { className: 'dim-jh-aggCandidateId' }, parts.realId),
+    parts.price === null
+      ? null
+      : React.createElement('span', {
+          className: 'dim-jh-aggCandidatePrice',
+          // `price === 0` 是「不计倍率」，与「倍率 0.15」是两回事 ⇒ 用 data-free 走另一套配色。
+          'data-free': parts.price === 0 ? 'true' : undefined,
+          title: parts.price === 0
+            ? '该渠道对这个模型不计倍率（免费）'
+            : `该渠道对这个模型的计费倍率：x${parts.price}`,
+        }, parts.price === 0 ? '免费' : `x${parts.price}`),
+    parts.patched
+      ? React.createElement('span', {
+          className: 'dim-jh-aggCandidatePatch',
+          title: '这条候选来自显式映射补丁（不是字面推导出来的）'
+            + '—— 规格 §7.1 要求对这种来源人工核查一次。',
+        }, '补丁')
+      : null),
     // ⚠️ 只有探测过才显示到期提示 —— 否则显示「到期未知」会让用户以为查过了。
     expiry === undefined
       ? null
@@ -7891,7 +7928,17 @@ function AggregatePanel({ rpcCall }) {
                 + '默认不参与的。展开后可以逐条处理。',
             }, '均未参与')
           : null;
-    return React.createElement('div', { className: 'dim-jh-aggModel', key: model.canonicalId },
+    // ⚠️ `data-open` 是**给样式用的状态出口**（用户 2026-10-27：「美化聚合页模型列表」）。
+    //    展开态要整块抬升（边框转品牌色 + 阴影），但 CSS 拿不到 React 的 `open`；
+    //    模型头本身已有 `aria-expanded`，可它只覆盖头部那一行，管不到整块。
+    //    ⇒ 在块上落一个 `data-open`，样式按 `.dim-jh-aggModel[data-open='true']` 取。
+    //    **不写 `data-open="false"`**：让未展开时属性彻底缺席，
+    //    样式只需一条正向规则，也不必处理 `[data-open='false']` 这种反向选择器。
+    return React.createElement('div', {
+      className: 'dim-jh-aggModel',
+      'data-open': open ? 'true' : undefined,
+      key: model.canonicalId,
+    },
       React.createElement('button', {
         type: 'button',
         className: 'dim-jh-aggModelHead',
@@ -7907,7 +7954,20 @@ function AggregatePanel({ rpcCall }) {
       //   ⚠️ 候选**数量**信息并未丢失：展开后「未参与轮换（K）」那一段仍带计数，
       //   而参与数量 = 展开后的可拖行数。
       blockerNode,
-      React.createElement('span', { className: 'dim-jh-aggChevron' }, open ? '▾' : '▸')),
+      React.createElement('span', { className: 'dim-jh-aggChevron', 'aria-hidden': 'true' },
+        React.createElement('svg', {
+          width: 12,
+          height: 12,
+          viewBox: '0 0 24 24',
+          fill: 'none',
+          stroke: 'currentColor',
+          strokeWidth: 2.5,
+          strokeLinecap: 'round',
+          strokeLinejoin: 'round',
+        },
+        // 右侧箭头，展开时由 CSS 转 90° 朝下 —— 比换两个字符顺滑，
+        // 且旋转有过渡动画（字符版本没有中间态，看起来是「跳」的）。
+        React.createElement('path', { d: 'M9 6l6 6-6 6' })))),
       open
         ? React.createElement('div', { className: 'dim-jh-aggCandidates' },
             candidates.map((candidate, index) => renderCandidate(model, candidate, {
