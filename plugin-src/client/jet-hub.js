@@ -621,12 +621,107 @@ function CreditBalanceRow({ balance, error, loading, windowDays, provider, actio
         return countdown === null ? null : `每日额度 ${countdown}后刷新`;
       })()
     : null;
+  /**
+   * 积分行的 **hover 全文**（用户 2026-10-27：「越界部分使用 ... 替代，
+   * 悬浮可看详情」）。
+   *
+   * ⚠️ 为什么要单独拼一份：原先 `title` 只挂**资源包明细**（`detail` /
+   *    `quotaDetail`），而那串明细**不含**行内可见的分桶文字
+   *    （`永久 1670.57 · 长期 500 · 临期 200`）—— 一旦行内被省略号截断，
+   *    用户 hover 看到的是一堆别的东西，**被截掉的那几个数字反而看不到**。
+   *
+   * ⚠️ 各段必须与行内**同源**（都来自 `quotaText` / `total` / `poolSplitText` /
+   *    `expiryParts` / `exclusiveRemaining` / `activeCount`），不许在这里
+   *    重新算一遍数字 —— 两套算法必然漂移，而 hover 与行内打架比截断更糟。
+   *
+   * ⚠️⚠️ **本块必须留在所有被引用变量之后**（真实事故，2026-10-27）：
+   *    初版把它插在 `quotaDetail` 后面，而 `poolSplitText` / `namedPoolText` /
+   *    `accioResetNote` 声明在更下面 ⇒ `const` 的 TDZ 让**整个设置页**渲染期抛
+   *    `Cannot access 'poolSplitText' before initialization`，被错误边界拦住
+   *    （用户看到的是一整块红字）。同文件 `onSortByExpiry` 的注释记过同款
+   *    事故 —— 这里再记一次：**新增引用别处变量的常量，先确认声明先后**。
+   *
+   * ⚠️⚠️ **子元素一律不得再挂 title**（真实缺陷，2026-10-27 用户报障：
+   *    「悬浮没显示后续的详细积分，而是解释名词」）：
+   *    HTML 的 title 是**子元素优先** —— 鼠标落在子元素上时，浏览器显示的是
+   *    子元素自己的 title，**父级 dd 的 title 根本没机会出现**。而这一行里
+   *    分桶文字（永久/长期/临期）、独立池、accio 倒计时三处原先各自挂着
+   *    「名词解释」，于是用户 hover 到最想看的那些数字上，看到的全是定义。
+   *    ⇒ 三处说明**全部并入本变量**，子元素不再挂 title。
+   *    ⚠️ 将来若想给某个子段加 tooltip，**加到这里来**，不要挂回子元素。
+   *
+   * 结构：第一段 = 行内那一整行（保证「被截掉的内容一定能看到」），
+   *       之后是名词解释，最后才是资源包逐项明细。
+   */
+  const lineText = [
+    quotaText ?? total,
+    poolSplitText,
+    namedPoolText,
+    accioResetNote,
+    !poolSplitText && expiryParts.length > 0
+      ? expiryParts
+        .map((part) => (part.countdown === undefined ? part.text : `${part.text}（${part.countdown}）`))
+        .join(' · ')
+      : null,
+    exclusiveRemaining > 0
+      ? `另有 ${formatUnits(exclusiveRemaining, unit) ?? exclusiveRemaining} 专属（不计入）`
+      : null,
+    quotaText === null && !poolSplitText && expiryParts.length === 0 && all.length > 1
+      ? `${activeCount}/${all.length} 个资源包有效`
+      : null,
+    balance.expiredTotal > 0
+      ? `另有 ${formatUnits(balance.expiredTotal, unit)} 已失效`
+      : null,
+  ].filter(Boolean).join(' · ');
+  /**
+   * 名词解释（原先是各子元素的 title，现统一收进 hoverTitle）。
+   *
+   * ⚠️ 只拼**当前真的渲染了**的那几条：给没显示独立池的 provider 挂一句
+   *    「独立池是什么」是纯噪音。
+   *
+   * ⚠️⚠️ **每条各占一行**（用户 2026-10-27：「名词解释也分下行吧」）：
+   *    初版把三档定义用分号连成**一整段**，在浏览器原生 tooltip 里会被折成
+   *    一大坨 —— 用户要在这段里找「临期到底怎么算」，得从头读到尾。
+   *    逐条成行之后，`永久 = …` / `长期 = …` / `临期 = …` 三行等宽对齐，
+   *    一眼就能定位到要看的那一条。
+   *    ⚠️ 分隔符用 `\n`（单换行）而不是 `\n\n`：`\n\n` 是**段落**分隔，
+   *    会在 tooltip 里多空一行，三档之间反而显得松散、不像一组。
+   *
+   * ⚠️ 与「锁定永久积分」的按钮文案取**同一套折中风格**（用户同日要求
+   *    「文案再调整下，折中一下」）：短句、无嵌套引号、不重复字眼。
+   *    ⇒ 三档定义压到一行一个「X = 定义」，不再带括号补充说明 ——
+   *    tooltip 是**查词**场景（用户 hover 是想确认「长期到底指什么」），
+   *    不是教程，补充说明越短越好；真要展开解释，正文里已有完整版。
+   */
+  const hoverGlossary = [
+    // 三档分桶：**逐条一行**，一行只说一个词条的定义。
+    !poolSplitText && expiryParts.length > 0
+      ? '永久 = 服务端未给到期时间，不会作废'
+      : null,
+    !poolSplitText && expiryParts.length > 0
+      ? `长期 = 有到期时间，距扣费截止还有 ${windowDays} 天以上`
+      : null,
+    !poolSplitText && expiryParts.length > 0
+      ? `临期 = 距扣费截止不足 ${windowDays} 天，优先消耗`
+      : null,
+    exclusiveRemaining > 0
+      // ⚠️ 池名本身常已含「独立池」字样（如「星火积分（独立池）」），
+      //    故这里**不再重复那个词**，只说清它的结算规则。
+      ? `${exclusiveNames}：与主池分开结算，不参与合计`
+      : null,
+    accioResetNote ? ACCIO_DAILY_REWARD_NOTE : null,
+  ].filter(Boolean).join('\n');
+  /** 最终 title：行内全文 → 名词解释 → 资源包明细（空段自动省略）。 */
+  const hoverTitle = [lineText, hoverGlossary, quotaDetail ?? detail]
+    .filter(Boolean).join('\n\n') || undefined;
   return React.createElement('div', rowProps,
     // ⚠ 标签按单位走：ZCode 是 token，显示「Token」而不是「积分」。
     React.createElement('dt', null, label),
     React.createElement('dd', {
       className: 'dim-jh-creditValue',
-      title: quotaDetail ?? (detail || undefined),
+      // ⚠️ 用 hoverTitle（行内全文 + 明细）：行内是 nowrap + ellipsis，
+      //    被截掉的内容只能从这里读到。见 hoverTitle 的注释。
+      title: hoverTitle,
     },
     // ⚠️ 配额窗口显示**逐窗口百分比**而不是均值：均值（94.5）既不是上游给的数，
     // 在「额度」这个标签下更会被读成 94.5 个积分。见 quotaText 的注释。
@@ -657,7 +752,8 @@ function CreditBalanceRow({ balance, error, loading, windowDays, provider, actio
     accioResetNote
       ? React.createElement('span', {
           className: 'dim-jh-creditPools',
-          title: ACCIO_DAILY_REWARD_NOTE,
+          // ⚠️ **不能**在这里再挂 title（见 hoverTitle 上方「子元素 title 会抢走
+          //    父级 title」的注释）。说明文字已并入 hoverTitle。
         }, accioResetNote)
       : null,
     // 两个 buddy + TRAE + LobsterAI：按「会不会近期作废」分桶，与选号判据同一套规则。
@@ -668,9 +764,7 @@ function CreditBalanceRow({ balance, error, loading, windowDays, provider, actio
     !poolSplitText && expiryParts.length > 0
       ? React.createElement('span', {
           className: 'dim-jh-creditPools',
-          title: `永久 = 服务端未给到期时间（不会作废）；`
-            + `长期 = 有到期时间但距扣费截止还有 ${windowDays} 天以上；`
-            + `临期 = 距扣费截止不足 ${windowDays} 天（再不用就作废，优先消耗，锁定永久积分后不参与消耗）。`,
+          // ⚠️ 同上：名词解释已并入 hoverTitle，这里不再挂 title。
         }, expiryParts.flatMap((part, index) => {
           const node = React.createElement('span', {
             key: part.key,
@@ -696,7 +790,7 @@ function CreditBalanceRow({ balance, error, loading, windowDays, provider, actio
     exclusiveRemaining > 0
       ? React.createElement('span', {
           className: 'dim-jh-creditExclusive',
-          title: `${exclusiveNames}：服务端下发的独立池，与上方主池分开结算，不参与主池合计、也不能当通用积分消耗。`,
+          // ⚠️ 独立池的说明已并入 hoverTitle，这里不再挂 title。
         }, `另有 ${formatUnits(exclusiveRemaining, unit) ?? exclusiveRemaining} 专属（不计入）`)
       : null,
     // ⚠️ 配额单位（Gemini）下**不渲染**这句：它的两个「包」是 5 小时窗口与
@@ -8085,6 +8179,23 @@ function AggregatePanel({ rpcCall }) {
  * 模块作用域里的 `PROVIDERS` / 十几个 provider 判据函数，拆出去会引入循环依赖。
  */
 export const __providersPanelForTest = ProviderPanel;
+
+/**
+ * 账号卡片上的**积分行**，供测试真正渲染。
+ *
+ * ⚠️ 为什么需要这个导出（真实事故，2026-10-27）：`CreditBalanceRow` 里新增的
+ * `hoverTitle` 曾引用声明在它**后面**的 `poolSplitText` / `namedPoolText` /
+ * `accioResetNote` ⇒ `const` 的 TDZ 让渲染期抛
+ * `Cannot access 'poolSplitText' before initialization`，整个设置页被错误边界拦住。
+ *
+ * 而 `tests/unit/jet-hub-tdz.spec.ts` **没抓住**它：那条用例只调
+ * `JetHubPage(...)` 顶层，而本组件要等账号列表加载完、`ProviderPanel` 渲染
+ * 卡片时才会执行 —— TDZ 藏在**子组件**里，顶层渲染根本走不到。
+ * ⇒ 与 `__providersPanelForTest` 同款取舍：导出内部组件，让测试能直接渲染它。
+ *
+ * 不是公共 API：客户端 bundle 内部使用，外部不要依赖。
+ */
+export const __creditBalanceRowForTest = CreditBalanceRow;
 
 export function JetHubPage({ rpcCall }) {
   const [selected, setSelected] = React.useState(PROVIDERS[0].id);

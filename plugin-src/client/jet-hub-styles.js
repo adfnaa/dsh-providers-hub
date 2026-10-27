@@ -202,7 +202,15 @@ const STYLES = `
 .dim-jh-accountTag[data-clickable="true"]:focus-visible { outline: 2px solid #1677ff; outline-offset: 1px; }
 
 /* 元信息：键值对齐的网格 */
-.dim-jh-accountMeta { display: grid; gap: 3px; margin: 8px 0 0; }
+/* ⚠️ 2026-10-27 用户报障「面板在仅设置页时按钮与信息重叠，其次将积分和详细积分
+   进行分行处理，避免越界」：本容器同时是**容器查询的锚点**
+   （见下方 @container 块）。设置页里的卡片比侧栏窄一截，同一套 nowrap 布局
+   在那边会溢出到右侧按钮列上。
+   ⚠️ container-type: inline-size 只影响本容器的**宽度计算**（让内部按容器宽
+   而不是视口宽做响应式），不改变它自身的盒模型 —— 把它挂在这里而不是整个
+   .dim-jh-accountCard 上，是为了把影响面收到元信息区，不碰卡片的拖拽指示线
+   （那两条 ::before / ::after 是相对卡片定位的）。 */
+.dim-jh-accountMeta { display: grid; gap: 3px; margin: 8px 0 0; container-type: inline-size; }
 .dim-jh-metaRow { display: grid; grid-template-columns: 52px minmax(0, 1fr); align-items: baseline; gap: 8px; }
 .dim-jh-metaRow dt { font-size: 12px; line-height: 18px; color: var(--dsw-alias-label-tertiary, #8f959e); }
 .dim-jh-metaRow dd { min-width: 0; margin: 0; overflow: hidden; font-size: 12px; line-height: 18px; color: var(--dsw-alias-label-secondary, #646a73); text-overflow: ellipsis; white-space: nowrap; }
@@ -213,8 +221,32 @@ const STYLES = `
 
 /* 账号卡片上的积分余额。
    覆盖 metaRow 的 overflow:hidden / nowrap —— 这里要的是横向排列的
-   数值 + 次要说明，而 dd 默认样式是为单行截断文本准备的。 */
-.dim-jh-metaRow dd.dim-jh-creditValue { display: flex; flex-direction: row; align-items: baseline; gap: 6px; overflow: visible; }
+   数值 + 次要说明，而 dd 默认样式是为单行截断文本准备的。
+
+   ⚠️⚠️ 2026-10-27 用户报障「面板在仅设置页时按钮与信息重叠」的**根因就在
+   这一行**：原先这里是 display: flex + overflow: visible，而父规则
+   .dim-jh-metaRow dd 带 white-space: nowrap ⇒ 那一整串
+   「永久 1670.57 · 长期 500 · 临期 200」被当成**一个不可断行的整体**按内容宽
+   撑开；dd 的宽度又被 minmax(0, 1fr) 钉住 ⇒ 内容直接画到右侧按钮列上
+   （设置页卡片窄，症状最明显；侧栏宽，看不出来）。
+
+   ★ 用户 2026-10-27 定稿方案：「详细积分也别换行了，就继续在后面，越界部分
+   使用 ... 替代，悬浮可看详情」。故这里**不换行**（nowrap），越界走省略号，
+   完整内容挂在 title 上（见 CreditBalanceRow 的 title 计算）。
+
+   ⚠️⚠️ **不能保留 display: flex**：text-overflow: ellipsis 在 flex 容器上
+   **不生效**（它只作用于块级容器的行内内容），实测表现为「flex 子项各自
+   nowrap 撑开、整行照样溢出」。故改成 block，子元素回到 inline 流。
+   ⚠️ 子元素之间的间距不再由 flex gap 提供，改由下面那条
+   > * + * 的 margin-left 给 —— 否则改成 inline 后各段会黏成一团。
+   ⚠️ 父规则已有的 text-overflow / overflow 不再被覆盖（这里刻意**不写**
+   overflow: visible），省略号才能生效。 */
+.dim-jh-metaRow dd.dim-jh-creditValue { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* inline 化：让主数值、分桶、独立池、资源包计数排在同一条不可断行的行内流里，
+   省略号才有「一个整体被截断」的语义。 */
+.dim-jh-metaRow dd.dim-jh-creditValue > * { display: inline; }
+/* 段间间距（替代原 flex gap: 6px）。用相邻兄弟选择器，首段不带左边距。 */
+.dim-jh-metaRow dd.dim-jh-creditValue > * + * { margin-left: 6px; }
 .dim-jh-creditTotal { font-size: 13px; font-weight: 600; color: #1677ff; font-variant-numeric: tabular-nums; }
 .dim-jh-creditPackages { font-size: 11px; color: var(--dsw-alias-label-tertiary, #8f959e); }
 /* 分桶说明（三档带色）：永久绿 / 长期黄 / 临期红 + 倒计时（用户 2026-10-12）。
@@ -240,7 +272,13 @@ const STYLES = `
 .dim-jh-rateLimits { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-top: 8px; }
 .dim-jh-rateLimitsLabel { font-size: 12px; line-height: 18px; color: var(--dsw-alias-label-tertiary, #8f959e); }
 
-/* 操作按钮：横向一行，右对齐 */
+/* 操作按钮：横向一行，右对齐。
+   ⚠️ flex-wrap: nowrap 是**有意**的（2026-10-26 之前就是），理由是账号卡片
+   在侧栏里足够宽、行内按钮排成一条更好看。但它在**窄容器**（仅设置页那种
+   宽度）里会让按钮组溢出卡片右边缘 —— 与积分文字重叠的那个报障同源。
+   ⇒ 窄容器改由下方 @container 块覆盖成 wrap，宽容器逐字不变。
+   ⚠️ 别直接把这里改成 wrap：宽容器下 nowrap + flex-end 是「按钮贴右、
+   不换行」的既定观感，改了会波及侧栏（用户明确说那边不用处理）。 */
 .dim-jh-accountActions { display: flex; flex-direction: row; flex-wrap: nowrap; justify-content: flex-end; gap: 8px; margin-top: 12px; padding-top: 10px; border-top: 1px solid var(--dsw-alias-border-l2, #f0f1f3); }
 
 /* 带操作按钮的积分行：第三列 auto 让按钮贴最右（用户报障「底部那排按钮
@@ -252,6 +290,62 @@ const STYLES = `
    align-self: center 覆盖 metaRow 的 baseline —— 按钮是 flex 容器，
    按基线对齐会贴到文字基线下方。 */
 .dim-jh-metaRow--actions .dim-jh-accountActions { margin-top: 0; padding-top: 0; border-top: 0; align-self: center; }
+
+/* ── 窄容器（仅设置页那种宽度）：积分行改成两行，按钮组独占第二行 ──
+   ⚠️⚠️ 2026-10-27 用户报障「面板在仅设置页时按钮与信息重叠」的**第二处根因**：
+   三列 grid（52px | minmax(0,1fr) | auto）里按钮列是 auto ⇒ 它按内容宽
+   吃走固定宽度，剩下给积分列的空间在设置页里只有 ~200px；而积分列里塞着
+   主数值 + 三档分桶 + 独立池 + 资源包计数四五段文字。**光靠换行还不够**：
+   换行只是把溢出从横向变成纵向，行高会涨到三四行，按钮仍与文字挨在同一行。
+
+   正解是**结构换行**：容器窄时把第三列（按钮组）下移一行独占整宽 ——
+   标签与积分占第一行，按钮组占第二行右对齐。侧栏宽度足够，不触发本块，
+   观感与改动前逐字一致（用户明说「仅在侧栏显示的话，宽度足够，可以考虑
+   不用处理」）。
+
+   ⚠️ 阈值 420px 的由来：设置页里的卡片内容宽实测约 300–380px（弹层左右
+   各留白 + rail 不出现），侧栏里约 520–700px。取 420 落在两档之间，两侧
+   都有余量 —— 不要为了「更保险」往上调，那会把侧栏也拖进两行布局。
+   ⚠️ 必须用 @container 而不是 @media：媒体查询看的是**视口**宽，而同一
+   个组件在两处入口的宽度差来自**容器**（设置弹层 vs 中央面板），视口完全
+   可能一样宽 —— 用 media 会得到「两处同时变/同时不变」的错误行为。
+   ⚠️ 容器查询锚点是上面 .dim-jh-accountMeta 的 container-type: inline-size；
+   删掉那一行，本块**整段静默失效**（浏览器不会报错，只是不匹配）。 */
+@container (max-width: 420px) {
+  /* 标签与积分占第一行，按钮组换到第二行并贴右。
+     ⚠️ grid-template-areas 比数格子稳：三列变两行时不用重算列宽。
+     ⚠️ align-items: start 覆盖基础规则的 baseline —— 窄容器下 dt / dd /
+     按钮组各自独占一格，baseline 会让空标签把行高撑歪。 */
+  .dim-jh-metaRow--actions {
+    grid-template-columns: 52px minmax(0, 1fr);
+    grid-template-areas:
+      "label value"
+      "actions actions";
+    row-gap: 6px;
+    align-items: start;
+  }
+  .dim-jh-metaRow--actions > dt { grid-area: label; }
+  .dim-jh-metaRow--actions > dd.dim-jh-creditValue { grid-area: value; }
+  /* ⚠️ 这里**不再**让主数值独占一行（用户 2026-10-27 定稿：「详细积分也别
+     换行了，就继续在后面，越界部分使用 ... 替代」）。积分行本身已是
+     nowrap + ellipsis 的**单行**，窄容器下由省略号收尾、悬浮看全 ——
+     再让它占整行只会把行数从 1 变成 2，与用户要求相反。 */
+  /* ⚠️ 按钮组在第一列起、跨两列：它现在是整行，justify-content: flex-end
+     让按钮贴右，与宽容器下的视觉位置一致（用户不会觉得按钮「跑到左边」）。 */
+  .dim-jh-metaRow--actions > .dim-jh-accountActions {
+    grid-area: actions;
+    grid-column: 1 / -1;
+    justify-content: flex-end;
+    align-self: start;
+    /* ⚠️ 窄容器下**允许换行**：这一行有 5～6 个按钮（新手任务 / 重测 / 重置 /
+       测试 / 代理 / 令牌 / 删除），整行宽度在 300px 级容器里放不下 ——
+       nowrap 会把最后一个（删除）推出卡片外，用户看不到也点不到。
+       宽容器仍是 nowrap（见基础规则），观感不变。 */
+    flex-wrap: wrap;
+    /* 与上方积分行拉开一点距离，否则按钮紧贴积分文字。 */
+    margin-top: 2px;
+  }
+}
 
 /* 按钮：align dsh-im .dim-deliveryButton */
 .dim-jh-btn { font-size: 12px; line-height: 18px; padding: 4px 12px; border: 1px solid var(--dsw-alias-border-l2, #dfe1e5); border-radius: 8px; background: var(--dsw-alias-bg-layer-3, #fff); cursor: pointer; color: var(--dsw-alias-label-primary, #1f2329); white-space: nowrap; transition: border-color .15s ease, background .15s ease, color .15s ease; }
@@ -922,6 +1016,15 @@ const STYLES = `
 .dim-jh-modePick input[type="radio"] { margin: 0; accent-color: #1677ff; }
 /* 弹窗底部动作区：右对齐（生成/确认按钮） */
 .dim-jh-modalActions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 14px; }
+/* ── 备份 / 恢复弹窗的方向切换条（2026-10-27 合并两个入口后新增）──
+   ⚠️ 这是「换一页」不是「选项」：两个按钮互斥、点即生效，故用按钮 + data-active
+   而不是 radio（radio 的语义是随表单一起提交，这里没有提交动作）。
+   ⚠️ 选中态沿用既有的 data-kind="primary" 观感（蓝底白字）**不**另起一套配色：
+   本仓库反复记录过「两套样式看起来不像同一个 UI」。 */
+.dim-jh-backupTabs { display: flex; gap: 8px; margin: 2px 0 10px; }
+/* 选中态：与 .dim-jh-btn[data-kind="primary"] 逐字同形（背景/边框/文字三处）。 */
+.dim-jh-backupTabs .dim-jh-btn[data-active="true"] { background: #1677ff; color: #fff; border-color: #1677ff; font-weight: 600; }
+.dim-jh-backupTabs .dim-jh-btn[data-active="true"]:hover:not(:disabled) { background: #0f5fce; border-color: #0f5fce; color: #fff; }
 
 
 /* ── Cline「订阅额度」弹窗（官方额度窗口 + 请求记录）── */
@@ -1543,9 +1646,9 @@ const STYLES = `
    .dim-jh-zcSelect 一致。官方设置页的选择器**没有** outline 规则，故这里也不加，
    否则同一张插件页上本卡片会比其他控件多一圈描边。 */
 .dim-jh-cardSelector:focus-visible { outline: none; box-shadow: 0 0 0 2px color-mix(in srgb, #1677ff 30%, transparent); }
-
-
 `
+
+
 
 /**
  * 本插件的**包 id** —— 必须等于 package.json 的 name（当前 dsh-providers-hub）。

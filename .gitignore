@@ -143,3 +143,6 @@ docs/zcode-protocol-notes.md
 # 需要改动实现、排查协议问题或重新校准结论时读它。
 docs/implementation-notes.md
 docs/audit/
+
+# Codegraph 本地索引（94 MB，纯本地生成物，不入库）
+.codegraph/
