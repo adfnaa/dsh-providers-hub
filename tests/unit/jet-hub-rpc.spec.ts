@@ -1451,6 +1451,94 @@ describe('model.list / model.setDisabled 端点', () => {
   })
 
   /**
+   * ★★ **上游已下架的黑名单条目不得补回设置页**（真实缺陷，2026-10-27）。
+   *
+   * ## 缺陷
+   *
+   * 旧实现无条件把 `disabledMap` 里所有 `true` 的 id 补进目录 ⇒ 上游已下架、
+   * 但用户曾关掉过的模型会**永久留在设置页**：灰显、开关能动，点开必然 404
+   * （实测 `GLM-5` / `glm-5.3-flash` 回 `InferHub.002002009.404`）。
+   *
+   * 它既不是 `dead`（没有阳性请求失败记录）、也不在远端目录里 ——
+   * 两条现有的「可解释」路径都覆盖不到，用户完全无从判断。
+   *
+   * ## 判据
+   *
+   * `llm.listModels()` 的结果是**权威在售集合**（读到且非空时）：
+   * 补回黑名单时只补**仍在其中**的；已下架的不补。
+   */
+  it('★ 已下架模型即使被用户关过，也不得补回设置页', async () => {
+    // 权威在售集合 = `listAllModels()`（**不套黑名单**的全量目录）。
+    // 这里它**没有** glm-5（已下架），有 glm-5.2（在售，但用户关着）。
+    const onSaleAll = [
+      { id: 'glm-5.2', name: 'GLM-5.2' },
+      { id: 'deepseek-v4.1-flash', name: 'DeepSeek-V4.1-Flash' },
+    ]
+    const { call } = registerEndpoints({
+      models: onSaleAll,
+      // glm-5 已下架（不在全量目录里）；glm-5.2 在售但被关着。
+      disabledModels: { buddy: { 'glm-5': true, 'glm-5.2': true } },
+      modelAdapters: { buddy: { listAllModels: () => onSaleAll } },
+    })
+
+    const result = await call('model.list', { provider: 'buddy' })
+    expect(result.ok).toBe(true)
+    const ids = (result.value as { models: Array<{ id: string }> }).models.map((m) => m.id)
+    // 已下架的 glm-5 不得出现（否则用户点开必然 404）。
+    expect(ids).not.toContain('glm-5')
+    // 在售但被关的 glm-5.2 必须仍在（否则用户无法重新打开）。
+    expect(ids).toContain('glm-5.2')
+  })
+
+  /**
+   * ★★ **对照组：拿不到全量目录时不得据残缺目录删黑名单**。
+   *
+   * 旧适配器没有 `listAllModels()` ⇒ 判据无法成立（`models` 是被黑名单过滤过的，
+   * 拿它当在售集合会把**所有被关模型**判成已下架 ⇒ 集体消失）。
+   * ⇒ 必须**放弃判据**、照旧补回。这条锁住「宁可留幽灵，不可删在售」。
+   */
+  it('★ 对照：没有 listAllModels 时黑名单条目照常补回（不得据被过滤的目录删）', async () => {
+    const { call } = registerEndpoints({
+      // 适配器已按黑名单过滤 ⇒ models 里没有 glm-5。
+      models: [{ id: 'glm-5.2', name: 'GLM-5.2' }],
+      disabledModels: { buddy: { 'glm-5': true } },
+      // 刻意不传 modelAdapters ⇒ all === undefined ⇒ 放弃判据。
+    })
+
+    const result = await call('model.list', { provider: 'buddy' })
+    expect(result.ok).toBe(true)
+    const ids = (result.value as { models: Array<{ id: string }> }).models.map((m) => m.id)
+    expect(ids).toContain('glm-5')
+  })
+
+  /**
+   * ★★ **对照组：远端读不到时不得据此删黑名单**（判据只能建在「确认读到」上）。
+   *
+   * 远端抛错 ≠ 模型已下架。若此时也过滤，一次网络抖动就会让用户所有关闭项
+   * 从设置页消失（虽然 `disabledModels` 记录还在，但用户看不到、也打不开）。
+   * 这正是 `dead-model-store.ts` 头注释禁止的「从残缺目录反推」。
+   */
+  it('★ 对照：远端读取失败时，黑名单条目必须照常补回（不得据残缺目录删）', async () => {
+    const { call } = registerEndpoints({
+      models: [],
+      listModelsError: 'network down',
+      disabledModels: { buddy: { 'glm-5': true } },
+    })
+
+    const result = await call('model.list', { provider: 'buddy' })
+    // 远端读失败 ⇒ 判据退化为「不知道」⇒ 保守照常补回。
+    // ⚠️ 该形态下端点本身会因读失败而返回错误；此处只断言「若返回成功，
+    //    则 glm-5 必须仍在」这一方向的语义（不把错误路径说成成功）。
+    if (result.ok) {
+      const ids = (result.value as { models: Array<{ id: string }> }).models.map((m) => m.id)
+      expect(ids).toContain('glm-5')
+    } else {
+      // 读失败本就该如实报错 —— 这也符合契约。
+      expect(result.error.code).toBe('bad-request')
+    }
+  })
+
+  /**
    * 回归测试：关闭 → 列表 → 重新打开的完整往返。
    *
    * 历史 bug：`model.list` 直接在 `llm.listModels()`（已被适配器过滤）的结果上

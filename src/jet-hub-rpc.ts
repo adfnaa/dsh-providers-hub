@@ -7164,13 +7164,59 @@ function registerJetHubEndpoints(
         // 对话框模型选择器读的仍是过滤后的 `listModels`，可见性行为完全不变。
         const catalogSource = modelAdapters?.[req.provider]
         const all = catalogSource?.listAllModels()
+        /**
+         * ⚠️⚠️ **黑名单补回必须以上游目录为界**（真实缺陷，2026-10-27）。
+         *
+         * ## 缺陷形态
+         *
+         * 旧实现无条件把 `disabledMap` 里所有 `true` 的 id 补进设置页目录。
+         * 于是**上游已下架**、但用户曾经关掉过的模型会**永久留在设置页**：
+         * 灰显、能点「打开」，点开却必然 404（实测 `GLM-5` / `glm-5.3-flash`
+         * 回 `InferHub.002002009.404 The model is not registered`）。
+         *
+         * 用户视角：这模型明明还在列表里、开关也能动，为什么一发就失败？
+         * 而它既不是 `dead`（没有阳性请求失败记录）、也不在远端目录里 ——
+         * 两条现有的「可解释」路径都覆盖不到它。
+         *
+         * ## ⚠️⚠️ 判据必须用 `listAllModels()`，**不能用 `models`**
+         *
+         * 这是本修法最容易搞反的一处：`llm.listModels()` 的结果**已被适配器按
+         * 黑名单过滤**（见上方长注释）。若拿它当「在售集合」，那么**每一个被
+         * 用户关掉的在售模型都不在其中** ⇒ 它们会被判成「已下架」⇒ 全部不再
+         * 补回 ⇒ 用户关掉的模型从设置页集体消失、无法重新打开 ——
+         * 那正是本端点**当初要修的那个缺陷**，等于把坑重新挖一遍。
+         *
+         * ⇒ 权威在售集合只能取 **`listAllModels()`**（不套黑名单的全量目录）。
+         * 拿不到它（外部/旧适配器没有该方法）时，**放弃该判据**（照旧补回），
+         * 宁可留着幽灵条目，也不让用户在售模型凭空消失。
+         *
+         * ## 三种形态的处置
+         *
+         * | 形态 | 处置 |
+         * |---|---|
+         * | `listAllModels()` 可用且非空 | 补回时只补**仍在其中**的（本次要修的） |
+         * | 它不可用（`undefined`） | **放弃判据**，照旧补回（保守） |
+         * | 它返回空数组 | 同样放弃判据（空目录 = 无账号门控，不是「全部下架」） |
+         *
+         * ⚠️ 判据只能建立在「确认拿到全量目录」之上。拿「读不到」反推「已下架」
+         * 正是本仓库 `dead-model-store.ts` 头注释明令禁止的「从残缺目录反推」。
+         *
+         * ⚠️ **不删用户数据**：这里只是**不显示**已下架条目，`disabledMap` 里的
+         * 记录原样保留 —— 万一上游把模型重新上架，开关状态还在（用户不必重设）。
+         */
+        const onSale = all !== undefined && all.length > 0
+          ? new Set(all.map((model) => model.id))
+          : undefined
+        const stillOnSale = (id: string): boolean => onSale === undefined || onSale.has(id)
         let catalog: Array<{ id: string; name: string; isFree?: boolean }>
         if (all !== undefined) {
           catalog = [...all]
           // 全量目录里若仍有黑名单命中却缺失者，一并补上（保底，正常不会发生）。
           const known = new Set(catalog.map((model) => model.id))
           for (const id of Object.keys(disabledMap)) {
-            if (disabledMap[id] === true && !known.has(id)) catalog.push({ id, name: id })
+            if (disabledMap[id] === true && !known.has(id) && stillOnSale(id)) {
+              catalog.push({ id, name: id })
+            }
           }
         } else {
           const listedIds = new Set(models.map((model) => model.id))

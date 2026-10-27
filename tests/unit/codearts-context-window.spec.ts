@@ -172,18 +172,25 @@ describe('上下文占用条的分母（contextWindow）', () => {
    * （静态兜底目录）里 ⇒ 远端失败（首次启动 / 未登录）时它走「目录外」分支
    * ⇒ 拿到 524_288 ⇒ **占用比分母错 2 倍**，而它**正是用户报障的模型**。
    *
+   * ⚠️⚠️ **2026-10-27 换主体 id**：原用例用 `glm-5.3` 作「表里有、目录里没有」
+   * 的样本。但同期实测校准把 `glm-5.3` **补进了** `DEFAULT_MODELS`
+   * （它上游确实下发、真机 200），该样本条件不再成立。
+   * ⇒ 改用 `glm-5.3-flash`：它仍在 `CONTEXT_WINDOWS` 里（1M），但已从
+   * `DEFAULT_MODELS` 移除（实测 404）。**用例要守的语义（离线路径取表内值）
+   * 一字未变**，只是换了满足条件的样本。
+   *
    * ⇒ 判据是「离线路径的取值 == 表内值」，且**必须与兜底常量不同**才算有判别力
    * （若两者恰好相等，这条用例会恒真）。
    */
-  it('③c 表里有、静态目录里没有的 id（glm-5.3），离线路径也拿表内值', async () => {
+  it('③c 表里有、静态目录里没有的 id（glm-5.3-flash），离线路径也拿表内值', async () => {
     // 先自证这条用例有判别力：表内值必须与兜底值**不同**。
-    expect(codeartsContextWindow('glm-5.3')).not.toBe(CODEARTS_FALLBACK_CONTEXT_WINDOW)
-    // 离线：远端拉取失败 ⇒ 目录回落到静态兜底表（里面**没有** glm-5.3）。
+    expect(codeartsContextWindow('glm-5.3-flash')).not.toBe(CODEARTS_FALLBACK_CONTEXT_WINDOW)
+    // 离线：远端拉取失败 ⇒ 目录回落到静态兜底表（里面**没有** glm-5.3-flash）。
     const adapter = makeAdapter()
     const listed = await adapter.listModels('codearts')
-    expect(listed.map((m) => m.id)).not.toContain('glm-5.3')
+    expect(listed.map((m) => m.id)).not.toContain('glm-5.3-flash')
     // 但用户仍可能（通过远端目录 / 手填 / 会话历史）请求它。
-    const resolved = await adapter.resolveModel('codearts', 'glm-5.3')
+    const resolved = await adapter.resolveModel('codearts', 'glm-5.3-flash')
     expect(resolved.context).toEqual({ contextWindow: 1_048_576 })
   })
 

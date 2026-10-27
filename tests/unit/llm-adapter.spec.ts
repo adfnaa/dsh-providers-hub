@@ -139,27 +139,30 @@ describe('CodeArtsAdapter', () => {
   it('listModels advertises the openpangu-2.0 and deepseek-v4 models alongside the GLM family', async () => {    // 对齐 deveco-code-rust 参考实现 codearts.rs：新增盘古模型
     // openpangu-2.0-flash (92B) / openpangu-2.0-pro (505B)，
     // 后端 /v1/default/models 下发的 model_id 为全小写。
-    // DeepSeek V4（对齐 deveco-code 62834ff6）：CodeArts Agent 模型列表新增
-    // deepseek-v4-flash / deepseek-v4-pro（UI 标注每日 1000 万免费 Tokens 福利）。
-    // ⚠️ 早期注释称「deepseek-v4-flash-0731 后端未注册」，该结论**有误**
-    // （2026-09-23 修正，对齐 deveco-code-rust fb1b4a2）：它返回 404 的真实原因是
-    // **缺少 maas_type: benefit 头**，带上即成功；带日期后缀与无后缀是后端上两个
-    // 不同的模型，不能互相替代。
+    //
+    // ⚠️⚠️ 2026-10-27 兜底表全表真机实测校准（本用例跟着改）：
+    // - `deepseek-v4-pro` **已下架**：不带 maas_type 回 `ModelArts.81009 Invalid model`
+    // - `deepseek-v4-flash` **仍然可用**（200）：虽不在 builtin 目录里，但真机能调通
+    //   ⇒ 保留（判据是「能不能调通」，不是「在不在目录里」）
+    // - 新增 `deepseek-v4.1-flash-1017`（issue IKQY27）：与老版是两个独立注册的模型
+    //
+    // ⚠️ benefit 头的判定**不属本用例范围**：由 PR #156 统一处理（静态兜底表将被
+    //    删除，唯一权威改为远端 gateway/config 的 result.models）。
     const models = await makeAdapter().listModels('codearts')
     const ids = models.map(model => model.id)
     expect(ids).toContain('openpangu-2.0-flash')
     expect(ids).toContain('openpangu-2.0-pro')
     expect(ids).toContain('deepseek-v4-flash')
-    expect(ids).toContain('deepseek-v4-pro')
     expect(ids).toContain('deepseek-v4.1-flash')
+    expect(ids).toContain('deepseek-v4.1-flash-1017')
+    // 已下架（实测 404）的不得再出现，否则用户选中后必然失败。
+    expect(ids).not.toContain('deepseek-v4-pro')
     const flash = models.find(model => model.id === 'openpangu-2.0-flash')
     const pro = models.find(model => model.id === 'openpangu-2.0-pro')
     const dsFlash = models.find(model => model.id === 'deepseek-v4-flash')
-    const dsPro = models.find(model => model.id === 'deepseek-v4-pro')
     expect(flash).toMatchObject({ provider: 'codearts', name: 'openpangu-2.0-flash' })
     expect(pro).toMatchObject({ provider: 'codearts', name: 'openpangu-2.0-pro' })
     expect(dsFlash).toMatchObject({ provider: 'codearts', name: 'deepseek-v4-flash' })
-    expect(dsPro).toMatchObject({ provider: 'codearts', name: 'deepseek-v4-pro' })
     // 默认模型仍是 GLM-5.2（新增模型不应改变默认模型）。
     expect(ids[0]).toBe('GLM-5.2')
   })
@@ -477,12 +480,19 @@ describe('CodeArtsAdapter', () => {
     expect(texts).toEqual(['ok'])
   })
 
-  it('listModels advertises glm-5.3-flash with the GLM family', async () => {
-    // 对齐 deveco-code-rust 90aeb17d：CodeArts Agent 后端新增 GLM-5.3 Flash
-    // （benefit 免费额度模型，后端注册 id 为全小写 glm-5.3-flash）。
+  it('★ glm-5.3-flash 已从兜底表移除（实测 404，不再是可用模型）', async () => {
+    // ⚠️⚠️ 2026-10-27 改写（原用例断言「目录里有 glm-5.3-flash」）。
+    //
+    // 旧事实（2026-09，对齐 deveco-code-rust 90aeb17d）：它是 benefit 免费额度
+    // 模型，后端注册 id 全小写 `glm-5.3-flash`。
+    //
+    // 新事实（真机实测）：不带头回 `InferHub.002002009.404 The model is not
+    // registered` —— 它已不是当前可调用的模型。
+    // ⚠️ 至于「它是否随福利活动下线」的**归因**留给 PR #156（那边把 benefit
+    //    判定整体改为只认远端集合），本用例只锁「兜底表不再列它」这一事实。
     const models = await makeAdapter().listModels('codearts')
-    expect(models.map((model) => model.id)).toContain('glm-5.3-flash')
-    // 默认模型仍是 GLM-5.2（新增模型不应改变默认模型）。
+    expect(models.map((model) => model.id)).not.toContain('glm-5.3-flash')
+    // 默认模型仍是 GLM-5.2。
     expect(models[0]!.id).toBe('GLM-5.2')
   })
 

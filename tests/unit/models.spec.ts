@@ -147,6 +147,64 @@ describe('fetchCodeArtsRemoteModels', () => {
     expect(models).toEqual([])
     expect(calls).toHaveLength(0)
   })
+
+  /**
+   * ★ **同一天下发「无后缀 + 带版本号」两条模型时必须都保留**（issue IKQY27）。
+   *
+   * 原实现对任何末尾 `-NNNN` 一律剥掉，`deepseek-v4.1-flash-1017` 被改写成
+   * `deepseek-v4.1-flash` 后撞 id、被 `seen` 去重丢掉 —— 选择器里一条 1017
+   * 都不出现，且零提示。实测上游 `display_enabled` 两条都是 true，
+   * 且两条真实请求分别回显各自 id ⇒ 后端注册为**两个独立模型**。
+   */
+  it('★ 保留「父 id 同时存在」的带版本号模型（issue IKQY27）', async () => {
+    const { fetcher } = makeFetcher({
+      [SNAP_MODEL_BUILTIN_URL]: {
+        body: JSON.stringify({
+          builtinModels: [
+            { model_id: 'deepseek-v4.1-flash', model_name: 'DeepSeek-V4.1-Flash', ratio_display: '0.18x' },
+            { model_id: 'deepseek-v4.1-flash-1017', model_name: 'DeepSeek-V4.1-Flash-1017', ratio_display: '0.18x' },
+          ],
+        }),
+      },
+    })
+    const models = await fetchCodeArtsRemoteModels(makeCredential(), fetcher)
+    const ids = models.map((m) => m.id)
+    // 两条都必须存在（这是本 issue 的核心断言）
+    expect(ids).toContain('deepseek-v4.1-flash')
+    expect(ids).toContain('deepseek-v4.1-flash-1017')
+    expect(models).toHaveLength(2)
+    // 名字也要各自独立，不能被归一化成同一个
+    const byId = new Map(models.map((m) => [m.id, m.name]))
+    expect(byId.get('deepseek-v4.1-flash')).toBe('DeepSeek-V4.1-Flash')
+    expect(byId.get('deepseek-v4.1-flash-1017')).toBe('DeepSeek-V4.1-Flash-1017')
+  })
+
+  /**
+   * ★ **反向：父 id 不存在时仍须剥掉后缀**（否则 chat 端点 404）。
+   *
+   * 这是 IKQY27 修法的边界 —— 单纯「永不剥」会退回旧缺陷：
+   * `gateway/config` 只下发 `deepseek-v4-flash-0731`，而 chat 端点只认
+   * `deepseek-v4-flash`（实测不带 maas_type → 404 not registered）。
+   */
+  it('★ 父 id 不存在时仍剥掉版本后缀（不得退回 404 缺陷）', async () => {
+    const { fetcher } = makeFetcher({
+      [OPENGW_GATEWAY_CONFIG_URL]: {
+        body: JSON.stringify({
+          result: {
+            models: [
+              // 只有带后缀的一条，没有无后缀的父 id
+              { model_id: 'deepseek-v4-flash-0731', model_name: 'deepseek-v4-flash' },
+            ],
+          },
+        }),
+      },
+      [SNAP_MODEL_BUILTIN_URL]: { body: JSON.stringify({ builtinModels: [] }) },
+    })
+    const models = await fetchCodeArtsRemoteModels(makeCredential(), fetcher)
+    const ids = models.map((m) => m.id)
+    expect(ids).toContain('deepseek-v4-flash')
+    expect(ids).not.toContain('deepseek-v4-flash-0731')
+  })
 })
 
 /**

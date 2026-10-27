@@ -7,7 +7,7 @@ import {
   type ExpiryAccessors,
 } from '../../src/expiry-sync.js'
 import { REFRESH_LEAD_MS } from '../../src/refresh.js'
-import { refreshTokenExpiresAt } from '../../src/oauth.js'
+import { refreshTokenExpiresAt, RefreshTokenExpiredError } from '../../src/oauth.js'
 import type { AccountPool, ProviderAccountStatus } from '../../src/account-pool.js'
 
 /**
@@ -263,6 +263,61 @@ describe('refreshAccountWithReconcile：需要刷就刷，不需要就对账', (
     })
     await expect(refreshAccountWithReconcile(params)).rejects.toThrow(/缺少访问令牌/)
     expect(calls.save).toBe(0)
+  })
+
+  /**
+   * ★★ **续期成功但落盘失败 ⇒ 必须报终态**（真实缺陷，2026-10-27 两次事故）。
+   *
+   * ## 为什么这是终态而不是可重试的普通错误
+   *
+   * `refresh()` 成功 = 服务端已经把**一次性** refresh_token 消耗掉并签发了新的。
+   * 此时 `save()` 失败 ⇒ 新凭据只剩内存引用、随调用栈消失 ⇒ 本地永久停留在
+   * 那份**已被消耗**的旧 token 上。
+   *
+   * 旧实现让异常冒泡，`refreshAll` 的 catch 把它当**非终态**：只记 warn、
+   * 不标 `refreshable:false`、下一轮继续拿死 token 兑换 ⇒ 服务端回
+   * `STS5.1806 the refresh token has been used` ⇒ 每轮静默失败、面板照常
+   * 显示「自动续期」。
+   *
+   * 实测时间线（2026-10-27 17:58 那轮）：16:58 续期成功落盘 → 17:58
+   * 「兑换成功但 `.credentials.yaml` 零写入」→ 18:23 池值被标 false →
+   * 18:30 实测 STS5.1806。
+   *
+   * ⚠️ 断言的是**错误类型**（`RefreshTokenExpiredError`），不是文案：
+   * 各家的 `refreshAll` 都按 `instanceof` 判终态，类型错了就白修。
+   */
+  it('★★ 续期成功但 save 失败 → 抛 RefreshTokenExpiredError（终态，不是可重试）', async () => {
+    const warns: string[] = []
+    let saveCalls = 0
+    const { params } = build({
+      credential: { ...CRED, expires_at: String(Date.now() - 1) },
+      // refresh 成功（服务端 token 已消耗）……
+      refresh: (c) => Promise.resolve({ ...c, access_token: 'NEW', expires_at: String(Date.now() + 7_200_000) }),
+      // ……但落盘失败。⚠️ 这里自带计数器：覆盖 `save` 会连带丢掉默认那份的
+      //    `calls.save` 自增，故不能用外层计数器断言。
+      save: () => {
+        saveCalls += 1
+        return Promise.reject(new Error('EACCES: permission denied'))
+      },
+      warn: (m) => warns.push(m),
+    })
+
+    let thrown: unknown
+    try {
+      await refreshAccountWithReconcile(params)
+    } catch (error) {
+      thrown = error
+    }
+    // ① 必须是终态类型 —— 各家的 catch 靠 instanceof 分流。
+    expect(thrown).toBeInstanceOf(RefreshTokenExpiredError)
+    // ② 必须真的调过 save（证明走到了「落盘」这一步）。
+    expect(saveCalls).toBe(1)
+    // ③ 错误文案要能区分「落盘失败」与「服务端拒绝」，并带上原始存储错误。
+    const message = (thrown as Error).message
+    expect(message).toMatch(/落盘失败/)
+    expect(message).toMatch(/EACCES/)
+    // ④ 抛终态前要单独记一条 warn：排查时能一眼分清是谁的锅。
+    expect(warns.some((w) => /落盘失败/.test(w))).toBe(true)
   })
 
   it('池值本就一致时不写盘（避免每轮定时器全量落盘）', async () => {

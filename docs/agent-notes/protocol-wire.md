@@ -629,6 +629,9 @@ const claim = deps.claim ?? (claimDailyCheckin as unknown as NonNullable<…>)
 - **账户类型检测**：`package.is_credit_package === true` 即积分账户（文档要求「已升级到积分计费模式」）。领取第一步就判它，非积分账户回 `inactive` 而非 `failed`
 - **幂等**：本协议无幂等键、无「今天已签到」业务码，唯一保护是活动列表的 `claimable` / `status` 预检（`status` ∈ {CLAIMED, CONFIRMED, CONSUMED} → `already-claimed`）
 - ⚠️ **`refresh_token` 一次性轮换**：用一次即作废（`STS5.1806 the refresh token has been used`）。任何刷新都必须**立刻回写**新凭据；E2E 凭据读取（`tests/e2e/codearts-credential.ts`）**只读不刷新**
+- ⚠️⚠️ **`STS5.1806` 必须归终态**（2026-10-27 实测事故，`src/oauth.ts` 的 `requestToken`）。它是「一次性 token 已被消费」的专属码，重试一万次也还是同一报文。原先漏判的连锁后果：`refreshAll` 走非终态分支 ⇒ **不写 `refreshable:false`**；而另一条终态判据要求「本地 `refresh_token.exp` 已过」，该账号 exp 还剩 29 天 ⇒ 也不成立 ⇒ **池内 `refreshable` 永远停在 `true`**、面板照常显示「自动续期」，实际每 30 分钟静默失败，直到用户主动查积分才看到 `HTTP 400 APIG.0602`
+- ⚠️ **判据要带 `error_msg` 兜底**：真实报文 `error_code` 与 `error_msg` 都带，但上游若改字段名，`/refresh\s*token\s+has\s+been\s+used/i` 那条腿能接住（已由 `tests/unit/oauth.spec.ts` 的两条用例分别锁住）
+- ⚠️ **续期是否轮换的判据（实测踩过）**：看 `refresh_token` 的 `iat` 或 AK 是否变化；**不能用 `exp`** —— 华为 STS 的 `refresh_token.exp` **恒等于「登录时刻 + 30 天」且续期不延长它**，换新 token 后 exp 仍是原值
 - `statistics/plugin` 是**裸对象**响应（无 `{code,data}` 包装），而 `ops/*` 有 —— 解析必须兼容两种信封
 - ⚠️ **`/v1/ops/delivery` 的字段类型/名字与直觉不符**（实测 2026-09-18，两个坑叠加导致「1 个失败」）：
   - **`campaignId` 是数字**（`1`），不是字符串 → 必须用 `readIdentifier`（兼容数字/字符串），用只收字符串的 `readString` 会得到空串并判 `failed`「活动缺少 campaignId」

@@ -111,15 +111,83 @@ let benefitMemoryCache: string[] | undefined
  * 远端 gateway/config 返回带日期后缀的 model_id（-0731 = 7月31日版本），
  * 但 chat 端点只认不带后缀的 id（InferHub.002002009.404 "model is not registered"）。
  * 仅匹配末尾 -NNNN（4 位数字），避免误去 glm-5.3-flash 等无后缀 id。
+ *
+ * ## ⚠️⚠️ 为什么**不能**无条件剥掉所有 `-NNNN`（issue IKQY27，2026-10-27）
+ *
+ * 原实现对任何「末尾 - + 4 位数字」的 id 一律剥掉，于是
+ * `deepseek-v4.1-flash-1017` 被改写成 `deepseek-v4.1-flash`，
+ * 与老版**撞成同一个 id**，随即被 `parseModelInfo` 的 `seen` 集合去重丢掉
+ * ⇒ 模型选择器里 1017 **一条都不出现**，且没有任何提示或报错。
+ *
+ * 实测证据（issue 附件，只读探测 `PromptCenterService/v1/model/builtin`）：
+ * ```
+ * { model_id: 'deepseek-v4.1-flash',      model_name: 'DeepSeek-V4.1-Flash',      display_enabled: true, ratio_display: '0.18x' }
+ * { model_id: 'deepseek-v4.1-flash-1017', model_name: 'DeepSeek-V4.1-Flash-1017', display_enabled: true, ratio_display: '0.18x' }
+ * ```
+ * 两条 `display_enabled` 均为 true，网页端下拉列表里**是两个独立可点选项**；
+ * 且两条真实请求分别回显 `"model":"deepseek-v4.1-flash"` 与
+ * `"model":"deepseek-v4.1-flash-1017"`（伪造 id 会报「未找到模型」）
+ * ⇒ **后端把 1017 注册成独立模型**，权重版本与排队池都不同，不可互相替代。
+ *
+ * ## 判据：只有**父 id 不存在**时，才把 `-NNNN` 当作版本后缀剥掉
+ *
+ * 单纯放宽成「永远不剥」会退回旧缺陷：`gateway/config` 下发的是
+ * `deepseek-v4-flash-0731`，而 chat 端点只认 `deepseek-v4-flash`，
+ * 不剥就 404 not registered（见 {@link CODEARTS_BENEFIT_FALLBACK} 的实证）。
+ *
+ * 两种形态在**单个条目**上无法区分（都是 `xxx-NNNN`），必须看**目录整体**：
+ * 上游同时给出 `X` 与 `X-1017` ⇒ 1017 是独立模型，保留；
+ * 只给出 `X-0731` 而没有 `X` ⇒ 0731 是版本后缀，剥掉。
+ *
+ * ⇒ 故归一化拆成两步：
+ * 1. {@link modelIdSuffixCandidate} 只算出「若剥掉会得到什么」，不落决定；
+ * 2. {@link resolveModelIds} 拿到**整个目录**的原始 id 集合后再裁决。
+ *
+ * 导旧签名 `normalizeModelId(id)` 的行为**刻意保留**（单 id、无上下文时按旧规则
+ * 剥后缀）：它仍被 benefit 判定的「是否被改写」比较使用，见
+ * `fetchCodeArtsRemoteModels` 里 `normalizeModelId(rawId) === rawId`。改成
+ * 「永不剥」会让那句恒真，进而把带后缀的 benefit 模型误记入落盘集合。
  */
 export function normalizeModelId(id: string): string {
-  if (id.length > 5) {
-    const suffix = id.slice(-5)
-    if (suffix.startsWith('-') && /^\d{4}$/.test(suffix.slice(1))) {
-      return id.slice(0, -5)
-    }
+  return modelIdSuffixCandidate(id) ?? id
+}
+
+/**
+ * 「若把末尾 `-NNNN` 当版本后缀剥掉，会得到什么」；形态不匹配时返回 `undefined`。
+ *
+ * ⚠️ 本函数**不做决定**（不知道父 id 是否存在），只是把形态判据抽出来给
+ * {@link resolveModelIds} 与 {@link normalizeModelId} 共用，避免两处各写一份
+ * 正则后漂移。
+ */
+function modelIdSuffixCandidate(id: string): string | undefined {
+  if (id.length <= 5) return undefined
+  const suffix = id.slice(-5)
+  if (suffix.startsWith('-') && /^\d{4}$/.test(suffix.slice(1))) {
+    return id.slice(0, -5)
   }
-  return id
+  return undefined
+}
+
+/**
+ * 按**整个目录**裁决每个原始 id 的最终形态。
+ *
+ * 规则（对应 issue IKQY27 的判据）：`X-1017` 只有在**同目录里存在 `X`** 时
+ * 才被当作独立模型保留；否则按旧规则剥成 `X`。
+ *
+ * @param rawIds 该来源下发的**全部**原始 `model_id`（未归一化）。
+ * @returns `原始 id → 最终 id`。形态不匹配的 id 原样映射到自己。
+ */
+export function resolveModelIds(rawIds: readonly string[]): Map<string, string> {
+  const all = new Set(rawIds)
+  const out = new Map<string, string>()
+  for (const id of rawIds) {
+    if (out.has(id)) continue
+    const parent = modelIdSuffixCandidate(id)
+    // 父 id 也在目录里 ⇒ 这是独立模型，保留原样（issue IKQY27）。
+    // 父 id 不在 ⇒ 是版本后缀形态，剥掉（否则 chat 端点 404）。
+    out.set(id, parent !== undefined && !all.has(parent) ? parent : id)
+  }
+  return out
 }
 
 function parseModelInfo(
@@ -127,16 +195,39 @@ function parseModelInfo(
   seen: Set<string>,
   /** 取倍率时用的「现在」（单测注入；缺省 `Date.now()`）。 */
   nowMs?: number,
+  /**
+   * 原始 `model_id` → 最终 id 的裁决表（见 {@link resolveModelIds}）。
+   *
+   * ⚠️ **必须由调用方按整个来源预先算好并传入**：单个条目无法判断
+   * `X-1017` 是独立模型还是版本后缀（issue IKQY27）—— 那要看同目录里
+   * 有没有 `X`。缺省时退回单 id 归一化，保持既有调用方行为。
+   */
+  idMap?: ReadonlyMap<string, string>,
 ): RemoteModel | undefined {
   const rawId = m['model_id']
   if (typeof rawId !== 'string' || rawId.length === 0) return undefined
-  const id = normalizeModelId(rawId)
+  const id = idMap?.get(rawId) ?? normalizeModelId(rawId)
   // 过滤视觉（VL）多模态模型
   // id 含 -VL- 或以 -VL 结尾（如 Qwen3-VL-235B），上下文小、不支持工具调用，
   // 不适合当 agent 主模型，从列表隐藏；只通过 analyzeImage 等工具间接调用。
   if (id.includes('-VL-') || id.endsWith('-VL')) return undefined
   const rawName = m['model_name']
-  const name = typeof rawName === 'string' && rawName.length > 0 ? normalizeModelId(rawName) : id
+  /**
+   * ⚠️ 名字的归一化**必须跟着 id 走**，不能独立按 `model_name` 再算一次。
+   *
+   * 实测（issue IKQY27 的上游报文）：`model_name` 与 `model_id` 的后缀并不总是
+   * 一致 —— 例如 id=`deepseek-v4-flash-0731` 而 name=`deepseek-v4-flash`
+   * （名字本就不带后缀）。若把 name 也丢进 `normalizeModelId`，当 id 被裁决为
+   * 「保留 `-1017`」时，name 却因自身不带后缀而保持原样，于是出现
+   * **id 带版本号、name 不带**的错配（首版实现即如此，被用例抓出）。
+   *
+   * ⇒ 规则：只要 id 被裁决表**保留**（即没被剥），name 就**原样保留**上游下发的
+   * 字符串；只有 id 被剥掉后缀时，才把 name 也按同规则剥一次，避免
+   * 「id=deepseek-v4-flash 而 name=DeepSeek-V4.1-Flash-1017」的反向错配。
+   */
+  const name = typeof rawName === 'string' && rawName.length > 0
+    ? (idMap?.get(rawId) === rawId ? rawName : normalizeModelId(rawName))
+    : id
   if (seen.has(id)) return undefined
   seen.add(id)
   return { id, name, ...readRateLabel(m, nowMs) }
@@ -364,14 +455,23 @@ export async function fetchCodeArtsRemoteModels(
     : extractJsonArray(gatewayText, ['result', 'models'])
   if (outcome !== undefined) outcome.gatewayOk = gatewayArr !== undefined
   if (gatewayArr !== undefined) {
+    // ⚠️ 裁决表必须按**整个来源**算好再逐条解析：`X-1017` 是否独立取决于
+    //    同目录里有没有 `X`（issue IKQY27，见 resolveModelIds 的说明）。
+    const gatewayIdMap = resolveModelIds(
+      gatewayArr.flatMap((item) => {
+        if (typeof item !== 'object' || item === null) return []
+        const raw = (item as Record<string, unknown>)['model_id']
+        return typeof raw === 'string' && raw.length > 0 ? [raw] : []
+      }),
+    )
     for (const item of gatewayArr) {
       if (typeof item === 'object' && item !== null) {
         const entry = item as Record<string, unknown>
         const rawId = typeof entry['model_id'] === 'string' ? entry['model_id'] : ''
-        const mi = parseModelInfo(entry, seen, nowMs)
+        const mi = parseModelInfo(entry, seen, nowMs, gatewayIdMap)
         if (mi) {
           // 仅当归一化未改写 id 时才记为 benefit（见上方说明）
-          if (rawId.length > 0 && normalizeModelId(rawId) === rawId) benefitIds.push(mi.id)
+          if (rawId.length > 0 && gatewayIdMap.get(rawId) === rawId) benefitIds.push(mi.id)
           models.push(mi)
         }
       }
@@ -391,9 +491,18 @@ export async function fetchCodeArtsRemoteModels(
     : extractJsonArray(snapText, ['builtinModels'])
   if (outcome !== undefined) outcome.builtinOk = snapArr !== undefined
   if (snapArr !== undefined) {
+    // 与 gateway 同法：按整个来源裁决（issue IKQY27 的实际形态就出在这里 ——
+    // `deepseek-v4.1-flash` 与 `deepseek-v4.1-flash-1017` 由 builtin 同时下发）。
+    const builtinIdMap = resolveModelIds(
+      snapArr.flatMap((item) => {
+        if (typeof item !== 'object' || item === null) return []
+        const raw = (item as Record<string, unknown>)['model_id']
+        return typeof raw === 'string' && raw.length > 0 ? [raw] : []
+      }),
+    )
     for (const item of snapArr) {
       if (typeof item === 'object' && item !== null) {
-        const mi = parseModelInfo(item as Record<string, unknown>, seen, nowMs)
+        const mi = parseModelInfo(item as Record<string, unknown>, seen, nowMs, builtinIdMap)
         if (mi) models.push(mi)
       }
     }
