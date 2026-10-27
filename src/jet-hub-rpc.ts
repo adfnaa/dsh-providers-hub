@@ -1705,6 +1705,27 @@ export function registerJetHubRpc(
 export interface ModelCatalogSource {
   listAllModels(): readonly { id: string; name: string; isFree?: boolean }[]
   /**
+   * 「我这份 `listAllModels()` **确认**来自远端完整读取」的适配器自报钩子。
+   *
+   * ## 用途（`model.list` 的「已下架」判据）
+   *
+   * `model.list` 补回黑名单条目时，只补**仍在售**的（否则上游已下架、
+   * 用户曾关掉的模型会永久留在设置页、点开必然 404）。
+   * 但「不在 `listAllModels()` 里」**不足以**证明已下架：冷缓存 / 远端降级时
+   * 它返回的是各家**编译期兜底表**（远端目录的**子集** —— Issue IKJW33 实测
+   * `cline` 冷缓存 3 条 vs 远端 460 条）。拿子集当在售集合会把用户关掉的
+   * **在售**模型判成已下架 ⇒ 从设置页彻底消失、无法重新打开。
+   *
+   * ⇒ 只有本方法返回 `true` 时才允许隐藏；返回 `false` / 未实现（`undefined`）
+   * 一律**放弃判据**（照旧补回）。方向与 `dead-model-store.ts` 的
+   * 「不从残缺目录反推」一致：**宁可留幽灵，不可删在售**。
+   *
+   * ⚠️ **可选**：只有能证明自己目录来源的家实现它（当前只有 codearts ——
+   * 它有两个目录端点、且由接线层的 `catalogComplete` 上报两来源成败）。
+   * 其余家不实现 ⇒ 行为与加这条判据之前逐字节一致。
+   */
+  catalogConfirmedRemote?(): boolean
+  /**
    * 聚合目录（**可选** —— 只有聚合适配器实现它）。
    *
    * ⚠️ 必须是**只读且零余额查询**的（规格 §8.3）：面板挂载时会调它。
@@ -7190,12 +7211,28 @@ function registerJetHubEndpoints(
          * 拿不到它（外部/旧适配器没有该方法）时，**放弃该判据**（照旧补回），
          * 宁可留着幽灵条目，也不让用户在售模型凭空消失。
          *
-         * ## 三种形态的处置
+         * ## ⚠️⚠️ 但「拿得到 `listAllModels()`」**仍然不等于**「拿到了全量目录」
+         * （2026-10-28 修，PR159 首版的缺口）
+         *
+         * 它在**冷缓存 / 远端降级**下返回的是各家**编译期兜底表**，而那是远端
+         * 目录的**子集**（`model-catalog.ts` 的 `cached ?? config.syncCatalog()`；
+         * Issue IKJW33 实测：`cline` 冷缓存只有 **3** 条、远端有 **460** 条）。
+         *
+         * 后果与本修复要治的病**同形但方向相反**：用户关掉的**在售**模型若恰好
+         * 不在兜底表里（例如 codearts 近期新增、只存在于远端的 `glm-5.3` /
+         * `kimi-k3`），会被判成「已下架」⇒ **从设置页彻底消失、再也打不开**。
+         * 命中窗口很实在：远端拉取失败、离线启动、或刚重启还没拉到目录时。
+         *
+         * ⇒ 判据的前置条件必须是**适配器自报「这份目录确认来自远端完整读取」**
+         * （{@link ModelCatalogSource.catalogConfirmedRemote}）。证明不了就放弃判据。
+         * 这条正是本文件注释里那句原则的落地：「判据只能建立在**确认拿到全量目录**
+         * 之上」—— 而「拿得到一份数组」不是「确认拿到全量」。
          *
          * | 形态 | 处置 |
          * |---|---|
-         * | `listAllModels()` 可用且非空 | 补回时只补**仍在其中**的（本次要修的） |
-         * | 它不可用（`undefined`） | **放弃判据**，照旧补回（保守） |
+         * | 自报确认远端 + `listAllModels()` 非空 | 补回时只补**仍在其中**的（本次要修的） |
+         * | 自报**未**确认远端（false / 未实现） | **放弃判据**，照旧补回（保守；其余 14 家的默认行为） |
+         * | `listAllModels()` 不可用（`undefined`） | 同样放弃判据 |
          * | 它返回空数组 | 同样放弃判据（空目录 = 无账号门控，不是「全部下架」） |
          *
          * ⚠️ 判据只能建立在「确认拿到全量目录」之上。拿「读不到」反推「已下架」
@@ -7204,8 +7241,18 @@ function registerJetHubEndpoints(
          * ⚠️ **不删用户数据**：这里只是**不显示**已下架条目，`disabledMap` 里的
          * 记录原样保留 —— 万一上游把模型重新上架，开关状态还在（用户不必重设）。
          */
-        const onSale = all !== undefined && all.length > 0
-          ? new Set(all.map((model) => model.id))
+        // ⚠️ 探测本身抛错一律按「未确认」处理（保守方向：宁可多留一个幽灵条目）。
+        let confirmedRemote: boolean | undefined
+        try {
+          confirmedRemote = catalogSource?.catalogConfirmedRemote?.()
+        } catch {
+          confirmedRemote = undefined
+        }
+        const onSale = confirmedRemote === true && all !== undefined && all.length > 0
+          // ⚠️ 取**两个来源的并集**（与 `fullCatalogIds` 同口径）：`listModels` 是
+          //    被黑名单过滤过的远端目录，`listAllModels` 是不套黑名单的那份 ——
+          //    任一来源里有它，就不能说它已下架。
+          ? new Set([...models.map((model) => model.id), ...all.map((model) => model.id)])
           : undefined
         const stillOnSale = (id: string): boolean => onSale === undefined || onSale.has(id)
         let catalog: Array<{ id: string; name: string; isFree?: boolean }>

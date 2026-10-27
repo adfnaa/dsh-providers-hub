@@ -189,6 +189,45 @@ describe('CodeArtsAdapter', () => {
     expect(ids[0]).toBe('GLM-5.2')
   })
 
+  /**
+   * ★★ `catalogConfirmedRemote()` 三态 —— 供 `model.list` 的「已下架」判据用。
+   *
+   * ## 为什么需要它（PR159 首版的缺口，2026-10-28 修）
+   *
+   * `model.list` 会据「模型不在全量目录里」判断它已被上游下架、从而**不补回**
+   * 设置页。但 `listAllModels()` 在**冷缓存 / 远端降级**下返回的是**编译期兜底
+   * 表**（远端目录的**子集** —— Issue IKJW33 实测 `cline` 冷缓存 3 条 vs 远端
+   * 460 条）。拿子集当在售集合 ⇒ 用户关掉的**在售**模型（例如 codearts 只存在于
+   * 远端的新模型 `glm-5.3`）会被判成已下架 ⇒ 从设置页彻底消失、再也打不开。
+   *
+   * ⇒ 只有本方法返回 `true`（**证明**这份目录来自远端完整读取）时才允许隐藏。
+   *
+   * ⚠️ 判据两条腿都必须成立，缺一即 `false`（保守）：
+   * - 从未拉到远端（`remoteModels === undefined`）⇒ 目录是兜底子集；
+   * - 拉到了但**残缺**（两个目录端点只有一个成功）⇒ 同样是子集。
+   */
+  it('★★ catalogConfirmedRemote：冷启动 / 远端完整 / 远端残缺 三态', async () => {
+    // ① 冷启动：从未成功拉到远端（默认 `fetchRemoteModels` 未注入）⇒ false
+    const cold = makeAdapter()
+    expect(cold.catalogConfirmedRemote(), '冷启动时目录只是兜底子集，不得据此判已下架').toBe(false)
+
+    // ② 远端成功且两个端点都取全 ⇒ true
+    const warm = makeAdapter({
+      fetchRemoteModels: async () => [{ id: 'GLM-5.2', name: 'GLM-5.2' }],
+      catalogComplete: () => true,
+    })
+    await warm.listModels('codearts')
+    expect(warm.catalogConfirmedRemote()).toBe(true)
+
+    // ③ 远端读到了、但残缺（只有一个端点成功）⇒ false（残缺目录同样不能反推「已下架」）
+    const partial = makeAdapter({
+      fetchRemoteModels: async () => [{ id: 'GLM-5.2', name: 'GLM-5.2' }],
+      catalogComplete: () => false,
+    })
+    await partial.listModels('codearts')
+    expect(partial.catalogConfirmedRemote()).toBe(false)
+  })
+
   it('resolveModel discloses contextWindow for every model in the catalog', async () => {
     // ⚠️ 2026-10-21 重取证（本机 42 份 IDE 内核日志，2026-09-11~10-21）：
     //    权威来源是 IDE 自己下发的 `provider["inferhub-provider"].models[*].limit.context`。

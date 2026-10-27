@@ -1199,7 +1199,16 @@ describe('model.list / model.setDisabled 端点', () => {
      * `model.list` 据此拿到被关闭模型的**真实展示名**（含倍率），而不是裸 id。
      * 省略时退化为「listModels + 裸 id 补回」的历史行为。
      */
-    modelAdapters?: Record<string, { listAllModels(): readonly { id: string; name: string }[] }>
+    modelAdapters?: Record<string, {
+      listAllModels(): readonly { id: string; name: string }[]
+      /**
+       * 「这份目录**确认**来自远端完整读取」的适配器自报钩子。
+       *
+       * 真实链路里只有 codearts 会声明它（两个目录端点都读成功才为 true）；
+       * 其余 14 家不声明 ⇒ `model.list` 放弃「已下架」判据、照旧补回黑名单条目。
+       */
+      catalogConfirmedRemote?(): boolean
+    }>
     /** 让 `ctx.emit` 抛错，验证「广播失败不反噬已落盘的开关」。 */
     emitThrows?: boolean
     /**
@@ -1466,6 +1475,10 @@ describe('model.list / model.setDisabled 端点', () => {
    *
    * `llm.listModels()` 的结果是**权威在售集合**（读到且非空时）：
    * 补回黑名单时只补**仍在其中**的；已下架的不补。
+   *
+   * ⚠️⚠️ **前置条件（2026-10-28 补）**：只有当适配器**能证明**这份目录来自
+   * 「远端完整读取」（`catalogConfirmedRemote() === true`）时，本判据才允许生效。
+   * 否则一份**兜底子集**就能让在售模型从设置页消失 —— 见下一条用例。
    */
   it('★ 已下架模型即使被用户关过，也不得补回设置页', async () => {
     // 权威在售集合 = `listAllModels()`（**不套黑名单**的全量目录）。
@@ -1478,7 +1491,8 @@ describe('model.list / model.setDisabled 端点', () => {
       models: onSaleAll,
       // glm-5 已下架（不在全量目录里）；glm-5.2 在售但被关着。
       disabledModels: { buddy: { 'glm-5': true, 'glm-5.2': true } },
-      modelAdapters: { buddy: { listAllModels: () => onSaleAll } },
+      // ⚠️ 必须声明「这份目录确认来自远端」—— 判据的前置条件（见 doc）。
+      modelAdapters: { buddy: { listAllModels: () => onSaleAll, catalogConfirmedRemote: () => true } },
     })
 
     const result = await call('model.list', { provider: 'buddy' })
@@ -1488,6 +1502,50 @@ describe('model.list / model.setDisabled 端点', () => {
     expect(ids).not.toContain('glm-5')
     // 在售但被关的 glm-5.2 必须仍在（否则用户无法重新打开）。
     expect(ids).toContain('glm-5.2')
+  })
+
+  /**
+   * ★★ **目录未经「确认远端」时，不得据兜底子集判「已下架」**（2026-10-28 修）。
+   *
+   * ## 为什么「不在 `listAllModels()` 里」不足以证明已下架
+   *
+   * `listAllModels()` 在**冷缓存 / 远端降级**下返回的是各家**编译期兜底表**
+   * （`model-catalog.ts` 的 `cached ?? config.syncCatalog()`），它是远端目录的
+   * **子集** —— 本仓库在 Issue IKJW33 上实测过：`cline` 冷缓存只有 **3** 条、
+   * 远端有 **460** 条。
+   *
+   * 拿它当「在售集合」的后果：用户关掉的**在售**模型（恰好不在兜底表里的那些，
+   * 例如 codearts 近期新增、只存在于远端的 `glm-5.3` / `kimi-k3`）会被判成
+   * 已下架 ⇒ **从设置页彻底消失、再也打不开** —— 正是本端点当初要修的缺陷形态。
+   * 而且窗口很实在：远端拉取失败、离线启动、或刚重启还没拉到时都会命中。
+   *
+   * ## 判据（与 PR159 注释里那句原则对齐）
+   *
+   * 「判据只能建立在**确认拿到全量目录**之上」—— 只有适配器能证明自己这份目录
+   * 来自「远端完整读取」（`catalogConfirmedRemote?.() === true`）时才允许隐藏；
+   * 证明不了就**放弃判据、照旧补回**。方向与 `dead-model-store.ts` 头注释的
+   * 「不从残缺目录反推」一致：**宁可留幽灵，也不让用户在售模型凭空消失**。
+   *
+   * ⚠️ 这条同时是**其余 14 家的默认行为**：它们都没声明该钩子 ⇒ 端点行为与
+   * 加本判据之前逐字节一致（不隐藏任何条目）。
+   */
+  it('★★ 目录未经「确认远端」时不得据残缺（兜底子集）判已下架', async () => {
+    // 兜底表是子集：远端真实在售的 glm-5.3 不在里面。
+    const fallback = [{ id: 'glm-5.2', name: 'GLM-5.2' }]
+    const { call } = registerEndpoints({
+      models: fallback,
+      disabledModels: { codearts: { 'glm-5.3': true } },
+      // ⚠️ 刻意**不声明** catalogConfirmedRemote —— 无法证明这是完整远端目录。
+      modelAdapters: { codearts: { listAllModels: () => fallback } },
+    })
+
+    const result = await call('model.list', { provider: 'codearts' })
+    expect(result.ok).toBe(true)
+    const ids = (result.value as { models: Array<{ id: string }> }).models.map((m) => m.id)
+    expect(
+      ids,
+      '拿兜底子集当在售集合 ⇒ 用户在售模型会从设置页消失且无法重新打开',
+    ).toContain('glm-5.3')
   })
 
   /**

@@ -1,5 +1,24 @@
 # fix(codearts): 续期静默死号 + 目录三处缺陷（IKQY27 / IKQ2QI 相关）
 
+> ## ⚠️⚠️ 2026-10-28：合入 master 后的两处修订（**先读这段；下文是当时的原文，保留作历史**）
+>
+> master（`08548c8`）合入本分支时，原有四处修复按下面处置（提交 `82219c5` 合并、
+> `f9208e3` 修缺陷）：
+>
+> | # | 原修法 | 现状 | 原因 |
+> |---|---|---|---|
+> | 1 | 「`X-NNNN` 只有在同目录存在 `X` 时才保留，否则**剥掉后缀**」（`resolveModelIds`） | ❌ **整条删除** | master 的 `3f0f48c` 已把同一缺陷（1017 被吞）修成「对外 id / `seen` 去重键 / 展示名一律用**原始** `model_id`」；且本修法依据的前提「chat 端点只认不带后缀的 id」在本仓 2026-09-23 已被实测推翻（`-0731` 回 404 的真因是**缺 `maas_type` 头**，两者是后端**两个独立注册模型**）。见 `src/llm-adapter.ts` 的 `DEFAULT_MODELS` 注释与 `tests/unit/models.spec.ts` 里那条「带版本后缀必须原样暴露」的用例 |
+> | 2 | 「复用 codearts 的 `RefreshTokenExpiredError` ⇒ **九家同时受益**」 | ⚠️ **机制改写** | 各家判的是**自己那个同名类**（buddy/trae/qoder/cline/lobsterai 各自定义、gemini/minimax/accio 各带前缀），跨模块 `instanceof` **恒 false** ⇒ 另外 8 家仍按非终态处理。改为**必填参数** `makeTerminalError(message) => Error`，10 处调用点各给自己的类；漏接线在 `tsc` 就红 |
+> | 3 | `STS5.1806` 归终态（`src/oauth.ts`） | ✅ 保留 | 与 master 无交集，仍是缺的 |
+> | 4 | 目录表校准（`DEFAULT_MODELS` / `CONTEXT_WINDOWS` 补 `-1017`） | ✅ 保留 | master 只修了「1017 可见」，它的窗口仍落 `524_288` 具名兜底 ⇒ 分母错 2 倍 |
+> | 5 | 已下架模型不再补回设置页（以 `listAllModels()` 为界） | ⚠️ **保留意图、判据加固** | master 的 `model.list` 仍无条件补回。但「拿得到 `listAllModels()`」**不等于**「拿到全量目录」——冷缓存 / 远端降级时它是**编译期兜底子集**（Issue IKJW33 实测：`cline` 冷缓存 3 条 vs 远端 460 条）⇒ 会把用户关掉的**在售**模型判成「已下架」、从设置页**彻底消失且无法重新打开**。⇒ 新增适配器自报钩子 `catalogConfirmedRemote()`，只有它能证明「远端完整读取」时才允许隐藏；其余 14 家不实现 ⇒ 行为与加判据之前逐字节一致 |
+>
+> ⇒ 下文提到 `resolveModelIds` / `gatewayIdMap` / 「仍须剥掉后缀」的段落**均已作废**；
+> 「九家同时受益」的目标成立，但机制是**调用方注入**而不是共用某个类。
+> 上述三处的完整判据、守卫与变异验证已登记进
+> `docs/agent-notes/providers-codearts.md`（「目录 id 语义 / 续期终态类型 /
+> 「已下架」判据」一节）。
+
 > 分支：`fix/codearts-renew-and-catalog`（基于 `master@239a7ee`，**不含** PR !158 的 UI 修复）
 > 提交：4 个 · 12 文件 · +567 / −38
 

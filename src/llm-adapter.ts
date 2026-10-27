@@ -383,8 +383,10 @@ const CONTEXT_WINDOWS: ReadonlyMap<string, number> = new Map([
   ['deepseek-v4-flash', 1_048_576],
   ['deepseek-v4-pro', 1_048_576],
   ['deepseek-v4.1-flash', 1_048_576],
-  // ⚠️ `-1017` 是上游**独立注册**的模型（与老版撞 id 会丢，见 models.ts 的
-  //    `resolveModelIds`），但**窗口与老版一致**（用户 2026-10-27 确认）。
+  // ⚠️ `-1017` 是上游**独立注册**的模型（`/v1/model/builtin` 与
+  //    `deepseek-v4.1-flash` 同时下发，`src/models.ts` 用**原始 `model_id`**
+  //    当对外 id 与去重键——2026-10-27 修，见 `parseModelInfo`），
+  //    但**窗口与老版一致**（用户 2026-10-27 确认）。
   //    不补这一行会让它走 524_288 的具名兜底 ⇒ 分母错 2 倍、压缩阈值偏早
   //    （正是 `CODEARTS_FALLBACK_CONTEXT_WINDOW` 注释里记录的那条报障形态）。
   ['deepseek-v4.1-flash-1017', 1_048_576],
@@ -1708,6 +1710,31 @@ export class CodeArtsAdapter extends LlmAdapter {
 
   async listModels(_provider: string): Promise<readonly LlmModelInfo[]> {
     return this.catalog.listModels(_provider)
+  }
+
+  /**
+   * 「这份 `listAllModels()` **确认**来自远端完整读取」——供 `model.list` 的
+   * 「已下架」判据用（见 `ModelCatalogSource.catalogConfirmedRemote` 的注释）。
+   *
+   * ## 判据（两条腿都必须成立，缺一即 `false`）
+   *
+   * 1. `remoteModels !== undefined` —— 至少成功读到过一次远端目录。
+   *    ⚠️ `syncCatalogEntries()` 在未落地时回退**编译期兜底表**，那是远端目录的
+   *    **子集**（Issue IKJW33 的实测形态）⇒ 不能当「在售集合」。
+   * 2. `remoteComplete === true` —— 接线层经 `catalogComplete` 上报「**两个**
+   *    目录端点都取全」。只有一个端点成功时目录同样是子集。
+   *
+   * ## 保守方向
+   *
+   * 冷启动 / 远端降级 / 残缺时返回 `false` ⇒ `model.list` **放弃**判据、照旧补回
+   * 黑名单条目。代价是可能多留一个「点开会 404」的幽灵条目；反向的代价是用户在售
+   * 模型从设置页**彻底消失且无法重新打开**（不可自愈）⇒ 两害相权取其轻。
+   *
+   * ⚠️ 本方法必须能被 `withDeadModelPruning` 的 Proxy **原样透传**（它有接线守卫：
+   * `dead-model-store.spec.ts` 的「catalogConfirmedRemote 经包装后仍可调用」）。
+   */
+  catalogConfirmedRemote(): boolean {
+    return this.remoteModels !== undefined && this.remoteComplete
   }
 
   async resolveModel(provider: string, model: string, signal?: AbortSignal): Promise<LlmResolvedModelInfo> {
