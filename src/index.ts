@@ -117,6 +117,8 @@ import { fetchAutoclawBalanceDetailed, fetchAutoclawCreditBalance } from './auto
 import type { RaccoonCredential } from './raccoon.js'
 import { MinimaxAuth } from './minimax-auth.js'
 import { registerMinimaxLlm } from './minimax-adapter.js'
+// ⚠️ 2026-10-24 本地试验版：journal 落盘根目录（`~/.dsh`，与 state.json 同源）。
+import { resolveJetHubHome } from './jet-hub-store.js'
 // ⚠️ MiniMax 国际站的**账号出口代理**解析器（与 gemini 同款：实例住在被依赖
 //    方向的下游，避免 `index → jet-hub-rpc → index` 的 ESM 环 —— 那条环会把
 //    引用变成 TDZ ⇒ 静默恒直连）。
@@ -3095,7 +3097,14 @@ export function apply(ctx: Context): void {
         pool.minimaxXff(),
       ),
   })
-  const minimax = new MinimaxAuth(ctx)
+  const minimax = new MinimaxAuth(ctx, {
+    // ⚠️ 2026-10-24 本地试验版：续期/身份 journal（`refresh-journal.jsonl`）。
+    journalHome: resolveJetHubHome(ctx),
+  })
+  // ⚠️ 2026-10-24 本地试验版：记住「上一次选中的账号」，401/临期续期时
+  //    **精准续它** —— 旧写法续的是「池内第一个可用账号」，那可能是另一个号
+  //    （选号器与 401 时刻之间隔着一整轮请求，池序没变但账号状态变了）。
+  let lastPickedMinimaxAccount = ''
   const minimaxAdapter = registerMinimaxLlm(ctx, {
     credentialRef: credentialRef(MINIMAX.defaultCredentialRef),
     // provider 实参用 MINIMAX 而非字面量：写死字面量在改名/多产品场景下
@@ -3103,7 +3112,10 @@ export function apply(ctx: Context): void {
     // ⚠️ 只从 minimax 自己的账号池取账号，回退到自己的单凭据 ref，
     // 保证不会串用其它 provider 的凭据。
     resolveCredential: createCredentialResolver<MinimaxCredential>(
-      { pool, reportAccount: (id) => { if (id !== undefined) reportLedgerAccount(MINIMAX.id, id) } },
+      { pool, reportAccount: (id) => {
+          if (id !== undefined) lastPickedMinimaxAccount = id
+          if (id !== undefined) reportLedgerAccount(MINIMAX.id, id)
+        } },
       {
         product: MINIMAX,
         // ⚠️ 与选号器**共用同一个**解析器（原先这里是一份内联的匿名箭头，
@@ -3151,20 +3163,22 @@ export function apply(ctx: Context): void {
       // ⚠️ MiniMax **有** refresh 端点（`/oauth2/token` 的 refresh_token 授权），
       // 这里是真续期（与 Loomy 的「只能探测有效性」不同）。
       //
-      // 仍须刷新**解析凭据时所用的那一个**账号，而不是默认单凭据 ref ——
-      // 否则续期的是另一份凭据，用户会看到「刚登录好却一直认证失败」。
-      const available = await pool.getAvailableAccount(MINIMAX.id, '')
-      if (available) {
+      // ⚠️ 2026-10-24 本地试验版：**精准续期** —— 优先续「上一次选中的账号」
+      //（401/临期预判都发生在它身上），找不到才退「池内第一个可用账号」。
+      //
+      // ⚠️ 走 `refreshAccountCredential`（lead-aware，1h 窗口）而不是
+      //    `renewEntry(force)`：① 它是 H2 契约的桩点（`refreshAccountCredential`
+      //    被替换成记录器时本闭包必须仍可驱动）；② 1h lead 窗口在巡检
+      //    （5-15min margin ⇒ 续后剩余恒 ~60min）下**恒命中**，401 时必发 grant，
+      //    与旧行为逐字节等价。抢断式强刷已由 `renewEntry` 的巡逻/兜底承担。
+      const entries = await pool.listAccounts(MINIMAX.id)
+      const target = entries.find((e) => e.id === lastPickedMinimaxAccount)
+        ?? (await pool.getAvailableAccount(MINIMAX.id, ''))?.entry
+      if (target !== undefined) {
         // ⚠️ **必须传 pool + entry.id**：续期成功后要把新的 `expiresAt` 写回
-        // 账号池，否则 UI 会一直显示「已过期」而实际能正常发消息
-        //（真实缺陷：JWT 已续到 15:09、账号池仍是 12:02，相差 3.1 小时）。
-        //
-        // ⚠️ `getAvailableAccount` 返回 **`{ entry, credential }`** 两层 ——
-        // 账号 id 与 credentialRef 在 **`available.entry`** 里，**不是**
-        // `available.id` / `available.credentialRef`（那是 `undefined`，
-        // 会让续期**静默写不回账号池**）。
+        // 账号池，否则 UI 会一直显示「已过期」而实际能正常发消息。
         await minimax.refreshAccountCredential(
-          available.entry.credentialRef, pool, available.entry.id,
+          target.credentialRef, pool, target.id,
         )
       } else {
         await minimax.refresh()
@@ -3215,13 +3229,19 @@ export function apply(ctx: Context): void {
   const minimaxIntl = new MinimaxAuth(ctx, {
     product: MINIMAX_INTL,
     fetchFor: minimaxIntlFetchForAccount,
+    journalHome: resolveJetHubHome(ctx),
   })
+  // ⚠️ 与中国版同因（2026-10-24）：记住「上一次选中的账号」，精准续期。
+  let lastPickedMinimaxIntlAccount = ''
   const minimaxIntlAdapter = registerMinimaxLlm(ctx, {
     credentialRef: credentialRef(MINIMAX_INTL.defaultCredentialRef),
     // ⚠️ provider 实参必须是 MINIMAX_INTL：写死 MINIMAX 会让国际站永远查不到
     // 自己的账号（本插件在 workbuddy 上踩过同类坑）。
     resolveCredential: createCredentialResolver<MinimaxCredential>(
-      { pool, reportAccount: (id) => { if (id !== undefined) reportLedgerAccount(MINIMAX_INTL.id, id) } },
+      { pool, reportAccount: (id) => {
+          if (id !== undefined) lastPickedMinimaxIntlAccount = id
+          if (id !== undefined) reportLedgerAccount(MINIMAX_INTL.id, id)
+        } },
       {
         product: MINIMAX_INTL,
         // ⚠️ 与中国版**共用同一个**解析器（见 `resolveMinimaxCredentialByRef` 的说明）。
@@ -3247,13 +3267,14 @@ export function apply(ctx: Context): void {
       },
     ),
     refresh: async () => {
-      // 同中国版：刷新**解析凭据时所用的那一个**账号，不是默认单凭据 ref。
-      const available = await pool.getAvailableAccount(MINIMAX_INTL.id, '')
-      if (available) {
-        // ⚠️ **必须传 pool + entry.id**（两层结构）：否则续期成功后新 `expiresAt`
-        // 写不回账号池，UI 会一直显示「已过期」而实际能正常发消息。
+      // 同中国版（2026-10-24 本地试验版）：**精准续期** —— 优先续「上一次选中
+      // 的账号」，走 `refreshAccountCredential`（lead-aware + 抢救链），理由见上。
+      const entries = await pool.listAccounts(MINIMAX_INTL.id)
+      const target = entries.find((e) => e.id === lastPickedMinimaxIntlAccount)
+        ?? (await pool.getAvailableAccount(MINIMAX_INTL.id, ''))?.entry
+      if (target !== undefined) {
         await minimaxIntl.refreshAccountCredential(
-          available.entry.credentialRef, pool, available.entry.id,
+          target.credentialRef, pool, target.id,
         )
       } else {
         await minimaxIntl.refresh()
@@ -3546,6 +3567,105 @@ export function apply(ctx: Context): void {
     // 共享骨架」后，那两个字段**已删除** —— 现在唯一入口是本行传进去的池。
     // ⚠️ **不要把它们加回来**：那会重现「同一语义两套判据」（本仓库红线）。
     accountPool: pool,
+    /**
+     * ⚠️⚠️ **2026-10-25 补：401 按需续期这条腿此前完全缺失**（真实缺陷）。
+     *
+     * ## 缺陷与证据
+     *
+     * `autoclaw-adapter.ts:636` 的 401 重试判据是
+     * `if (!response.ok && (401 || 403) && this.options.refresh)` ——
+     * **没有本回调时整段不执行**（既不续期、也不重发）。
+     * 而本实例（与国际版）自 `6da5505`（AutoClaw 首次接入）起**从未传过它**
+     * （`git log -S"autoclawAdapter"` 只命中那一个提交）。
+     *
+     * ⇒ 401 直接落到 `isAutoclawAuthError` 命中 `'invalid token'` ⇒ 归 `AUTH`
+     *   ⇒ 而 `AUTH` 会被 DSH 客户端**换成固定文案「API 密钥无效」并丢掉原文**
+     *   （本仓库自记：`autoclaw.ts:555-556` / `docs/agent-notes/client-ui.md`）。
+     *   这正是用户报「模型经常报错 API 密钥无效」的**直接来源**。
+     *
+     * ## 为什么「经常」（触发窗口）
+     *
+     * 定时 `refreshAll`（注册表派生，覆盖本家）本身是工作的 —— 实测凭据
+     * AT 的 `iat` 已刷新、RT 还剩 24.5 天，说明续期成功过。但定时器有 **30 分钟
+     * 粒度**：AT 过期到下一轮成功续期之间存在窗口（宿主关闭/重启、某一轮失败
+     * 都会拉长它），窗口内任何请求都 401 且**无按需自愈** ⇒ 每次过期边界附近
+     * 都可能撞上。补上本回调后，401 会先续期再原样重发一次，请求级自愈。
+     *
+     * ## 形态（⚠️ 2026-10-27 审计修：**不再自己问池要号**）
+     *
+     * 修前是 `pool.getAvailableAccount(AUTOCLAW.id, '')` —— 续到的号与请求实际
+     * 用的号**不是同一个**，而这是本 PR **目标没达成**的直接原因：
+     *
+     * | 判据 | 请求用的号（`createCredentialResolver` + `balance` 分档） | 修前的续期号 |
+     * |---|---|---|
+     * | 排序 | 按到期档位（`pickBuddyAccount`） | 用户手动序第一个 |
+     * | 限流过滤 | 按真 `modelId` | 传 `''` ⇒ **整体短路** |
+     *
+     * 实测（真跑 `createCredentialResolver` + 复刻池逻辑）：分档选中 B 号，
+     * 而 `getAvailableAccount` 返回 A 号 ⇒ 续 A、重发仍用 B 的旧 token ⇒
+     * 401 原样复现，A 被白轮换一把 RT。端到端三次请求 `["AUTH","AUTH","AUTH"]`。
+     *
+     * ⇒ 现在用适配器传进来的 `used`（**本次实际发请求的那份凭据**）：
+     *   ① 按 `access_token` 反查它在池里的条目（与适配器自己的记账判据同源）；
+     *   ② 续它、并**把新凭据返回给适配器重发**（不再 `resolveCredential` 重选号）。
+     *
+     * ⚠️ 反查不到（单凭据路径 / 池里没有这个 token）⇒ 退默认单凭据 ref。
+     * ⚠️ 仍传 `pool + entry.id`，否则新 `expiresAt` 写不回池（issue !IKIRTT）。
+     */
+    refresh: async (used) => {
+      const token = used?.access_token ?? ''
+      // ⚠️ 反查的第二参是**凭据内容**（access_token）而不是 ref 名 ——
+      //    传 ref 名会恒匹配失败且**静默**（本仓库已复发多次）。
+      const accountId = token.length > 0
+        ? await pool.findAccountIdByCredential(AUTOCLAW.id, token).catch(() => '')
+        : ''
+      const entry = accountId.length > 0
+        ? (await pool.listAccounts(AUTOCLAW.id)).find((item) => item.id === accountId)
+        : undefined
+      if (entry !== undefined) {
+        return await autoclaw.renewCredentialForRef(entry.credentialRef, pool, entry.id)
+      }
+      /**
+       * ⚠️⚠️ **反查失败必须当场留痕**（2026-10-27 第二轮审计打穿的 P0，两位审计员独立命中）。
+       *
+       * ## 为什么诊断要写在这里而不是下面那条「退默认 ref」的分支
+       *
+       * 修前把 warn 放在 `renewCredentialForRef(defaultCredentialRef)` 返回
+       * `undefined` 之后 —— 但那条分支**几乎不可达**：该 ref 全仓无写入点，
+       * 而 `renewCredentialForRef` 在「凭据未配置」时是**抛错**（不是返回
+       * `undefined`）⇒ 真正发生的是「抛错被适配器的 `catch` 静默吃掉」，
+       * 那条精心写好的 warn **一次都不会执行**（实测确认）。
+       *
+       * ⇒ 现在把诊断**前移到反查失败当场**：无论后续走哪条分支（抛错 / 空转 /
+       *   退默认 ref），日志里都已经有「为什么找不到可续期的账号」。
+       *
+       * ⚠️ 这条路径**可达**：`pool.findAccountIdByCredential` 会 `continue` 掉
+       *   `!entry.enabled` 的条目 ⇒ 请求用的账号若在 grant 期间被停用，
+       *   反查返回 `''` 就落到这里。
+       */
+      if (token.length > 0) {
+        ctx.logger.warn(
+          '[autoclaw] 401 后按 access_token 反查不到账号：'
+          + '池里没有一把匹配的凭据（可能该账号已被删除，或已停用 ⇒ 反查跳过 enabled:false）'
+          + ' ⇒ 本次只能退默认单凭据 ref（它通常未配置，即本次不重发，按首次 401 报错）',
+        )
+      }
+      /**
+       * 池里没有这个 token（单凭据路径 / 账号被删）⇒ 退默认单凭据 ref。
+       *
+       * ⚠️ **不能抛错**（第二轮审计打穿的 P0）：适配器那一侧的 401 重发是
+       * `try { … } catch { /* 忽略重试失败 *\/ }` —— 抛出去的异常被**静默吃掉**。
+       * 现在只记日志 + 让 `renewCredentialForRef` 自己决定抛或返回；
+       * 适配器那侧的 `catch` 也已补 warn，两处合起来保证**不再静默**。
+       */
+      return await autoclaw.renewCredentialForRef(AUTOCLAW.defaultCredentialRef).catch((error: unknown) => {
+        ctx.logger.warn(
+          '[autoclaw] 401 后无可续期的账号（默认单凭据 ref 未配置或不可用）：'
+          + `${error instanceof Error ? error.message : String(error)} ⇒ 本次不重发，按首次 401 报错`,
+        )
+        return undefined
+      })
+    },
   })
 
   // ===== AutoClaw 国际版（autoclawintl）=====
@@ -3597,6 +3717,49 @@ export function apply(ctx: Context): void {
     // ⚠️⚠️ 同国内版（2026-10-23 迁移）：黑名单与关闭意图由共享骨架从账号池读。
     //    两个站点**各一条** `accountPool`，漏一处即该站静默失效（本仓库的既有纪律）。
     accountPool: pool,
+    /**
+     * ⚠️⚠️ **2026-10-25 补：401 按需续期这条腿此前完全缺失**（与国内版同因同源）。
+     *
+     * 证据与形态**逐字同国内版那条**（见上）：`autoclaw-adapter.ts` 的 401
+     * 重试判据带 `&& this.options.refresh`，而两个实例自 `6da5505` 起都没传它
+     * ⇒ 401 不续期不重发 ⇒ 归 `AUTH` ⇒ 客户端换成「API 密钥无效」。
+     * 两个站点**各补一条**（本仓库既有纪律：双站点每处都要到位）。
+     *
+     * ⚠️ 形态与国内版**逐字同构**（含「按 `used.access_token` 反查」与
+     * 「返回新凭据供重发」）：两站的选号规则差异（都接了 `balance` 分档）
+     * 完全一样，照抄国内版才是同一条纪律；各写一套必然漂移。
+     */
+    refresh: async (used) => {
+      const token = used?.access_token ?? ''
+      const accountId = token.length > 0
+        ? await pool.findAccountIdByCredential(AUTOCLAW_INTL.id, token).catch(() => '')
+        : ''
+      const entry = accountId.length > 0
+        ? (await pool.listAccounts(AUTOCLAW_INTL.id)).find((item) => item.id === accountId)
+        : undefined
+      if (entry !== undefined) {
+        return await autoclawIntl.renewCredentialForRef(entry.credentialRef, pool, entry.id)
+      }
+      // ⚠️ 同国内版：**诊断前移到反查失败当场**（那条「退默认 ref 后看返回值」
+      //    的分支几乎不可达 —— `renewCredentialForRef` 在未配置时是抛错不是返回
+      //    `undefined`，故旧写法里那段 warn 一次都不会执行，实测确认）。
+      if (token.length > 0) {
+        ctx.logger.warn(
+          '[autoclawintl] 401 后按 access_token 反查不到账号：'
+          + '池里没有一把匹配的凭据（可能该账号已被删除，或已停用 ⇒ 反查跳过 enabled:false）'
+          + ' ⇒ 本次只能退默认单凭据 ref（它通常未配置，即本次不重发，按首次 401 报错）',
+        )
+      }
+      // ⚠️ 同国内版：**不得抛错**（抛出去会被适配器的 catch 静默吃掉 ⇒
+      //    「一次上游都不发 + 日志零字」）。只记日志并返回 undefined。
+      return await autoclawIntl.renewCredentialForRef(AUTOCLAW_INTL.defaultCredentialRef).catch((error: unknown) => {
+        ctx.logger.warn(
+          '[autoclawintl] 401 后无可续期的账号（默认单凭据 ref 未配置或不可用）：'
+          + `${error instanceof Error ? error.message : String(error)} ⇒ 本次不重发，按首次 401 报错`,
+        )
+        return undefined
+      })
+    },
   })
 
   const accio = new AccioAuth(ctx)
@@ -4314,6 +4477,32 @@ const zcodeAdapter = registerZcodeLlm(ctx, {
   }).catch((error: unknown) => {
     ctx.logger.warn(`[jet-hub] 修正 MiniMax 国际版账号显示名失败：${String(error)}`)
   })
+
+  // ===== MiniMax 专属 60s 续期巡检 =====
+  //
+  // ⚠️⚠️ **这是本次重构的核心**：全局 30min 调度器对 MiniMax 已改为
+  // **只对账**（`MinimaxAuth.refreshAll` 不再发 grant，见该方法注释），
+  // MiniMax 的轮换改由这里承担 —— margin 5min + 账号散列抖动 ⇒
+  // 各账号续期时刻天然错开，旧形态「全池同秒过期」的结构性根因被拆除。
+  //
+  // ⚠️ 两个站点**各一条**（同 repair 的双站点纪律，漏一处即该站静默不续期）。
+  //
+  // ⚠️⚠️ **必须挂 `ctx.effect` 回收**（2026-10-27 审计修）。
+  //    修前这两行是裸调用：`startRenewPatrol` 装了一个 60s `setInterval`，
+  //    而**没有任何 clear 路径**（`unref` 只保证「不阻止进程退出」，不保证
+  //    「fiber 卸载后停手」）。实测 `fiber.dispose()` 后推进 130s ⇒ 巡检 tick
+  //    照跑，而旧实例读的是**共享 credentials 后端**（不是快照）⇒ 它会继续对
+  //    **新池**发 grant；插件热重载时旧实例没死 + 新实例已起 ⇒ **两个实例并发
+  //    轮换同一批一次性 RT**，输家拿到 `invalid_grant` 并把好号标死
+  //    （`refreshable:false` 是单向门）—— 恰好是本 PR 自己声称要修的形态。
+  //    ⚠️ 回收点必须与 `refreshScheduler.stop()`（下方 `ctx.effect`）同处：
+  //    那是本文件既有的生命周期约定，别另开一套。
+  ctx.effect(() => () => {
+    minimax.stopRenewPatrol()
+    minimaxIntl.stopRenewPatrol()
+  })
+  void minimax.startRenewPatrol(pool)
+  void minimaxIntl.startRenewPatrol(pool)
 
   // ===== 多账号静默续期调度 =====
   // 替代原有的单账号 scheduleRefresh()，使用 refreshAll() 遍历所有账号续期

@@ -50,6 +50,36 @@ export const JET_HUB_SIDEBAR_ORDER = 20;
 const PANEL_ENTRY_READ_TIMEOUT_MS = 5000;
 
 /**
+ * 一次 `loadPanelEntry` 最多发几轮读请求（1 轮首读 + 重试）。
+ *
+ * ⚠️⚠️ **首读发生在 `apply()` 里，那时连接可能还没握手完**（2026-10-27 真机报障）：
+ * 本插件是 `web` profile 里 60+ 个客户端插件之一，冷启动时 `apply()` 早于
+ * `connection` 的握手完成，而 `connection.rpc.call()` 在 socket 就绪前**不会本地失败**，
+ * 只是一直不 settle ⇒ 5s 超时信号到点 ⇒ 控制台一条
+ * `[jet-hub] 读取面板入口偏好失败，按仅侧栏处理 TimeoutError: signal timed out`。
+ *
+ * 后果不止是那行噪音：偏好被永久降级成「仅侧栏」直到插件重载 —— 选了
+ * 「仅设置页」的用户会看到侧栏多出一行、设置节消失。
+ *
+ * ⇒ 有界重试：`apply()` 期的一次瞬时超时不该等于「宿主真的答不上」。
+ *   每轮都带自己的 5s 超时，间隔按轮次线性递增（200ms / 400ms），
+ *   最坏 3 轮 ≈ 15.6s —— 冷启动握手远小于这个量级。
+ */
+const PANEL_ENTRY_READ_ATTEMPTS = 3;
+
+/**
+ * 重试间隔基数（毫秒，第 n 轮重试等 `n × 本值`）。
+ *
+ * 只用来跨过握手窗口，不需要指数退避（总共才两轮重试）。
+ */
+const PANEL_ENTRY_RETRY_DELAY_MS = 200;
+
+/** 等待若干毫秒（重试用）。 */
+function delay(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
  * 进程内的「面板入口」状态。
  *
  * `null` = **还没从宿主读到**（启动中）；`'sidebar'` / `'settings'` = 宿主的明确取值。
@@ -206,6 +236,11 @@ function readSignal() {
  * ⚠️ **并发去重**：三处都在 `apply` / 挂载时立即调用，不去重就要打三次宿主 RPC，
  * 而且三次回包顺序不定会多广播两次无谓重渲染。
  *
+ * ⚠️ **有界重试**（2026-10-27）：首读发生在 `apply()`，那时 `connection` 可能还没
+ * 握手完，`connection.rpc.call()` 不会本地失败、只是一直不 settle ⇒ 5s 超时到点
+ * ⇒ 偏好被永久降级成「仅侧栏」。现在最多 3 轮、间隔 200ms / 400ms，只在**全部
+ * 轮次都失败**时才打一次 warn。详见 {@link PANEL_ENTRY_READ_ATTEMPTS}。
+ *
  * @param {(endpoint: string, payload: unknown, signal?: AbortSignal) => Promise<unknown>} rpcCall
  * @returns {Promise<'sidebar' | 'settings'>} 读到的值；失败时沿用当前状态（兜底仅侧栏）
  */
@@ -216,24 +251,40 @@ export function loadPanelEntry(rpcCall) {
   // ⚠️ 发起时记下写入序号：回包时若它变了，说明期间用户改过，本回包已过期。
   const seqAtStart = writeSeq;
   const task = (async () => {
-    try {
-      const result = await rpcCall('panelEntry.get', {}, readSignal());
-      const next = normalize(result?.entry);
-      // ⚠️ 防倒灌（复核 I3）：期间有写入就丢弃本次读回包 —— 它携带的是写之前
-      //    的宿主状态，落地会覆盖用户刚做的选择。
-      if (writeSeq !== seqAtStart) return entry ?? FALLBACK_ENTRY;
-      if (next !== null) {
-        // 宿主明确给了合法值：清掉失败标记。
-        publish(next, false);
-      } else {
-        // 回包形状不对：按读取失败处理，但仍保持当前（默认仅侧栏）方向。
-        publish(entry ?? FALLBACK_ENTRY, true);
+    /** 最后一轮的失败原因；只有**全部轮次都失败**才把它报出去。 */
+    let lastError;
+    for (let attempt = 1; attempt <= PANEL_ENTRY_READ_ATTEMPTS; attempt += 1) {
+      try {
+        const result = await rpcCall('panelEntry.get', {}, readSignal());
+        // ⚠️ 防倒灌（复核 I3）：期间有写入就丢弃本次读回包 —— 它携带的是写之前
+        //    的宿主状态，落地会覆盖用户刚做的选择。
+        if (writeSeq !== seqAtStart) return entry ?? FALLBACK_ENTRY;
+        const next = normalize(result?.entry);
+        if (next !== null) {
+          // 宿主明确给了合法值：清掉失败标记。
+          publish(next, false);
+        } else {
+          // 回包形状不对：按读取失败处理，但仍保持当前（默认仅侧栏）方向。
+          // ⚠️ 形状不对**不重试** —— 宿主已经答了，只是答得不对，再问三次也一样。
+          publish(entry ?? FALLBACK_ENTRY, true);
+        }
+        return entry ?? FALLBACK_ENTRY;
+      } catch (caught) {
+        lastError = caught;
+        // 期间用户写入过 ⇒ 本次读已过期，不必再试（写成功已给出权威值）。
+        if (writeSeq !== seqAtStart) return entry ?? FALLBACK_ENTRY;
+        if (attempt >= PANEL_ENTRY_READ_ATTEMPTS) break;
+        // ⚠️ 等待与退避都在 `writeSeq` 判据之后：用户一写入就立刻停，别再空转两轮。
+        await delay(PANEL_ENTRY_RETRY_DELAY_MS * attempt);
+        if (writeSeq !== seqAtStart) return entry ?? FALLBACK_ENTRY;
       }
-    } catch (caught) {
-      console.warn('[jet-hub] 读取面板入口偏好失败，按仅侧栏处理', caught);
-      // 失败标记同理：期间若用户写入成功，不该再挂一个「读失败」的降级文案。
-      if (writeSeq === seqAtStart) publish(entry ?? FALLBACK_ENTRY, true);
     }
+    console.warn(
+      `[jet-hub] 读取面板入口偏好失败，按仅侧栏处理（已重试 ${PANEL_ENTRY_READ_ATTEMPTS - 1} 次）`,
+      lastError,
+    );
+    // 失败标记同理：期间若用户写入成功，不该再挂一个「读失败」的降级文案。
+    if (writeSeq === seqAtStart) publish(entry ?? FALLBACK_ENTRY, true);
     return entry ?? FALLBACK_ENTRY;
   })();
   inflight = task;
