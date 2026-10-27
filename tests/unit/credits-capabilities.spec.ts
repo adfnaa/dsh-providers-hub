@@ -595,10 +595,25 @@ describe('客户端积分请求门控（源码级回归）', () => {
       '★★ loadCredits 必须把 force 透传给 credits.balances（否则「刷新」是假的）',
     ).toMatch(/rpcCall\('credits\.balances',\s*force\s*\?[^)]*:\s*\{[^}]*\}\)/)
 
-    // ② 「刷新积分」按钮
+    // ② 「刷新积分」按钮（2026-10-26 起是**图标按钮**，文案在 title / aria-label 里）
     const button = /onClick: \(\) => void loadCredits\(([^)]*)\)/.exec(source)
     expect(button, '★ 找不到「刷新积分」按钮的 onClick').not.toBeNull()
     expect(button![1], '★★ 「刷新积分」必须传 force=true').toContain('true')
+
+    // ②b 换图标后**必须**补的两处（否则是净损失，与「删除」那枚图标按钮同源教训）：
+    //     - `title`：原按钮文案「刷新积分」自带动作语义，图标不自解释
+    //     - `aria-label`：svg 标了 aria-hidden，没有它读屏只会念「按钮」
+    const refreshAt = source.indexOf('刷新积分：重新查询本页全部账号的剩余积分')
+    expect(refreshAt, '★ 「刷新积分」按钮的 title 丢了（图标不自解释）').toBeGreaterThan(-1)
+    const refreshBlock = source.slice(Math.max(0, refreshAt - 900), refreshAt + 400)
+    expect(refreshBlock, '★★ 图标按钮必须带 dim-jh-iconBtn（否则 svg 会被当文字挤成一行）')
+      .toMatch(/className: 'dim-jh-btn dim-jh-iconBtn'/)
+    expect(refreshBlock, '★★ 图标按钮必须给 aria-label（svg 是 aria-hidden）')
+      .toMatch(/'aria-label':\s*creditsLoading\s*\?/)
+    // 加载态不再换文案（没有文字可换）⇒ 必须走 data-loading + disabled 双保险
+    expect(refreshBlock, '★ 加载态必须有 data-loading（图标自转的唯一入口）')
+      .toMatch(/'data-loading':\s*creditsLoading\s*\?/)
+    expect(refreshBlock, '★ 加载态必须 disabled（否则能连点）').toMatch(/disabled:\s*creditsLoading/)
 
     // ③ 签到 / 新手任务领取后补读（余额刚变，必须绕过缓存）
     expect(source, '★★ 领取积分后补读必须 force').toContain('await loadCredits(true);')
@@ -633,13 +648,21 @@ describe('客户端积分请求门控（源码级回归）', () => {
   it('「刷新积分」按钮与账号卡片的「积分」行都按能力渲染', () => {
     // 归一化 CRLF：本仓库源码在 Windows 上是 CRLF，直接比对多行字面量会假失败。
     const normalized = source.replace(/\r\n/g, '\n')
-    expect(normalized).toMatch(/canLoadCredits\s*\n\s*\? React\.createElement\('button'/)
+    // ⚠️ 2026-10-26 起「刷新积分」是**图标按钮**，`? React.createElement('button'`
+    //    与它之间隔了 8 行注释 ⇒ 原正则（注释夹在 `?` 与 createElement 之间就匹配不上）
+    //    会假红。改为「canLoadCredits 后面紧跟一个 button 元素」，容忍中间任意注释。
+    expect(normalized).toMatch(/canLoadCredits\s*\n(?:\s*\/\/[^\n]*\n|\s*\n)*\s*\? React\.createElement\('button'/)
     expect(normalized).toContain('showCredits: canLoadCredits')
     // AccountCard 必须真的消费 showCredits，否则传了也没用
-    // ⚠️ 窗口不能只取 4000：账号名 hover（packageTooltip / accountTitle）的
-    // 计算代码插在函数头部与 CreditBalanceRow 渲染之间，把间距撑大了。
+    // ⚠️ 窗口**必须跟随函数体**，不能写死字符数 —— 2026-10-25 又来一次：
+    //    把卡片底部的按钮行提成 `actionsNode` 变量后（它插在 `return` 之前，
+    //    约 150 行），函数头到 `CreditBalanceRow` 的间距再次被撑大，
+    //    原 `cardStart + 8000` 窗口够不到 ⇒ 本条假红。
+    //    ⚠️⚠️ `AccountCard` 是**顶层**函数，函数体内部的大括号都缩进过，
+    //    故「顶格 `}` + 换行」就是它的闭合，与内部长度无关。
     const cardStart = normalized.indexOf('function AccountCard(')
-    const cardBody = normalized.slice(cardStart, cardStart + 8000)
+    const cardEnd = normalized.indexOf('\n}\n', cardStart)
+    const cardBody = normalized.slice(cardStart, cardEnd === -1 ? undefined : cardEnd)
     expect(cardBody).toContain('showCredits')
     expect(cardBody).toMatch(/showCredits\s*\n?\s*\?[\s\S]*CreditBalanceRow/)
   })

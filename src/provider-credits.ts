@@ -622,8 +622,30 @@ export function createProviderCredits(
     autoclaw: {
       fetchBalanceDetailed: async (credential) =>
         await fetchAutoclawBalanceDetailed(credential as AutoclawCredential),
-      claim: async (credential) =>
-        await claimAutoclawDailyQuota(credential as AutoclawCredential),
+      /**
+       * ⚠️ **必须把 `call.warn` 与 `call.persistCredential` 透传下去**
+       * （2026-10-27 Gitee PR #153 审计 P0/P1-3）：
+       * - `warn`：刷新失败原先被裸 `catch` 吞掉，`outcome` 与成功逐字相同 ⇒
+       *   用户永远不知道「活动奖励其实没发」；
+       * - `persistCredential`：刷新**可能轮换** `refresh_token`，新值若没人接住，
+       *   旧值立即作废 ⇒ 账号续期能力被**逐日烧掉**（详见
+       *   `ProviderCallContext.persistCredential` 的长注释）。
+       *   ⚠️ 这里用 `entry.credentialRef` 绑 ref —— 与 `resolve` 那条腿**同一个
+       *   ref 约定**（`credentialRef(entry.credentialRef)`），不要自己拼。
+       */
+      claim: (credential, entry, call) =>
+        claimAutoclawDailyQuota(credential as AutoclawCredential, {
+          warn: (message) => call?.warn(message),
+          ...call?.persistCredential === undefined
+            ? {}
+            : {
+                persist: (next: AutoclawCredential) =>
+                  call.persistCredential!(
+                    entry?.credentialRef as unknown as string,
+                    JSON.stringify(next),
+                  ),
+              },
+        }),
       precheckStatus: false,
     },
     /**
@@ -643,11 +665,21 @@ export function createProviderCredits(
           credential as AutoclawCredential,
           { product: AUTOCLAW_INTL },
         ),
-      claim: async (credential) =>
-        await claimAutoclawDailyQuota(
-          credential as AutoclawCredential,
-          { product: AUTOCLAW_INTL },
-        ),
+      /** 与 `autoclaw` 同形（含 `warn` / `persistCredential` 透传），只差产品基址。 */
+      claim: (credential, entry, call) =>
+        claimAutoclawDailyQuota(credential as AutoclawCredential, {
+          product: AUTOCLAW_INTL,
+          warn: (message) => call?.warn(message),
+          ...call?.persistCredential === undefined
+            ? {}
+            : {
+                persist: (next: AutoclawCredential) =>
+                  call.persistCredential!(
+                    entry?.credentialRef as unknown as string,
+                    JSON.stringify(next),
+                  ),
+              },
+        }),
       precheckStatus: false,
     },
     accio: {

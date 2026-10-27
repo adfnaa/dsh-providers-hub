@@ -76,7 +76,7 @@ export function ModelscopeKeyModal({ error, busy, inputRef, onSubmit, onClose })
     onSubmit(value)
   }
   return React.createElement('div', {
-    className: 'dim-jh-modalOverlay dim-jh-modalOverlay--top',
+    className: 'dim-jh-modalOverlay',
     onClick: (e) => { if (e.target === e.currentTarget && !busy && onClose) onClose() },
   },
     React.createElement('div', {
@@ -175,7 +175,7 @@ export function ModelscopeKeyEditModal({ error, busy, currentMasked, inputRef, o
     onSubmit(value)
   }
   return React.createElement('div', {
-    className: 'dim-jh-modalOverlay dim-jh-modalOverlay--top',
+    className: 'dim-jh-modalOverlay',
     onClick: (e) => { if (e.target === e.currentTarget && !busy && onClose) onClose() },
   },
     React.createElement('div', {

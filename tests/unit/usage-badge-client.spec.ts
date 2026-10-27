@@ -491,7 +491,30 @@ describe('用量徽标：签到（本渠道 + 全部渠道）', () => {
 
   it('签到成功后强制重读（否则要等下一轮轮询才看到新数字）', () => {
     expect(badge).toMatch(/await claimCredits\(provider\)[\s\S]{0,500}?read\.current\(\)/)
-    expect(badge).toMatch(/setClaiming\(null\);\s*\n\s*read\.current\(\);/)
+    /**
+     * ⚠️ 判据从「`setClaiming(null)` **紧跟** `read.current()`」改成**行为不变的弱形式**
+     * （2026-10-27）：签到路径加了 `claimInFlightRef` 同步闸门后，释放动作变成
+     * `finally { claimInFlightRef.current = false; setClaiming(null) }`，而
+     * `read.current()` 移到了 finally **之后** —— 相邻关系不再成立，但「签到后必重读」
+     * 这条**语义没变**。
+     *
+     * ⇒ 真正要守的是「重读发生在签到**之后**」，而不是两条语句物理相邻
+     * （后者属于实现细节，且本次已因正当理由改变）。用 `onClaim` 函数体范围来判，
+     * 避免跨函数误匹配。
+     */
+    const onClaimBody = badge.slice(
+      badge.indexOf('const onClaim = async'),
+      badge.indexOf('const onClaimAll = async'),
+    )
+    expect(onClaimBody.length, '未定位到 onClaim 函数体').toBeGreaterThan(100)
+    expect(
+      onClaimBody,
+      'onClaim 里必须调用 read.current() —— 否则签到后要等下一轮轮询才看到新余额',
+    ).toMatch(/read\.current\(\)/)
+    // 且必须在 `await claimCredits` **之后**（签到前重读没有意义）
+    expect(onClaimBody.indexOf('read.current()')).toBeGreaterThan(
+      onClaimBody.indexOf('await claimCredits'),
+    )
   })
 
   it('签到结果按四态汇总成一句话 + 色调（「今天已领」不算失败）', () => {
@@ -1293,5 +1316,120 @@ describe('徽标 tooltip 标题：短语不得再拼后缀（!135 回归的守�
     // 反：不得出现「拼了后缀」的形态
     expect(badge, '不得对 countdown 再拼「后」（混合批次时它是完整短语）')
       .not.toContain('${part.countdown}后')
+  })
+})
+
+/**
+ * ★★★ **签到必须有同步重入闸门**（2026-10-27 审计，与 `jet-hub.js` 的
+ * `claimInFlightRef` 同款）。
+ *
+ * ## 缺陷
+ *
+ * 本组件此前只用 `claiming` 这个**异步 state** 禁用按钮，而 state 更新要等下一帧
+ * ⇒ **同一 tick 内连点两次会穿透**，起两轮 `credits.claimAll`。
+ *
+ * ## 为什么在这条渠道上后果重
+ *
+ * AutoClaw 的签到腿会**先刷新 token 制造一次「登录事件」**（活动奖励依赖它）。
+ * 两轮并发 ⇒ 两次刷新；而刷新会**轮换 `refresh_token`**，两次写回的先后由网络
+ * 抖动决定 ⇒ 晚到的旧值把已作废的 token 覆盖回盘上 ⇒ 账号续期能力失效。
+ * （服务端那条腿已加单飞，客户端这层是第二道，挡的是白打两轮上游请求。）
+ *
+ * ## 判据为什么是这几条
+ *
+ * - **必须是 `useRef`**：`useState` 的 `disabled` 只挡下一帧之后的点击；
+ * - **闸门判断必须在第一个 `await` 之前**（否则两轮都已越过检查点，闸门无效）；
+ * - **拦住时不得静默 return**（本仓库记过「点了没反应」这条教训，IKJLK3 B）；
+ * - **两个入口共用同一个 ref**（`onClaim` 与 `onClaimAll` 各用一个的话，
+ *   交替点击仍能穿透）；
+ * - **释放必须在 `finally` 里**（否则一次未捕获异常就让签到永久卡死）。
+ */
+describe('用量徽标：签到同步重入闸门', () => {
+  const source = readFileSync(
+    resolve(dirname(fileURLToPath(import.meta.url)), '../../plugin-src/client/usage-badge.js'),
+    'utf8',
+  ).replace(/\r\n/g, '\n')
+
+  /**
+   * ⚠️⚠️ **必须剥掉块注释再取函数体**（2026-10-27 实测的假绿根因）：
+   * `onClaim` 上方有一段说明闸门的长注释，**注释里就写着「必须在第一个 `await`
+   * 之前」** ⇒ `body.indexOf('await ')` 命中的是注释文字，于是下面
+   * `guardBlock = slice(guardAt, firstAwait)` 变成一个**空/错位**切片，
+   * 「拦住时不得静默」那条断言拿到空串 ⇒ **`toMatch` 直接假绿**。
+   * 实测：把拦住分支改成 `{ return; }`（真缺陷），4 条断言**全绿**。
+   */
+  const stripBlockComments = (text: string): string => text.replace(/\/\*[\s\S]*?\*\//g, '')
+  const onClaimBody = stripBlockComments(source.slice(
+    source.indexOf('const onClaim = async'),
+    source.indexOf('const onClaimAll = async'),
+  ))
+  // ⚠️ 窗口按**下一个函数**的起点截，不要写死字符数（4000 不够 —— finally 在更后面，
+  //    第一版就这么假红了一次）。
+  const claimAllAt = source.indexOf('const onClaimAll = async')
+  const afterClaimAll = source.indexOf('\n  const tone =', claimAllAt)
+  const onClaimAllBody = source.slice(claimAllAt, afterClaimAll > claimAllAt ? afterClaimAll : claimAllAt + 6000)
+
+  it('★★ 闸门是 useRef（不是 state）', () => {
+    expect(source, '必须有 claimInFlightRef')
+      .toMatch(/const claimInFlightRef = React\.useRef\(false\)/)
+  })
+
+  it('★★ onClaim：闸门判断在第一个 await 之前，且拦住时不静默', () => {
+    const guardAt = onClaimBody.indexOf('claimInFlightRef.current')
+    const firstAwait = onClaimBody.indexOf('await ')
+    expect(guardAt, 'onClaim 里找不到闸门判断').toBeGreaterThan(-1)
+    expect(firstAwait, 'onClaim 里找不到 await').toBeGreaterThan(-1)
+    expect(guardAt, '闸门判断必须在第一个 await 之前，否则两轮都已越过检查点').toBeLessThan(firstAwait)
+    // 拦住时必须给用户一句话（静默 return 会让人分不清「没反应」与「正在跑」）
+    const guardBlock = onClaimBody.slice(guardAt, firstAwait)
+    /**
+     * ⚠️⚠️ 判据必须是「**带文案**的 setClaimNotice」，不能只匹配 `setClaimNotice(` ——
+     * 拦住分支**之后**紧跟一行 `setClaimNotice(null)`（进入正常流程前清空旧提示），
+     * 它落在同一个切片里 ⇒ 只匹配函数名**恒真**。
+     * 实测：把拦住分支改成 `{ return; }`（真缺陷），这条断言仍绿 —— 就是栽在这。
+     */
+    expect(
+      guardBlock,
+      '拦住后必须给用户一句话（不得静默 return —— 用户分不清「没反应」与「正在跑」）',
+    ).toMatch(/setClaimNotice\(\s*\{/)
+  })
+
+  it('★★ onClaimAll 与 onClaim **共用同一个** ref（否则交替点击仍可穿透）', () => {
+    expect(onClaimAllBody, 'onClaimAll 没接闸门').toMatch(/claimInFlightRef\.current/)
+    expect(onClaimAllBody, 'onClaimAll 拦住后必须 setClaimNotice').toMatch(/setClaimNotice\(/)
+  })
+
+  /**
+   * 取某个 `finally {` **块内部**的内容（按花括号配对，不是按字符距离）。
+   *
+   * ⚠️ 判据必须是「在 finally 块**内部**」，不能用 `finally\s*\{[\s\S]{0,200}?…`
+   * 这种**距离**判据 —— 把释放语句挪到 `}` 之后的下一行，它离 `finally {` 仍然
+   * 只有几十个字符 ⇒ 距离判据**照样命中**（2026-10-27 实测：该变异下断言仍绿）。
+   */
+  const finallyBlockBody = (text: string): string | null => {
+    const at = text.lastIndexOf('} finally {') >= 0 ? text.lastIndexOf('} finally {') : text.indexOf('finally {')
+    if (at < 0) return null
+    const open = text.indexOf('{', at)
+    let depth = 0
+    for (let i = open; i < text.length; i += 1) {
+      if (text[i] === '{') depth += 1
+      else if (text[i] === '}') {
+        depth -= 1
+        if (depth === 0) return text.slice(open + 1, i)
+      }
+    }
+    return null
+  }
+
+  it('★★ 释放必须在 finally **块内部**（否则一次异常就让签到永久卡死）', () => {
+    for (const [name, body] of [['onClaim', onClaimBody], ['onClaimAll', onClaimAllBody]] as const) {
+      const inner = finallyBlockBody(body)
+      expect(inner, `${name} 里找不到 finally 块`).not.toBeNull()
+      expect(
+        inner,
+        `${name} 的闸门释放必须在 finally **块内** —— 挪到块之后时，一次未捕获异常`
+        + '就会让闸门永久占住（此后点签到只看到「上一次仍在进行中」）',
+      ).toMatch(/claimInFlightRef\.current = false/)
+    }
   })
 })
