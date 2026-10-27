@@ -112,6 +112,54 @@ describe('面板入口客户端状态', () => {
     expect(store.panelEntryReadFailed()).toBe(false)
   })
 
+  /**
+   * ⚠️⚠️ **冷启动握手期的首读超时必须能被重试救回来**（2026-10-27 真机报障）。
+   *
+   * 真实形态：本插件是 web profile 里 60+ 个客户端插件之一，`apply()` 早于
+   * `connection` 握手完成，而 `connection.rpc.call()` 在 socket 就绪前**不本地
+   * 失败**、只是一直不 settle ⇒ 5s 超时信号到点。旧实现一次失败就把偏好永久
+   * 降级成「仅侧栏」，并在控制台留一条 `TimeoutError: signal timed out`。
+   *
+   * 判据必须打在**行为**上：第一轮抛错、第二轮答上 → 值落地、失败标记不挂、
+   * **且一次 warn 都不打**（那条噪音正是用户报障）。
+   */
+  it('⚠️⚠️ 首读超时会被重试救回来：第二轮答上就不打 warn、不挂失败标记', async () => {
+    const store = await freshModule()
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    let sent = 0
+    const rpc = async () => {
+      sent += 1
+      if (sent === 1) {
+        const timeout = new Error('signal timed out')
+        timeout.name = 'TimeoutError'
+        throw timeout
+      }
+      return { entry: 'settings' }
+    }
+
+    expect(await store.loadPanelEntry(rpc)).toBe('settings')
+    expect(sent, '第一轮失败后必须真的再发一轮').toBe(2)
+    expect(store.panelEntry()).toBe('settings')
+    expect(store.panelEntryReadFailed()).toBe(false)
+    expect(warn, '一轮瞬时超时不该在控制台留噪音').not.toHaveBeenCalled()
+  })
+
+  it('⚠️⚠️ 全部轮次都失败时才报一次 warn，并留下失败标记', async () => {
+    const store = await freshModule()
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    let sent = 0
+    const rpc = async () => {
+      sent += 1
+      throw new Error('宿主没响应')
+    }
+
+    expect(await store.loadPanelEntry(rpc)).toBe('sidebar')
+    expect(sent, '应当把每一轮重试都发出去').toBe(3)
+    expect(warn, `warn 只该在全部轮次失败后打一次，实际 ${warn.mock.calls.length} 次`).toHaveBeenCalledTimes(1)
+    expect(store.panelEntryReadFailed(), '全部失败后必须留下失败标记').toBe(true)
+    expect(store.panelEntryShowsSidebar(), '失败兜底方向不能反').toBe(true)
+  })
+
   it('写入时把 { entry } 发给宿主，并以宿主返回值更新状态', async () => {
     const store = await freshModule()
     const { rpc, calls } = makeRpc({ set: async () => ({ entry: 'settings' }) })
@@ -175,13 +223,16 @@ describe('面板入口客户端状态', () => {
     }
 
     // 第一次：失败并留下失败标记。
+    // ⚠️ 现在一次 `loadPanelEntry` 会**有界重试**（连接握手期的一次超时不该
+    //    永久降级偏好，见 panel-entry-store.js 的 PANEL_ENTRY_READ_ATTEMPTS），
+    //    所以这里按「全部轮次都真的发出去了」计数。
     expect(await store.loadPanelEntry(throwing)).toBe('sidebar')
     expect(store.panelEntryReadFailed()).toBe(true)
-    expect(sent).toBe(1)
+    expect(sent, '每次 loadPanelEntry 应当把每一轮重试都真的发出去').toBe(3)
 
     // 第二次：必须**真的再发一次请求**，而不是复用那个已 settle 的旧 Promise。
     expect(await store.loadPanelEntry(throwing)).toBe('sidebar')
-    expect(sent, 'inflight 泄漏了：第二次读取没有真正发出请求').toBe(2)
+    expect(sent, 'inflight 泄漏了：第二次读取没有真正发出请求').toBe(6)
   })
 
   it('⚠️ 一次失败的读取之后，后续成功读取能恢复（inflight 已正确清空）', async () => {
