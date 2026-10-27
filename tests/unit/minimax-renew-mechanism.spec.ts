@@ -28,8 +28,8 @@
  *   显式指向临时目录；不传时探测「绝不写盘」）、不读真实凭据。
  */
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
-import { tmpdir } from 'node:os'
+import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { homedir, tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { Context } from '@deepseek-ai/cordis'
 import { MinimaxAuth, parseMinimaxCredential, renewJitterMs } from '../../src/minimax-auth.js'
@@ -1178,5 +1178,67 @@ describe('★★ repairAccountNicknames 的 CAS：重读失败时**绝不写盘*
     expect(final.refresh_token, '★ 他处轮换的新 RT 必须保住').toBe('RT-NEW-BY-OTHER')
     expect(final.nickname, '身份字段要补在最新那份上').toBe('NEW_N')
     expect(final.user_id).toBe('u9')
+  })
+})
+
+// ─────────────────────────────────────────────────────────────
+// ⑫ 测试环境不得写进真实用户目录（实测污染后补的防线）
+// ─────────────────────────────────────────────────────────────
+
+describe('★★ 测试环境拒写真实用户目录（本轮实测污染后补）', () => {
+  it('★★ `NODE_ENV=test` 且 home 指向 `~/.dsh` ⇒ 一个字节都不写', async () => {
+    /**
+     * ## 事故
+     *
+     * 本轮审计期间 `~/.dsh/jet-hub/refresh-journal.jsonl` **真的出现了** ——
+     * 内容是用户**真实账号**（`minimaxintl-6d76168a`）的一条 `result:'error'`
+     * 记录，`latencyMs: 2001`（说明**真的向上游发了续期请求**）。
+     * 成因是某个非 `setupFiles` 路径（e2e / 临时探针）没隔离
+     * `DSH_JET_HUB_STATE_DIR`，而 `journalHome` 由 `index.ts` 无条件注入。
+     *
+     * ⚠️ 这类污染的后果不是报错，而是「在用户真实数据目录留下测试痕迹」；
+     * 若那个账号的 `refresh_token` 是一次性的，**测试会真的把它烧掉**。
+     */
+    const original = process.env.NODE_ENV
+    process.env.NODE_ENV = 'test'
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    try {
+      const realHome = join(homedir(), '.dsh')
+      const probe = join(realHome, 'jet-hub', 'refresh-journal.jsonl')
+      const before = existsSync(probe) ? statSync(probe).mtimeMs : 0
+      appendMinimaxJournal(realHome, {
+        ts: Date.now(), provider: 'minimax', accountId: 'should-not-write',
+        kind: 'grant', trigger: 'patrol', result: 'ok',
+      })
+      // fire-and-forget ⇒ 给一拍
+      await new Promise((resolve) => { setTimeout(resolve, 60) })
+      const after = existsSync(probe) ? statSync(probe).mtimeMs : 0
+      expect(
+        after,
+        '★★ 测试环境下写进了真实用户目录 ⇒ 审计探针会污染用户数据（且可能烧掉一次性 RT）',
+      ).toBe(before)
+      expect(warn.mock.calls.some((c) => String(c[0]).includes('拒写真实用户目录'))).toBe(true)
+    } finally {
+      process.env.NODE_ENV = original
+      warn.mockRestore()
+    }
+  })
+
+  it('★ 对照：临时目录照常写（防线不得把正常观测也挡掉）', async () => {
+    const original = process.env.NODE_ENV
+    process.env.NODE_ENV = 'test'
+    const home = tempDir('mm-journal-tmp-')
+    try {
+      appendMinimaxJournal(home, {
+        ts: Date.now(), provider: 'minimax', accountId: 'tmp-ok',
+        kind: 'grant', trigger: 'patrol', result: 'ok',
+      })
+      const file = join(home, 'jet-hub', 'refresh-journal.jsonl')
+      await vi.waitFor(() => {
+        expect(() => readFileSync(file, 'utf8'), '临时目录也必须能写').not.toThrow()
+      })
+    } finally {
+      process.env.NODE_ENV = original
+    }
   })
 })

@@ -23,7 +23,8 @@
  */
 
 import { appendFile, mkdir, rename, stat } from 'node:fs/promises'
-import { join } from 'node:path'
+import { homedir } from 'node:os'
+import { join, resolve, sep } from 'node:path'
 
 /** 日志条目类型。 */
 export type MinimaxJournalKind = 'grant' | 'superseded'
@@ -62,12 +63,66 @@ export interface MinimaxJournalEntry {
 /** 单文件上限；超过即轮转（`.jsonl` → `.jsonl.old`，覆盖旧 `.old`）。 */
 const MAX_JOURNAL_BYTES = 5 * 1024 * 1024
 
+/**
+ * 测试环境下**拒绝**写进真实用户目录（2026-10-27 实测污染后补的防线）。
+ *
+ * ## 事故
+ *
+ * 本轮审计期间，`~/.dsh/jet-hub/refresh-journal.jsonl` **真的出现了** ——
+ * 内容是用户**真实账号**（`minimaxintl-6d76168a`）的一条 `result:'error'`
+ * 记录，`latencyMs: 2001`（说明**真的向上游发了续期请求**）。
+ *
+ * 成因是审计探针/某个非 `setupFiles` 路径（如 e2e 或临时脚本）**没有隔离**
+ * `DSH_JET_HUB_STATE_DIR`，而 `journalHome` 由 `index.ts` 无条件注入
+ * ⇒ 一路落到第 ⑤ 条兜底：`homedir()/.dsh`。
+ *
+ * ## 为什么要在**运行时**再加一道，而不是只靠测试配置
+ *
+ * `tests/setup-isolation.ts` 只对走 `vitest.config.ts` 的**单测**生效；
+ * e2e 配置、临时探针脚本、`node -e` 都绕得过。而这类污染的**后果不是报错**
+ * 而是「在用户的真实数据目录里留下测试痕迹」—— 且若那个账号的
+ * `refresh_token` 是一次性的，**测试会真的把它烧掉**（本仓库
+ * `officeace` 就发生过真实事故：`STS5.1806 has been used`）。
+ *
+ * ⇒ 判据：`NODE_ENV === 'test'` **且** `home` 解析后落在
+ *   `homedir()/.dsh` 之下 ⇒ **拒写**（只 warn 一次）。临时目录不受影响，
+ *   生产（`NODE_ENV` 不是 test）也完全不受影响。
+ */
+let warnedRealHomeWrite = false
+function isRealUserHomeWrite(home: string): boolean {
+  if (process.env.NODE_ENV !== 'test') return false
+  try {
+    const real = join(homedir(), '.dsh')
+    const normalizedHome = resolve(home)
+    const normalizedReal = resolve(real)
+    return normalizedHome === normalizedReal
+      || normalizedHome.startsWith(`${normalizedReal}${sep}`)
+  } catch {
+    // 解析失败 ⇒ 不阻断（宁可漏拦，也不让观测设施把主路径搞坏）
+    return false
+  }
+}
+
 /** 追加一条日志。`home` 缺省（单测）时**什么都不做**。 */
 export function appendMinimaxJournal(
   home: string | undefined,
   entry: MinimaxJournalEntry,
 ): void {
   if (home === undefined || home === '') return
+  /**
+   * ⚠️ 测试环境下拒写真实用户目录（见 {@link isRealUserHomeWrite} 的事故记录）。
+   * 只 warn 一次，避免把测试输出刷满。
+   */
+  if (isRealUserHomeWrite(home)) {
+    if (!warnedRealHomeWrite) {
+      warnedRealHomeWrite = true
+      console.warn(
+        '[minimax] 测试环境下拒写真实用户目录的 refresh-journal'
+        + `（${home}）—— 请检查测试是否隔离了 DSH_JET_HUB_STATE_DIR`,
+      )
+    }
+    return
+  }
   void (async () => {
     try {
       const dir = join(home, 'jet-hub')
