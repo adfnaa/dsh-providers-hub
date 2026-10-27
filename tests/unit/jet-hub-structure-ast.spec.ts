@@ -178,14 +178,46 @@ describe('★★ 账号管理页结构（AST 级，防括号错位）', () => {
 
     const expected = ['probeNotice', 'lockNotice', 'claimNotice', 'onboardingNotice', 'loginUrlForManual', 'compensationCard']
     for (const name of expected) {
+      /**
+       * ⚠️⚠️ 判据必须是**精确标识符 + 词边界**，不能 `startsWith`（2026-10-27 对抗审计 P1-3）。
+       *
+       * 原写法 `t.startsWith(name)` 有一个真实旁路：插入
+       * `const probeNoticeLegacy = null;` 并把子项换成 `probeNoticeLegacy ? …`
+       * ⇒ `'probeNoticeLegacy ? …'.startsWith('probeNotice') === true`，节点数与
+       * 类名文本全部照旧 ⇒ **8 条用例全绿，而该提示从此永不显示**（实测复现）。
+       * 反向钉子 `^null\s*\?` 也挡不住它（首字符是 `p` 不是 `n`）。
+       */
+      const matched = before.some((t) => t === name || new RegExp(`^${name}\\s*\\?`).test(t.trim()))
       expect(
-        before.some((t) => t.startsWith(name) || t === name),
-        `按钮组之前的提示里找不到以 ${name} 开头的条件 —— 该提示要么被删了，要么条件被短路成恒 null`
+        matched,
+        `按钮组之前的提示里找不到条件为「${name} ?」的那一条 —— 该提示要么被删了，`
+        + '要么条件被换成了前缀相同的另一个标识符（如 '
+        + `${name}Legacy ?）`
         + `（实际：${before.map((t) => t.slice(0, 24).replace(/\s+/g, ' ')).join(' | ')}）`,
       ).toBe(true)
     }
     // 反向钉子：不许出现 `null ?` 这种恒假短路（M3 的形态）
     expect(before.join('\n'), '提示条件被短路成恒 null ⇒ 提示永不显示').not.toMatch(/^null\s*\?/m)
+    /**
+     * ⚠️ 反向钉子之二（2026-10-27 对抗审计 P2）：「名字还在」不等于「真的会渲染」。
+     * `const compensationCard = false && …` 这类**常量假条件**会让标识符仍在、
+     * 子项数不变、上一条计数照样过 —— 而卡片永不显示。
+     * ⇒ 对**裸标识符**形态的提示，追到它的声明，断言初始化式不是字面假值。
+     */
+    for (const name of expected) {
+      const decl = new RegExp(`const\\s+${name}\\s*=\\s*([^;\\n]{0,60})`).exec(source)
+      if (decl === null) continue
+      const init = decl[1]!.trim()
+      expect(
+        /^(?:false|null|undefined|0)\b/.test(init),
+        `${name} 的初始化式是常量假值（${init.slice(0, 24)}）⇒ 该提示永不渲染，`
+        + '而节点计数与条件名断言都会照样通过',
+      ).toBe(false)
+      expect(
+        /^(?:false|null)\s*&&/.test(init),
+        `${name} 被短路成「假值 && …」⇒ 该提示永不渲染`,
+      ).toBe(false)
+    }
   })
 
   it('★★ 面板级提示必须在 panelHead 里独占整行（否则会与按钮组挤同一行）', () => {

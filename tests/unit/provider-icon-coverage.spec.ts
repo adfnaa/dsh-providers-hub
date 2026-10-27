@@ -208,3 +208,55 @@ describe('供应商图标 · 行内尺寸', () => {
       .toContain('.dim-jh-aggCandidate > .dim-jh-providerIcon { flex: none; width: 18px; height: 18px;')
   })
 })
+
+/**
+ * ★★ **图标数据通路**必须真的接上（2026-10-27 对抗审计 P1-2）。
+ *
+ * ## 缺陷
+ *
+ * 本文件原先只断言「调用点把 `provider` 传进去了」，**没有任何一条**断言
+ * 「`provider` 传进去之后真的能取到图标」。实测两个变异都逃得过（37/37 全绿）：
+ *
+ * 1. 把生产代码的 `icon: PROVIDER_ICONS[d.id]` 改成 `icon: undefined`
+ *    ⇒ **全站 5 处图标同时变成 `<img src={undefined}>`**，而本 spec 与
+ *    `provider-registry.spec.ts` **一条都不红**；
+ * 2. 从 `PROVIDER_ICONS` 删掉一个 provider ⇒ 变红，但红在**旧的**
+ *    `provider-registry.spec.ts`（键集合相等），本 spec 仍 17 passed。
+ *
+ * ⇒ 「新增 provider 忘配图标」由 `provider-registry.spec.ts` 守；
+ *   **「取图标的这一行断了」此前无人守** —— 那正是本组补的。
+ *
+ * ⚠️ 本文件的头部注释写着「组件无法在本仓库单测里渲染（react 不在依赖内），
+ * 故只能做源码文本断言」——**这个前提已被本仓库自己证伪**
+ * （`tests/unit/jet-hub-panel-wiring.spec.ts` 用 `vi.mock('react', …)` +
+ * 真实 `await import(...)` 跑过运行时渲染；同款见 `jet-hub-tdz.spec.ts`）。
+ * 保留文本断言的真正理由是「成本」而不是「做不到」，别拿错误前提正当化它。
+ */
+describe('供应商图标 · 数据通路（不只接线）', () => {
+  it('★★ PROVIDERS 的 icon 必须来自 PROVIDER_ICONS（写成 undefined 会全站静默无图标）', () => {
+    const code = hubCode()
+    // 逐字定位那一行映射，避免「文本里出现过 PROVIDER_ICONS」这种恒真判据
+    const line = code.match(/icon:\s*([^,\n]+)/)
+    expect(line, 'PROVIDERS 里找不到 icon 字段').toBeTruthy()
+    expect(
+      line![1]!.trim(),
+      'PROVIDERS 的 icon 不再从 PROVIDER_ICONS 取 ⇒ 全部 ProviderLogo 会拿到 undefined，'
+      + '渲染成 <img src={undefined}>（静默，无报错）',
+    ).toMatch(/^PROVIDER_ICONS\[/)
+  })
+
+  it('★★ PROVIDER_ICONS 必须覆盖 PROVIDER_REGISTRY 的每一个 id（含新增 provider）', () => {
+    // ⚠️ 注册表在**服务端**（`src/provider-registry.ts`），不是客户端文件 ——
+    //    第一版写成 `plugin-src/client/provider-registry.js` 直接 ENOENT。
+    const registry = source('src/provider-registry.ts')
+    const ids = [...registry.matchAll(/^\s+id:\s*'([^']+)'/gm)].map(m => m[1]!)
+    expect(ids.length, 'PROVIDER_REGISTRY 里没解析出 id ⇒ 本用例会恒真').toBeGreaterThan(10)
+
+    const icons = source('plugin-src/client/provider-icons.js')
+    const missing = ids.filter((id) => !new RegExp(`(?:^|[\\s,{])${id.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s*:`).test(icons))
+    expect(
+      missing,
+      '这些 provider 没有图标条目 ⇒ 它们的列表行会静默缺图标（ProviderLogo 返回 null）',
+    ).toEqual([])
+  })
+})

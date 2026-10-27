@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest'
 import { AUTOCLAW } from '../../src/autoclaw-product.js'
 import {
+  AUTOCLAW_CLAIM_REFRESH_TIMEOUT_MS,
   AUTOCLAW_DAILY_CLAIM_PATH,
   AUTOCLAW_LEDGER_MAX_PAGES,
   AUTOCLAW_LEDGERS_PATH,
@@ -332,10 +333,26 @@ describe('claimAutoclawDailyQuota', () => {
       product: AUTOCLAW,
       fetcher: fetcher as unknown as typeof fetch,
     })
-    const body = JSON.parse((fetcher.mock.calls[0]![1] as RequestInit).body as string)
+    /**
+     * ⚠️⚠️ **必须按 URL 取那一次调用，不能用 `mock.calls[0]`**
+     * （2026-10-27 审计 P2-3，实测的静默漂移）：
+     * 签到腿现在**先发 refresh 再发 claim** ⇒ `calls[0]` 已经是 **refresh** 请求，
+     * 而本用例的受测对象是 claim 请求。原写法之所以没红，只是因为
+     * `deviceId` 两条腿共用同一个局部变量 —— **侥幸**，不是判据正确。
+     */
+    const calls = fetcher.mock.calls as [string, RequestInit][]
+    const claimCall = calls.find((c) => String(c[0]).includes(AUTOCLAW_DAILY_CLAIM_PATH))
+    expect(claimCall, '找不到 claim 请求').toBeDefined()
+    const body = JSON.parse(claimCall![1].body as string)
     expect(body.device_id, '不该是那个固定常量').not.toBe('dsh-autoclaw-device-001')
     // ⚠️ 必须是 UUID 形态（随机造的），不是写死的字符串。
     expect(body.device_id).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i)
+    // 两腿必须用**同一个** device_id（服务端按设备记登录，见 `refresh` 的请求体判据）。
+    const refreshCall = calls.find((c) => String(c[0]).includes('/userapi/v1/refresh'))
+    if (refreshCall !== undefined) {
+      const refreshBody = JSON.parse(refreshCall[1].body as string)
+      expect(refreshBody.device_id, '两条腿用了不同的设备号 ⇒ 登录事件挂在另一个设备上').toBe(body.device_id)
+    }
   })
 
   it('daily_check_in_completed_on_request 为 false 时返回 already-claimed', async () => {
@@ -390,6 +407,13 @@ describe('claimAutoclawDailyQuota', () => {
     const refreshBody = JSON.parse(refreshInit.body as string)
     expect(refreshBody.refresh_token).toBe(MOCK_CREDENTIAL.refresh_token)
     expect(refreshBody.source_id).toBe('autoclaw')
+    /**
+     * ⚠️ 补上**注释已经声称、但此前没有断言**的那一条（2026-10-27 审计 P2-3）：
+     * 注释写着「与同一个 device_id」，而代码只断言了 `refresh_token` 与
+     * `source_id` ⇒ 刷新腿换用别的设备号也照样绿，而服务端**按设备记登录**
+     * ⇒ 登录事件会挂到另一个设备上。
+     */
+    expect(refreshBody.device_id, '刷新腿必须带调用方给的 device_id').toBe(MOCK_CREDENTIAL.device_id)
   })
 
   /**
@@ -1256,5 +1280,301 @@ describe('★★ 登录后自动领取每日积分（对齐桌面端 claimDailyC
     expect(res.ok).toBe(false)
     expect(calls, '登录失败时不该调领取').not.toContain('claim')
     expect(credentials.store.size).toBe(0)
+  })
+})
+
+/**
+ * ⚠️⚠️ **刷新轮换出的 `refresh_token` 必须落盘**（2026-10-27 审计 P0，两路独立命中）。
+ *
+ * ## 缺陷
+ *
+ * `refreshAutoclawToken` 会解析并返回轮换后的 `refresh_token`，而签到腿原先
+ * **只取 `access_token`、把 `refresh_token` 直接丢弃**。若服务端按 OAuth 2.1 RTR
+ * 一次性轮换，丢弃就等于**每天烧掉一次续期能力**：旧 token 立即作废 ⇒ 此后每轮
+ * 刷新的 401 被静默降级 ⇒ 活动奖励永不再发；而自愈读到盘上的死 token 会抛
+ * `RefreshTokenExpiredError` ⇒ 账号被标 `refreshable:false` ⇒ 用户被要求重登，
+ * **而重登拿到的 token 又会在下一次签到时被同样烧掉**。
+ *
+ * ⚠️ 判据不是「谁会轮换」，而是**同仓库两套口径**：`autoclaw-auth.ts` 那条续期腿
+ * **会** `credentials.set` 落盘，而这条新腿不落 —— 同一字段两种约定。
+ *
+ * ⚠️ 轮换本身在本仓库**无任何可复核取证**（`providers-autoclaw.md` 把它登记为
+ * 「未测」），所以本组用例同时锁住**两条分支**：真的轮换 → 必须落盘；
+ * 没有落盘出口 → **必须出声**（不得静默）。
+ */
+describe('AutoClaw 签到：刷新轮换必须落盘（2026-10-27 审计 P0）', () => {
+  /** 造一个「刷新会轮换 refresh_token」的服务端桩。 */
+  function makeRotatingFetcher(rotatedRefresh: string, opts?: { failRefresh?: boolean }) {
+    return vi.fn(async (url: string) => {
+      if (String(url).includes('/userapi/v1/refresh') || String(url).includes('/agent-refresh')) {
+        if (opts?.failRefresh === true) {
+          return jsonResponse({ code: 401, msg: 'refresh token invalid' })
+        }
+        return jsonResponse({
+          code: 0,
+          msg: 'SUCCESS',
+          data: {
+            access_token: 'stub-at-rotated',
+            refresh_token: rotatedRefresh,
+            expires_in: 3600,
+            expires_at: Date.now() + 3_600_000,
+          },
+        })
+      }
+      return jsonResponse({ code: 0, msg: 'SUCCESS', data: { uid: 'u', daily_check_in_completed_on_request: true } })
+    })
+  }
+
+  it('★★ 服务端轮换了 refresh_token ⇒ 必须调用 persist 落盘（不得丢弃）', async () => {
+    const fetcher = makeRotatingFetcher('stub-rt-ROTATED')
+    const persisted: AutoclawCredential[] = []
+    const outcome = await claimAutoclawDailyQuota(MOCK_CREDENTIAL, {
+      product: AUTOCLAW,
+      fetcher: fetcher as unknown as typeof fetch,
+      persist: async (next) => { persisted.push(next) },
+    })
+
+    expect(outcome.kind).toBe('claimed')
+    expect(persisted, '轮换出的 refresh_token 被丢弃了 ⇒ 账号续期能力会被逐日烧掉').toHaveLength(1)
+    expect(persisted[0]!.refresh_token).toBe('stub-rt-ROTATED')
+    // 用新 token 领（登录事件的凭据）
+    const calls = fetcher.mock.calls as [string, RequestInit][]
+    const claimCall = calls.find((c) => String(c[0]).includes(AUTOCLAW_DAILY_CLAIM_PATH))
+    expect((claimCall![1].headers as Record<string, string>).Authorization).toContain('stub-at-rotated')
+  })
+
+  it('★ 服务端返回**同一个** refresh_token ⇒ 不必落盘（不做多余写入）', async () => {
+    const fetcher = makeRotatingFetcher(MOCK_CREDENTIAL.refresh_token)
+    let persistCalls = 0
+    await claimAutoclawDailyQuota(MOCK_CREDENTIAL, {
+      product: AUTOCLAW,
+      fetcher: fetcher as unknown as typeof fetch,
+      persist: async () => { persistCalls += 1 },
+    })
+    expect(persistCalls, '没轮换却写了盘 ⇒ 多余 I/O 且会覆盖并发写者').toBe(0)
+  })
+
+  it('★★ 轮换但**没有落盘出口** ⇒ 必须 warn 出声（绝不静默）', async () => {
+    const fetcher = makeRotatingFetcher('stub-rt-ROTATED')
+    const warns: string[] = []
+    const outcome = await claimAutoclawDailyQuota(MOCK_CREDENTIAL, {
+      product: AUTOCLAW,
+      fetcher: fetcher as unknown as typeof fetch,
+      warn: (m) => { warns.push(m) },
+    })
+    expect(outcome.kind).toBe('claimed')
+    expect(
+      warns.some((w) => w.includes('轮换') || w.includes('落盘')),
+      '轮换被静默丢弃 ⇒ 用户/维护者都无从发现账号正在失去续期能力',
+    ).toBe(true)
+  })
+
+  it('★ 轮换落盘失败 ⇒ 不得打断签到，但必须 warn', async () => {
+    const fetcher = makeRotatingFetcher('stub-rt-ROTATED')
+    const warns: string[] = []
+    const outcome = await claimAutoclawDailyQuota(MOCK_CREDENTIAL, {
+      product: AUTOCLAW,
+      fetcher: fetcher as unknown as typeof fetch,
+      persist: async () => { throw new Error('store boom') },
+      warn: (m) => { warns.push(m) },
+    })
+    expect(outcome.kind, '落盘失败不得把签到变成失败').toBe('claimed')
+    expect(warns.some((w) => w.includes('落盘失败'))).toBe(true)
+  })
+
+  it('★★ 非字符串 refresh_token（备份导入的脏值）⇒ 不得抛异常、不得发刷新请求', async () => {
+    // ⚠️ 这是本 PR 引入的**回归**：修复前这条路径根本不读 refresh_token，
+    //    那种凭据本来能正常签到。原 `cleanToken` 只挡 falsy ⇒
+    //    `42.replace` 抛 `TypeError`，且调用写在 claim 的 try **之外**
+    //    ⇒ 异常逃到 RPC 层，用户看到一句毫无出路的内部错误。
+    for (const dirty of [42, {}, [], true, { token: 'x' }]) {
+      const fetcher = makeRotatingFetcher('stub-rt-ROTATED')
+      const outcome = await claimAutoclawDailyQuota(
+        { ...MOCK_CREDENTIAL, refresh_token: dirty as unknown as string },
+        { product: AUTOCLAW, fetcher: fetcher as unknown as typeof fetch },
+      )
+      expect(outcome.kind, `refresh_token=${JSON.stringify(dirty)} 时签到被连坐`).toBe('claimed')
+      const urls = fetcher.mock.calls.map((c) => String(c[0]))
+      expect(urls.filter((u) => u.includes('/refresh')).length, '脏 refresh_token 不该发出刷新请求').toBe(0)
+      expect(urls.filter((u) => u.includes(AUTOCLAW_DAILY_CLAIM_PATH)).length).toBe(1)
+    }
+  })
+
+  it('★★ 刷新失败必须 warn（原先裸 catch 吞掉 ⇒ outcome 与成功逐字相同）', async () => {
+    const fetcher = makeRotatingFetcher('x', { failRefresh: true })
+    const warns: string[] = []
+    const outcome = await claimAutoclawDailyQuota(MOCK_CREDENTIAL, {
+      product: AUTOCLAW,
+      fetcher: fetcher as unknown as typeof fetch,
+      warn: (m) => { warns.push(m) },
+    })
+    expect(outcome.kind).toBe('claimed')
+    expect(
+      warns.some((w) => w.includes('登录事件刷新失败')),
+      '刷新失败零日志 ⇒ 用户永远不知道活动奖励其实没发（而那正是本次改动的唯一理由）',
+    ).toBe(true)
+  })
+
+  it('★★ 刷新腿必须用**短超时**（原为 2×60s ⇒ 最坏 135s）', async () => {
+    // 判据打在「实际请求的超时预算」上，而不是事后计时（后者要么慢要么脆）。
+    const spy = vi.spyOn(AbortSignal, 'timeout')
+    try {
+      const fetcher = makeRotatingFetcher('stub-rt-ROTATED')
+      await claimAutoclawDailyQuota(MOCK_CREDENTIAL, {
+        product: AUTOCLAW,
+        fetcher: fetcher as unknown as typeof fetch,
+      })
+      const budgets = spy.mock.calls.map((c) => Number(c[0]))
+      expect(budgets, '刷新腿的超时预算').toContain(AUTOCLAW_CLAIM_REFRESH_TIMEOUT_MS)
+      // 且必须显著小于默认的 60s（否则两个端点各 60s ⇒ 光刷新就 120s）
+      expect(AUTOCLAW_CLAIM_REFRESH_TIMEOUT_MS).toBeLessThan(15_000)
+    } finally {
+      spy.mockRestore()
+    }
+  }, 20_000)
+})
+
+/**
+ * ★★ **国际版的刷新腿必须打国际站**（2026-10-27 审计 P2-3）。
+ *
+ * ## 缺口
+ *
+ * 变异「刷新调用丢掉 `product`」⇒ PR 自己的 spec **49/49 全绿**
+ * （审计实测），即**刷新腿的基址零守卫**。而 `autoclaw` 与 `autoclawintl`
+ * 是「同一实现两个实例」，漏传 `product` 会走默认的**国内**基址 ——
+ * 用户的国际账号刷新打到国内站，症状与「余额恒查不到（410000 用户未登录）」
+ * 同形，**静默**。
+ *
+ * ⚠️ 这与 `provider-credits.ts` 里 `fetchBalanceDetailed` 那条腿的既有教训**同源**
+ * （该文件逐字写着「必须显式传 `product: AUTOCLAW_INTL` —— 不传会走默认的国内
+ * 基址……这是『同一实现两个实例』最容易踩的一处」）。余额腿有守卫，刷新腿此前没有。
+ */
+describe('AutoClaw 国际版：刷新腿必须打国际站（国际/国内基址不得混）', () => {
+  it('★★ autoclawintl 的 refresh 与 claim 都必须打到国际站基址', async () => {
+    const { AUTOCLAW_INTL } = await import('../../src/autoclaw-product.js')
+    const urls: string[] = []
+    /**
+     * ⚠️ 必须**桩全局 fetch**：能力表里的 `claim` 只收 `(credential, entry, call)`，
+     * **不接受注入 fetcher** ⇒ 走能力表时它回落到全局 `fetch`。
+     * 这样才能覆盖 `provider-credits.ts` 那条「有没有把 product 传下去」的透传腿
+     * —— 审计的变异正是打在那一行（丢掉 `product` ⇒ PR spec 49/49 全绿）。
+     */
+    const fetcher = vi.fn(async (url: string) => {
+      urls.push(String(url))
+      if (String(url).includes('/refresh')) {
+        return jsonResponse({
+          code: 0,
+          msg: 'SUCCESS',
+          data: {
+            access_token: 'stub-at',
+            refresh_token: 'stub-rt',
+            expires_in: 3600,
+            expires_at: Date.now() + 3_600_000,
+          },
+        })
+      }
+      return jsonResponse({ code: 0, msg: 'SUCCESS', data: { uid: 'u', daily_check_in_completed_on_request: true } })
+    })
+    vi.stubGlobal('fetch', fetcher)
+    try {
+      const credits = createProviderCredits()
+      const impl = credits.autoclawintl as unknown as {
+        claim?: (credential: unknown, entry: unknown, call: unknown) => Promise<{ kind: string }>
+      }
+      expect(typeof impl?.claim, 'autoclawintl 没有 claim 能力').toBe('function')
+
+      const outcome = await impl.claim!(
+        { ...MOCK_CREDENTIAL, device_id: 'dev-intl' },
+        { id: 'a1', credentialRef: 'ref1' },
+        { warn: () => {}, resolveCredential: async () => undefined, accountPool: {} },
+      )
+      expect(outcome.kind).toBe('claimed')
+
+      expect(AUTOCLAW_INTL.apiBase, '前提失效：两站基址相同 ⇒ 本用例恒真').not.toBe(AUTOCLAW.apiBase)
+      const refreshUrl = urls.find((u) => u.includes('/refresh'))
+      expect(refreshUrl, '刷新腿根本没发请求').toBeDefined()
+      expect(
+        refreshUrl!.startsWith(AUTOCLAW_INTL.apiBase),
+        `刷新腿打到了 ${refreshUrl} —— 漏传 product 会走国内默认基址，`
+        + '国际账号的「登录事件」就挂到了国内站（静默，症状与「余额查不到 410000」同形）',
+      ).toBe(true)
+      const claimUrl = urls.find((u) => u.includes(AUTOCLAW_DAILY_CLAIM_PATH))
+      expect(claimUrl, '签到腿根本没发请求').toBeDefined()
+      expect(claimUrl!.startsWith(AUTOCLAW_INTL.apiBase)).toBe(true)
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  }, 20_000)
+})
+
+/**
+ * ★★★ **刷新腿必须单飞**（2026-10-27 自查实测，由落盘腿**自己**引入的竞态）。
+ *
+ * ## 缺陷
+ *
+ * 落盘腿让「刷新 → 写回新 `refresh_token`」成为一次**写操作**。而并发时两次刷新
+ * 各自拿到一个新 token，写回的先后顺序**由网络抖动决定**，不由签发顺序决定 ⇒
+ * **晚到的旧响应会把已作废的旧 token 覆盖回盘上**。
+ *
+ * 实测（宽限期服务端 + 只给第一次响应加 50ms 延迟）：
+ * ```
+ * 落盘序列 = ["RT-2","RT-1"] | 服务端最新有效 = RT-2
+ * 最后落盘 = RT-1 | 它还有效吗 = false   ← 盘上留下作废 token
+ * ```
+ *
+ * ⇒ 与 P0 同源同量级（下一次续期读到死 token ⇒ `RefreshTokenExpiredError` ⇒
+ * 账号被标 `refreshable:false`）。本仓库**早就为同一形态**给自愈腿建了
+ * `balanceHealInFlight` 去重表，并逐字写下「并发会让后写的把先写的新 token
+ * 覆盖成已失效的旧 token」—— 这条新腿此前不在任何闸门之内。
+ */
+describe('AutoClaw 签到：刷新腿必须单飞（并发不得把旧 token 写回）', () => {
+  it('★★ 两个并发 claim ⇒ **恰好一次** refresh、一次落盘，且落盘值仍然有效', async () => {
+    let issued = 0
+    let latest = 'stub-rt-0'
+    const valid = new Set<string>([latest])
+    const refreshCalls: string[] = []
+    const writes: string[] = []
+
+    const fetcher = vi.fn(async (url: string, init?: RequestInit) => {
+      const u = String(url)
+      if (u.includes('/userapi/v1/refresh')) {
+        const offered = String(JSON.parse(String(init?.body ?? '{}')).refresh_token)
+        refreshCalls.push(offered)
+        if (!valid.has(offered)) return jsonResponse({ code: 401, msg: 'invalid' })
+        issued += 1
+        const mine = issued
+        latest = `stub-rt-${mine}`
+        valid.add(latest) // 宽限期：旧的不立刻作废，但只有最新的是"真正的"当前值
+        // ⚠️ 第一次签发的响应故意慢：制造「先签发的后到」这一真实交错。
+        if (mine === 1) await new Promise((r) => setTimeout(r, 50))
+        return jsonResponse({
+          code: 0, msg: 'SUCCESS',
+          data: {
+            access_token: `stub-at-${mine}`, refresh_token: latest,
+            expires_in: 3600, expires_at: Date.now() + 3_600_000,
+          },
+        })
+      }
+      return jsonResponse({ code: 0, msg: 'SUCCESS', data: { uid: 'u', daily_check_in_completed_on_request: true } })
+    })
+
+    const cred = { ...MOCK_CREDENTIAL, refresh_token: 'stub-rt-0' }
+    const run = () => claimAutoclawDailyQuota(cred, {
+      product: AUTOCLAW,
+      fetcher: fetcher as unknown as typeof fetch,
+      persist: async (next) => { writes.push(next.refresh_token as string) },
+      warn: () => {},
+    })
+    const [a, b] = await Promise.all([run(), run()])
+
+    expect(a.kind).toBe('claimed')
+    expect(b.kind).toBe('claimed')
+    expect(refreshCalls, '并发发了多次 refresh ⇒ 会出现「后写的覆盖先写的」').toHaveLength(1)
+    expect(writes, '并发写了多次 ⇒ 落盘顺序由网络抖动决定，可能存回已作废的旧值').toHaveLength(1)
+    expect(
+      writes.at(-1),
+      `落盘的是 ${String(writes.at(-1))}，而服务端唯一有效的是 ${latest}`
+      + ' ⇒ 下次续期会拿到 RefreshTokenExpiredError（账号级失效）',
+    ).toBe(latest)
   })
 })

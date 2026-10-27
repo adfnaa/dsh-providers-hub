@@ -2344,6 +2344,20 @@ function registerJetHubEndpoints(
     resolveCredential: (refName) => ctx.credentials.resolve(credentialRef(refName)),
     warn: (message) => ctx.logger?.warn?.(message),
     accountPool: pool,
+    /**
+     * 刷新**轮换**出的凭据写回（2026-10-27 Gitee PR #153 审计 P0）。
+     *
+     * ⚠️ 与 `resolveCredential` **同一个 ref 约定**（都经 `credentialRef(...)` 归一）
+     * —— 实现侧传的是 `entry.credentialRef`，正是 `collectClaimResults` 里
+     * `deps.resolve(credentialRef(entry.credentialRef))` 用的那一个，
+     * 两条腿必须看到**同一份**凭据。
+     *
+     * ⚠️ 与既有续期腿 `autoclaw-auth.ts` 的 `credentials.set(ref, …)` **同源**
+     * —— 那是本仓库唯一被验证过的凭据回写路径，不要再写第二套。
+     */
+    persistCredential: async (refName, value) => {
+      await ctx.credentials.set(credentialRef(refName), value)
+    },
   }
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const connection = (ctx as any).connection ?? ctx.get('connection')

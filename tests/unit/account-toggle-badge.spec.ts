@@ -63,6 +63,38 @@ describe('账号状态徽章兼作启停开关', () => {
     expect(badge, '徽章必须能点').toContain('onClick:')
     expect(badge, '必须调用既有的 onToggle(account.id, !account.enabled)')
       .toMatch(/onToggle\(account\.id, !account\.enabled\)/)
+
+    /**
+     * ⚠️⚠️ **`onClick` 的值不得是死分支**（2026-10-27 对抗审计 P1-1，实测有牙缺口）。
+     *
+     * 原判据只有 `toContain('onClick:')` + 正则匹配 `onToggle(...)` —— 两者都能被
+     * **同一个字面量**满足，即使那个调用被包进恒不执行的分支里：
+     *
+     * ```js
+     * onClick: () => { if (false) { onToggle(account.id, !account.enabled) } }
+     * ```
+     *
+     * 实测：注入上面这行后本文件 **6 passed 全绿**，而账号的鼠标/键盘启停**双双失效**。
+     * 这是本仓库的头号复发形态（`if (false)` 短路禁用），且风险**不对称** ——
+     * 底部「停用/启用」按钮已被本 PR 删除 ⇒ 一旦这段失效，**账号再也停用不了**
+     * （只能删号重建，丢昵称/指纹代次/历史标记），而用户侧**无报错、无白屏**。
+     *
+     * ⇒ 这里补三条「死分支」判据。它们不是完备的（真正的行为级判据需要多轮渲染
+     * 夹具），但能挡住**恒假条件**这一类，成本极低。
+     */
+    const handler = badge.slice(badge.indexOf('onClick:'))
+    expect(
+      handler,
+      'onClick 里出现恒假条件（if (false) / if (0) …）⇒ 徽章点了没反应，账号无法启停',
+    ).not.toMatch(/\bif\s*\(\s*(?:false|0|null|undefined|!\s*1|!\s*true)\s*\)/)
+    expect(
+      handler,
+      'onClick 被 `假值 && …` 短路 ⇒ 徽章点了没反应',
+    ).not.toMatch(/(?:^|[\s(])(?:false|null|undefined|0)\s*&&/)
+    expect(
+      handler,
+      'onClick 被 `假值 ? … : …` 短路 ⇒ 徽章点了没反应',
+    ).not.toMatch(/(?:^|[\s(])(?:false|null|undefined|0)\s*\?/)
   })
 
   it('徽章是键盘可达的（role + tabIndex + Enter/空格 + 拦下空格滚动）', () => {

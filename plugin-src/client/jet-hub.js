@@ -1168,8 +1168,14 @@ function AccountCard({ account, index, order, provider, onToggle, onDelete, onRe
  * ⇒ 记录永不自动清除）。按钮虽然 `type="button"`，它仍嵌在 `<label>` 内，
  * 点击会冒泡到 label 并**顺带切换可见性开关** —— 必须拦下。
  *
- * @param {{ model: {id: string, name?: string, disabled?: boolean, dead?: boolean},
+ * @param {{ provider: string,
+ *           model: {id: string, name?: string, disabled?: boolean, dead?: boolean},
  *           busy: boolean, onToggle: Function, onRestore: Function }} props
+ *
+ * ⚠️ `provider` 是 2026-10-26 新增的入参（`ProviderLogo` 接线要用它取图标），
+ *    但当时**漏更新上面这行 JSDoc** —— `tsconfig.client-check.json` 因此多出
+ *    恰好 1 个 `TS2339: Property 'provider' does not exist on type ...`
+ *    （77 → 78 个错误，实测用前后错误集差集确认）。已补。
  */
 function ModelToggle({ provider, model, busy, onToggle, onRestore }) {
   const dead = model.dead === true;
