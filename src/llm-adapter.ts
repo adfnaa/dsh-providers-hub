@@ -305,13 +305,38 @@ const CODEARTS_QUOTA_EXHAUSTED_CODE = 'QUOTA_EXCEEDED'
 //   - deepseek-v4-flash / deepseek-v4-pro（无后缀）  → 非 benefit（带该头会
 //     `unsupported model`）
 // gateway/config 返回的是 benefit 那组，故下方静态表保留无后缀形态
-// （无后缀始终可用，不依赖 benefit 头），而 deepseek-v4.1-flash 只有 benefit 形态。
+// （无后缀始终可用，不依赖 benefit 头）。
+//
+// ## ⚠️⚠️ 2026-10-27 全表实测校准（逐条真机请求，两个账号交叉验证）
+//
+// 旧表 9 条里 **3 条已彻底失效**、4 条上游新模型完全缺席。实测结果：
+//
+// | 条目 | 不带头实测 | 处置 |
+// |---|---|---|
+// | `GLM-5.2` | 200 | 保留 |
+// | `GLM-5.1` | **200（仍可用！）** | 保留 —— 不在 builtin 目录里**不等于**不可用 |
+// | `GLM-5` | **404 InferHub.002002009** | **删除** |
+// | `glm-5.3-flash` | **404 InferHub.002002009** | **删除** |
+// | `openpangu-2.0-flash` / `-pro` | 200 | 保留 |
+// | `deepseek-v4-flash` | **200（仍可用！）** | 保留 |
+// | `deepseek-v4-pro` | **404 ModelArts.81009 Invalid model** | **删除** |
+// | `deepseek-v4.1-flash` | 200 | 保留 |
+// | `glm-5.3` / `glm-5.2-sft-harmony` | 200 | **新增**（上游有、旧表漏） |
+// | `deepseek-v4.1-flash-1017` | 200 | **新增**（issue IKQY27 的新模型） |
+// | `kimi-k3` | 200 | **新增** |
+//
+// ⚠️ **判据是「真机能不能调通」，不是「在不在 builtin 目录里」**：`GLM-5.1`
+// 与 `deepseek-v4-flash` 实测 200，若按目录比对删掉就会让用户少两个可用模型
+// （这正是 `dead-model-store.ts` 头注释里「不从残缺目录反推」那条铁律）。
+//
+// ⚠️ VL 模型（`kimi-k2.6-vl` / `Qwen3-VL-235B`）**刻意不入本表**：它们被
+// `catalogEntries` 的可见性过滤挡在主列表外，只经 `analyzeImage` 间接调用。
 const DEFAULT_MODELS: readonly string[] = [
-  'GLM-5.2', 'GLM-5.1', 'GLM-5',
-  'glm-5.3-flash',
+  'GLM-5.2', 'GLM-5.1',
+  'glm-5.3', 'glm-5.2-sft-harmony',
   'openpangu-2.0-flash', 'openpangu-2.0-pro',
-  'deepseek-v4-flash', 'deepseek-v4-pro',
-  'deepseek-v4.1-flash',
+  'deepseek-v4-flash', 'deepseek-v4.1-flash', 'deepseek-v4.1-flash-1017',
+  'kimi-k3',
 ]
 
 /**
@@ -358,6 +383,13 @@ const CONTEXT_WINDOWS: ReadonlyMap<string, number> = new Map([
   ['deepseek-v4-flash', 1_048_576],
   ['deepseek-v4-pro', 1_048_576],
   ['deepseek-v4.1-flash', 1_048_576],
+  // ⚠️ `-1017` 是上游**独立注册**的模型（`/v1/model/builtin` 与
+  //    `deepseek-v4.1-flash` 同时下发，`src/models.ts` 用**原始 `model_id`**
+  //    当对外 id 与去重键——2026-10-27 修，见 `parseModelInfo`），
+  //    但**窗口与老版一致**（用户 2026-10-27 确认）。
+  //    不补这一行会让它走 524_288 的具名兜底 ⇒ 分母错 2 倍、压缩阈值偏早
+  //    （正是 `CODEARTS_FALLBACK_CONTEXT_WINDOW` 注释里记录的那条报障形态）。
+  ['deepseek-v4.1-flash-1017', 1_048_576],
 ])
 
 /**
@@ -1678,6 +1710,31 @@ export class CodeArtsAdapter extends LlmAdapter {
 
   async listModels(_provider: string): Promise<readonly LlmModelInfo[]> {
     return this.catalog.listModels(_provider)
+  }
+
+  /**
+   * 「这份 `listAllModels()` **确认**来自远端完整读取」——供 `model.list` 的
+   * 「已下架」判据用（见 `ModelCatalogSource.catalogConfirmedRemote` 的注释）。
+   *
+   * ## 判据（两条腿都必须成立，缺一即 `false`）
+   *
+   * 1. `remoteModels !== undefined` —— 至少成功读到过一次远端目录。
+   *    ⚠️ `syncCatalogEntries()` 在未落地时回退**编译期兜底表**，那是远端目录的
+   *    **子集**（Issue IKJW33 的实测形态）⇒ 不能当「在售集合」。
+   * 2. `remoteComplete === true` —— 接线层经 `catalogComplete` 上报「**两个**
+   *    目录端点都取全」。只有一个端点成功时目录同样是子集。
+   *
+   * ## 保守方向
+   *
+   * 冷启动 / 远端降级 / 残缺时返回 `false` ⇒ `model.list` **放弃**判据、照旧补回
+   * 黑名单条目。代价是可能多留一个「点开会 404」的幽灵条目；反向的代价是用户在售
+   * 模型从设置页**彻底消失且无法重新打开**（不可自愈）⇒ 两害相权取其轻。
+   *
+   * ⚠️ 本方法必须能被 `withDeadModelPruning` 的 Proxy **原样透传**（它有接线守卫：
+   * `dead-model-store.spec.ts` 的「catalogConfirmedRemote 经包装后仍可调用」）。
+   */
+  catalogConfirmedRemote(): boolean {
+    return this.remoteModels !== undefined && this.remoteComplete
   }
 
   async resolveModel(provider: string, model: string, signal?: AbortSignal): Promise<LlmResolvedModelInfo> {

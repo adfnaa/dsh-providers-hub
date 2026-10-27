@@ -316,3 +316,81 @@ HTTP 层拒绝，200 **无本机证据**（bili 未装、文档不可得）；�
 ③ 误判面已实测：agent 正常回答若引用这三个 marker（本仓库源码自身含 13 次），
 200 通道版判据**全部 TRUE** ⇒ 把正常回答变成硬失败，还会给出「重新登录无用」的
 **假指路**。收益/风险不对称，按仓库「不据构造的报文改分类」的纪律仅登记。
+
+---
+
+## ⚠️⚠️ 目录 id 语义 / 续期终态类型 / 「已下架」判据（2026-10-28，PR #159 合入 master 后）
+
+三件事都来自 PR #159（`fix/codearts-renew-and-catalog`）与 master 的合并复核
+（合并提交 `82219c5`、缺陷修正在其后）。**动这三处前先读本节。**
+
+### ① 目录 id：对外**一律用原始 `model_id`**，不存在「剥日期后缀」的裁剪刀
+
+- master `3f0f48c` 已修 IKQY27（`deepseek-v4.1-flash-1017` 被静默吞掉）：
+  `parseModelInfo` 的**对外 id / `seen` 去重键 / 展示名**全部改用**原始** `model_id`
+  （`/v1/model/builtin` 同时下发 `deepseek-v4.1-flash` 与 `-1017` 两个独立条目，
+  两者 `model_type` 都是 `admin`、`context` 都是 `1048576`）。
+  `normalizeModelId` 只保留两处**内部**用途：gateway 分支判断「该 id 是否带日期
+  后缀」（决定是否记为 benefit）、`model_name` 缺失时的兜底 id。
+- ⚠️ PR159 首版的「父 id 不存在才剥后缀」（`resolveModelIds` / `modelIdSuffixCandidate`）
+  **已删除**：它依据的前提「chat 端点只认不带后缀的 id」在本仓 2026-09-23 已被实测
+  推翻 —— `-0731` 回 `404 not registered` 的真因是**缺 `maas_type: benefit` 头**，
+  而 `deepseek-v4-flash-0731` 与无后缀是后端**两个独立注册的模型，不能互相替代**。
+  守卫：`tests/unit/models.spec.ts` 的「带版本后缀的 id 必须原样暴露、不得归一成无后缀」。
+- 目录表校准（真机逐条实测）：`DEFAULT_MODELS` 删 `GLM-5` / `glm-5.3-flash` /
+  `deepseek-v4-pro`（均 404），补 `glm-5.3` / `glm-5.2-sft-harmony` /
+  `deepseek-v4.1-flash-1017` / `kimi-k3`。
+- ⚠️⚠️ **`CONTEXT_WINDOWS` 必须补 `deepseek-v4.1-flash-1017 = 1_048_576`，否则只是半修**：
+  master 已让 1017 在列表里可见，但窗口会落到 `524_288` 具名兜底 ⇒ 占用比分母
+  **小 2 倍**、压缩阈值偏早（实测 `codeartsContextWindow('deepseek-v4.1-flash-1017')
+  === 524288`，父 id 为 `1048576`）。守卫：`tests/unit/llm-adapter.spec.ts` 的
+  `listModels` 断言 + `tests/unit/codearts-context-window.spec.ts`。
+
+### ② 续期「兑换成功但落盘失败」⇒ 终态，且**终态错误的类型由调用方注入**
+
+- 事实：`refresh()` 成功 = 服务端**已消耗**一次性 refresh_token 并签发新的；
+  此时 `save()` 失败 ⇒ 新凭据只剩内存引用 ⇒ 本地永久停在死 token 上。旧实现让异常
+  冒泡，各家 `refreshAll` 当**非终态**处理：只记 warn、不写 `refreshable:false`、
+  面板照常显示「自动续期」⇒ 静默死号（2026-10-27 两次真实事故）。
+- 修法：`refreshAccountWithReconcile` 新增**必填**参数
+  `makeTerminalError: (message) => Error`。
+- ⚠️⚠️ **不得复用别家 provider 的错误类**（PR159 首版即如此，注释声称「九家同时
+  受益」）：每家 `refreshAll` 判的是**自己那个同名类**（buddy / trae / qoder /
+  cline / lobsterai 各自定义、gemini 是 `GeminiRefreshTokenExpiredError`、minimax 是
+  `MinimaxRefreshTokenExpiredError`、accio 是 `AccioRefreshTokenExpiredError`）
+  ⇒ 跨模块 `instanceof` **恒为 false**，另外 8 家仍按非终态处理 = 照样静默死。
+  ⇒ 10 处调用点（九家，gemini 两处）各给自己的类；参数**必填**，漏接线在
+  `tsc --noEmit` 就红（不靠人记得）。
+- 守卫（双向都做过）：
+  - `tests/unit/expiry-sync.spec.ts` 注入独有的 `MarkerTerminalError`，断言抛出的
+    就是它、且**不是**别家的类（先 RED：`expected RefreshTokenExpiredError … to be an
+    instance of MarkerTerminalError`）；
+  - `tests/unit/buddy-auth.spec.ts` 在本 provider 上真跑 `refreshAll`（只让
+    `credentials.set` 失败）⇒ 必须写 `refreshable:false`。变异：把共享模块改回借用
+    codearts 的类 ⇒ 该用例**变红**（共享模块自己的替身单测抓不到这处接线）。
+- ⚠️ 关联：master 另有中立的续期失败分类器 `src/refresh-failure.ts`
+  （`isTerminalRefreshFailure`），当前只接在 autoclaw / minimax 两家；本处**不**用它，
+  因为它的输入形状是「上游响应」，而这里是「本地存储写失败」。
+
+### ③ 「已下架模型不补回设置页」的判据必须**确认拿到全量目录**
+
+- 病：`model.list` 会把「不在全量目录里」的黑名单条目判成已下架、**不补回**设置页
+  （否则上游已下架、用户曾关掉的模型会永久灰显在那儿、点开必然
+  `InferHub.002002009.404`）。
+- ⚠️⚠️ 但 `listAllModels()` 在**冷缓存 / 远端降级**下返回的是各家**编译期兜底表**，
+  而那是远端目录的**子集**（Issue IKJW33 实测：`cline` 冷缓存 3 条 vs 远端 460 条）
+  ⇒ 拿它当在售集合，用户关掉的**在售**模型（例如只存在于远端的新模型 `glm-5.3`）
+  会被判「已下架」⇒ **从设置页彻底消失、再也打不开**（窗口很实在：远端拉取失败、
+  离线启动、刚重启还没拉到目录时都会命中）。
+- 修法：适配器自报钩子 `ModelCatalogSource.catalogConfirmedRemote?()`（**可选**；
+  当前只有 codearts 实现 = `remoteModels !== undefined && remoteComplete`，即
+  「至少成功读到过一次远端**且**两个目录端点都取全」）。只有它返回 `true` 时
+  `model.list` 才允许隐藏；**未实现 / false / 抛错一律放弃判据**（照旧补回）——
+  其余 14 家不实现该钩子 ⇒ 行为与加判据之前**逐字节一致**。
+  在售集合取 `listModels ∪ listAllModels`（与 `fullCatalogIds` 同口径）。
+- 守卫：`tests/unit/jet-hub-rpc.spec.ts`「目录未经确认远端时不得据残缺（兜底子集）
+  判已下架」（先 RED）；`tests/unit/llm-adapter.spec.ts` 三态（冷启动 / 完整 / 残缺）；
+  `tests/unit/dead-model-store.spec.ts`「经 `withDeadModelPruning` 包装后仍可调用」
+  （⚠️ 包装层若吞掉该成员，判据会**静默放弃**、PR159 那半个修复无声失效）。
+  变异验证：去掉 `confirmedRemote === true` 门槛 / 丢掉 `remoteComplete` 腿 /
+  让 Proxy 吞掉该成员 ⇒ 三条用例各自变红。
