@@ -494,6 +494,135 @@ const DSH_REWRITE = 'You are an AI coding assistant, powered by a large language
 const WEB_SURFACE_TRIGGER = 'You are interacting with the user through the DeepSeek Harness Web GUI whose URL the runtime context names. When the user refers to "this page", "this GUI", or "this app" without naming another target, they mean this GUI.'
 const WEB_SURFACE_REWRITE = 'You are interacting with the user through the harness Web GUI whose URL the runtime context names. When the user refers to "this page", "this GUI", or "this app" without naming another target, they mean this GUI.'
 
+/**
+ * 第六条指纹：**DSH 的 `@` 文件引用说明句**（`FILE_REFERENCE_PROMPT`，2026-10-28 真实报障）。
+ *
+ * ## 现象
+ *
+ * 真实会话每轮 `400/11128 Illegal API invocation from an unapproved channel`，
+ * 报错原文 `INVALID_REQUEST` + 「请求被拦截，请重新发送」。前五条全部命中并被改写
+ * （身份句、Web 面两句都在），**仍被拦** ⇒ 触发物不在已登记的清单里。
+ *
+ * ## 根因（本机 2026-10-28 逐格实测，`copilot.tencent.com` + `deepseek-v4.1-flash`）
+ *
+ * 真实 system（18,383 字符）逐行二分 ⇒ 第 160 行为临界点。行内前缀二分
+ * 给出 **110 字符放行 / 111 字符被拦**、**后缀砍到 50 字符即放行** ⇒ 字面量
+ * 从行首起算、共 111 字符，恰好是这两句的并集。
+ *
+ * ⚠️⚠️ 本条**不含任何品牌词**（没有 `DeepSeek Harness`、没有 `dsh`）⇒ 按
+ * 「找含品牌名的句子」的思路**必然漏掉它**。这正是它被前五条漏掉的原因，
+ * 也是它值得单独登记一条注释的理由：**判据不是品牌名，是「`@` 语法说明」
+ * 这个 DSH 独有写法**。
+ *
+ * 出处：`packages/context/file-reference/src/index.ts` 的 `FILE_REFERENCE_PROMPT`，
+ * 由 `file-reference-local` 注入为 `context:file-reference` 段（该段在 agent
+ * 有 `read` 工具时恒非空 ⇒ **每轮必带**）。
+ */
+const FILE_REFERENCE_TRIGGER = 'Tokens prefixed with @ are paths the user explicitly referenced. Relative paths resolve from the workspace root'
+/** 只调整语序，语义不变：仍是「路径相对工作区根解析」。其余 402 字符逐字不动。 */
+const FILE_REFERENCE_REWRITE = 'Tokens prefixed with @ are paths the user explicitly referenced. Paths resolve relative to the workspace root'
+
+describe('腾讯系内容级风控指纹改写（2026-10-28）：DSH `@` 文件引用说明句', () => {
+  it('★ 字面量被改写成等义语序替换，且长度判据锁住 111 字符', () => {
+    // 两份独立誊写 + 长度断言：源码那边少一个字符，本节就红。
+    expect(FILE_REFERENCE_TRIGGER).toHaveLength(111)
+    expect(FILE_REFERENCE_REWRITE).toHaveLength(109)
+    const out = rewriteTencentContentFingerprints(FILE_REFERENCE_TRIGGER, 'buddy')
+    expect(out).toBe(FILE_REFERENCE_REWRITE)
+    // 反向对照：输入必须真的变了（防「两边写成同一个字面量」这类恒真断言）。
+    expect(out).not.toBe(FILE_REFERENCE_TRIGGER)
+    // 两站都改（`find` 是 provider 无关的；被拦与否另说）。
+    expect(rewriteTencentContentFingerprints(FILE_REFERENCE_TRIGGER, 'workbuddy'))
+      .toBe(FILE_REFERENCE_REWRITE)
+  })
+
+  it('★ `find` 长度判据：**前 110 字符**实测放行 ⇒ 必须逐字节不动（把 find 改短这里就红）', () => {
+    const prefix110 = FILE_REFERENCE_TRIGGER.slice(0, 110)
+    expect(prefix110).toHaveLength(110)
+    // 实测：110 放行 ⇒ 不得改写。若有人把 find 削到 110，本行会变红。
+    expect(rewriteTencentContentFingerprints(prefix110, 'buddy')).toBe(prefix110)
+    // 反向：整条 111 必须真的被改掉，否则上面那条「不动」是空跑。
+    expect(rewriteTencentContentFingerprints(FILE_REFERENCE_TRIGGER, 'buddy'))
+      .not.toBe(FILE_REFERENCE_TRIGGER)
+  })
+
+  it('★ 切句的两半**各自都实测放行** ⇒ 谁都不许被改写（写短了=空跑）', () => {
+    // 前半句（48 字符）与后半句（44 字符）单独发都是 200 ⇒ 触发串跨了句边界。
+    const sentence1 = 'Tokens prefixed with @ are paths the user explicitly referenced.'
+    const sentence2 = 'Relative paths resolve from the workspace root'
+    for (const half of [sentence1, sentence2]) {
+      expect(rewriteTencentContentFingerprints(half, 'buddy')).toBe(half)
+    }
+  })
+
+  it('★ 位置无关：前接中性前言 / 前接换行 / 前接中文**仍要改**（与第 4 条的行首锚定相反）', () => {
+    // 实测：句首 / 句中 / 前接空格 / 前接换行 / 前接中文 —— 五格全部 400/11128。
+    for (const text of [
+      FILE_REFERENCE_TRIGGER,
+      `Note: ${FILE_REFERENCE_TRIGGER} here.`,
+      `You are a helpful assistant.\n\n${FILE_REFERENCE_TRIGGER}`,
+      `\n${FILE_REFERENCE_TRIGGER}`,
+      `你好\n${FILE_REFERENCE_TRIGGER}`,
+    ]) {
+      const out = rewriteTencentContentFingerprints(text, 'buddy')
+      expect(out).not.toContain(FILE_REFERENCE_TRIGGER)
+      expect(out).toContain(FILE_REFERENCE_REWRITE)
+    }
+  })
+
+  it('★ 大小写不敏感（实测全小写 / 全大写同样被拦）', () => {
+    expect(rewriteTencentContentFingerprints(FILE_REFERENCE_TRIGGER.toUpperCase(), 'buddy'))
+      .toBe(FILE_REFERENCE_REWRITE)
+    expect(rewriteTencentContentFingerprints(FILE_REFERENCE_TRIGGER.toLowerCase(), 'buddy'))
+      .toBe(FILE_REFERENCE_REWRITE)
+  })
+
+  it('★ 逐字符：改一个词 / 多一个空格**不动**（服务端认的是逐字符字面量）', () => {
+    for (const text of [
+      // 少一个词
+      'Tokens prefixed with @ are paths the user explicitly referenced. Relative paths resolve from the root',
+      // 多一个空格
+      'Tokens prefixed with @ are paths the user explicitly referenced. Relative  paths resolve from the workspace root',
+    ]) {
+      expect(rewriteTencentContentFingerprints(text, 'buddy')).toBe(text)
+    }
+  })
+
+  it('★ 非腾讯系：逐字节不变（别替别家上游改写自家提示词）', () => {
+    for (const provider of ['qoder', 'qodercn', 'trae', 'codearts', 'lobsterai', '']) {
+      expect(rewriteTencentContentFingerprints(FILE_REFERENCE_TRIGGER, provider))
+        .toBe(FILE_REFERENCE_TRIGGER)
+    }
+  })
+
+  it('★ 真实整段 `FILE_REFERENCE_PROMPT`（407 字符）：只改那一处，其余逐字节不变', () => {
+    // ⚠️ 这一条是「改写不得伤害语义」的守卫：`@` 语法说明的后半段（目录 list、
+    // 用 read、不得声称已读过、引号语法）**一个字都不许动** —— 它们是防模型
+    // 编造文件内容的核心约束。
+    const full = 'Tokens prefixed with @ are paths the user explicitly referenced. '
+      + 'Relative paths resolve from the workspace root; absolute paths identify files or '
+      + 'directories on the host. A trailing slash marks a directory: list it when its '
+      + 'contents matter. Anything else is a file: use the read tool when its contents are '
+      + 'needed, and do not claim to have inspected it before reading. @"..." quotes a path '
+      + 'containing spaces.'
+    const out = rewriteTencentContentFingerprints(full, 'buddy')
+    expect(out).not.toContain(FILE_REFERENCE_TRIGGER)
+    expect(out).toContain(FILE_REFERENCE_REWRITE)
+    // 除该处外逐字节不变。
+    expect(out).toBe(full.replace(FILE_REFERENCE_TRIGGER, FILE_REFERENCE_REWRITE))
+    // 后半段的核心约束必须原样保留。
+    expect(out).toContain('A trailing slash marks a directory: list it when its contents matter.')
+    expect(out).toContain('use the read tool when its contents are needed')
+    expect(out).toContain('do not claim to have inspected it before reading')
+    expect(out).toContain('@"..." quotes a path containing spaces.')
+  })
+
+  it('★ 幂等：改写结果再跑一次逐字节不变', () => {
+    const once = rewriteTencentContentFingerprints(FILE_REFERENCE_TRIGGER, 'buddy')
+    expect(rewriteTencentContentFingerprints(once, 'buddy')).toBe(once)
+  })
+})
+
 describe('腾讯系内容级风控指纹改写（2026-10-21）：DSH 身份首句', () => {
   it('★ 首句改成官方同形措辞，且出站文本里**不再有 `DeepSeek Harness`**', () => {
     // 后半句才是本条的**真正收益**，所以写成不变式而不是只断言等值：
