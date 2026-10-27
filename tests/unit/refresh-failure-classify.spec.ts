@@ -118,12 +118,27 @@ describe('★ 状态码闸门是**黑名单**而不是白名单（红队打穿�
       new RefreshFailureError('x：HTTP 200 Invalid token', { status: 200, oauthError: 'Invalid token' }),
       AUTOCLAW_TERMS,
     ), '业务码信封（HTTP 200 + code 非 0）必须能判终态').toBe(true)
+    /**
+     * ⚠️⚠️ **`403` 的口径（2026-10-27 自审统一）**：判**非**终态。
+     *
+     * 此前终态判据只排了 `401`、而 `isDefinitiveRefreshRejection` 排了 `403`
+     * ⇒ **两处口径分叉**（同一份 `403 Invalid token` 在终态判据里 true、
+     * 在「确定性拒绝」里 false）。
+     *
+     * 取「不判终态」的理由：`403` 是「禁止访问」，真实世界里更常见于
+     * **WAF / 风控 / 地域封锁 / 代理拒绝**（本仓库有实测：国际站按出口 IP
+     * 分流时回与凭据失效**逐字同形**的拒绝）—— 都不说明**这一把** RT 死了。
+     * 判错的代价是「账号报废、必须重登」，漏判只是「每 30 分钟白撞一次」。
+     */
     expect(isTerminalRefreshFailure(
       new RefreshFailureError('x：HTTP 403 Invalid token', { status: 403, oauthError: 'Invalid token' }),
       AUTOCLAW_TERMS,
-    )).toBe(true)
+    ), '★ `403` 不得判终态（WAF/风控/地域封锁与「RT 死了」是两件事）').toBe(false)
+    // 反向自证：同一份错误在「确定性拒绝」判据里也必须是 false（两处口径一致）
+    expect(isDefinitiveRefreshRejection(
+      new RefreshFailureError('x：HTTP 403 Invalid token', { status: 403, oauthError: 'Invalid token' }),
+    ), '两处口径必须一致（403 都不是「确定性拒绝」）').toBe(false)
   })
-
   it('★ 但 401 仍是**非**终态（客户端认证问题，不说明这把 RT 死了）', () => {
     expect(isTerminalRefreshFailure(
       new RefreshFailureError('x：HTTP 401 Invalid token', { status: 401, oauthError: 'Invalid token' }),

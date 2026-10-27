@@ -505,13 +505,36 @@ export class AutoclawAuth extends Service {
    */
   async refresh(): Promise<void> {
     if (!this.active) return
-    const ref = credentialRef(this.credentialRefName)
     /**
      * ⚠️ 用 `renewViaFlight` 的**返回路径**（它内部已经落盘 + CAS + 池对账）。
      * 拿结果只为触发 scheduler 的重新武装与 `refreshTokenInvalid` 复位 ——
      * 落盘不由本方法再做一次（那会写第二遍，且可能覆盖闸门内的 CAS 判断）。
      */
-    const refreshed = await this.renewViaFlight(this.credentialRefName)
+    let refreshed: AutoclawCredential | undefined
+    try {
+      refreshed = await this.renewViaFlight(this.credentialRefName)
+    } catch (error) {
+      /**
+       * ⚠️⚠️ **错误分支的两个副作用绝不能丢**（2026-10-27 自审发现：本轮改写
+       * `refresh()` 时把它们漏掉了，属**净回归**）。
+       *
+       * 修前本方法的 catch 做两件事：
+       * 1. 终态（`RefreshTokenExpiredError`）⇒ `markRefreshTokenInvalid()`
+       *    —— 它同时 `scheduler.stop()`，**停掉 30 分钟定时器**。丢了它 ⇒
+       *    定时器会继续对一把**确定已死**的 RT 每 30 分钟白撞一次；
+       * 2. 其余错误 ⇒ `lastRefreshError = …`，那是 `status()`（面板）
+       *    读取失败原因的唯一来源。丢了它 ⇒ 面板上永远看不到「上次续期失败」。
+       *
+       * ⚠️ 判据用 `instanceof` 而不是字符串比较（与 `src/refresh.ts` 的
+       * 终态判据同一条纪律）。
+       */
+      if (error instanceof RefreshTokenExpiredError) {
+        this.markRefreshTokenInvalid()
+      } else {
+        this.lastRefreshError = error instanceof Error ? error.message : String(error)
+      }
+      throw error
+    }
     if (refreshed === undefined) {
       // ⚠️ 闸门里没有任何可续期内容（凭据读不到 / 无 refresh_token）——
       //    与修前 `if (!resolved) return` 的语义一致，静默返回。
@@ -522,7 +545,6 @@ export class AutoclawAuth extends Service {
     if (refreshed.expires_at) {
       this.scheduler.arm(refreshed.expires_at)
     }
-    void ref
   }
 
   private markRefreshTokenInvalid(): void {

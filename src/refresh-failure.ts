@@ -195,20 +195,33 @@ export function isTerminalRefreshFailure(
    */
   const oauthError = normalizedDetails?.oauthError
   if (typeof oauthError === 'string' && oauthError.trim().length > 0) {
-    // ⚠️ 状态码若是 5xx/429/408/401，仍按「非终态」处理（那是整台网关的问题，
-    //    与**这一把** RT 无关）；这里只放行「确定性拒绝」那类状态码。
+    /**
+     * ⚠️ 状态码是 `5xx` / `429` / `408` / `401` / **`403`** 时按「非终态」处理。
+     *
+     * ⚠️⚠️ **`403` 是 2026-10-27 自审补齐的一格**：此前这里只排了 `401`，
+     * 而 `isDefinitiveRefreshRejection` 却把 `403` 排除了 ⇒ **两处口径分叉**
+     * （`403 Invalid token` 在终态判据里是 true、在「确定性拒绝」里是 false）。
+     *
+     * 取「不判终态」的理由：`403` 的语义是「禁止访问」，真实世界里更常见于
+     * **WAF / 风控 / 地域封锁 / 代理拒绝**（本仓库有实测：国际站按出口 IP 分流时
+     * 会回与凭据失效**逐字同形**的拒绝）—— 都不说明**这一把** refresh_token 死了。
+     * 判错的代价是「账号报废、必须重登」，漏判只是「每 30 分钟白撞一次」
+     * ⇒ 偏向不标死。
+     */
     const statusIsAmbiguous = status !== undefined
-      && (status >= 500 || status === 429 || status === 408 || status === 401)
+      && (status >= 500 || status === 429 || status === 408 || status === 401 || status === 403)
     if (!statusIsAmbiguous) return matchesAny(oauthError, terminalOAuthErrors)
   }
 
   // ① 传输层永远不是终态（含 `certificate has expired`）。
   if (isRefreshTransportFailure(error)) return false
 
-  // ② HTTP 状态码黑名单：5xx / 429 / 408 / 401 一律非终态。
-  //    网关抖动、限流、超时、客户端认证问题都不说明**这把** refresh_token 死了。
+  // ② HTTP 状态码黑名单：5xx / 429 / 408 / 401 / 403 一律非终态。
+  //    网关抖动、限流、超时、客户端认证问题、WAF/风控拒绝都不说明**这把**
+  //    refresh_token 死了。
   //    ⚠️ 刻意是**黑名单**而不是白名单（见 doc：白名单会让别的 4xx 整格跳过）。
-  if (status !== undefined && (status >= 500 || status === 429 || status === 408 || status === 401)) {
+  if (status !== undefined
+    && (status >= 500 || status === 429 || status === 408 || status === 401 || status === 403)) {
     return false
   }
 
