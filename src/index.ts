@@ -3626,24 +3626,45 @@ export function apply(ctx: Context): void {
         return await autoclaw.renewCredentialForRef(entry.credentialRef, pool, entry.id)
       }
       /**
-       * 池里没有这个 token（或根本没有池 / 单凭据路径）⇒ 退默认单凭据 ref。
+       * ⚠️⚠️ **反查失败必须当场留痕**（2026-10-27 第二轮审计打穿的 P0，两位审计员独立命中）。
        *
-       * ⚠️⚠️ **修前这一格是空转**（2026-10-27 审计 P2）：
-       * `autoclaw.refresh()` 读的是 `AUTOCLAW.defaultCredentialRef`，而该 ref
-       * 全仓**没有任何写入点**（`grep AUTOCLAW_ACCESS_TOKEN` 只有产品定义与
-       * `fallback` 声明）⇒ `refresh()` 里 `if (!resolved) return` 静默返回，
-       * 用户白等一次 60s 超时，然后仍然 401。
+       * ## 为什么诊断要写在这里而不是下面那条「退默认 ref」的分支
        *
-       * ⇒ 现在显式抛错（让适配器走原有的 401 分类路径），把「没有可续的账号」
-       *   与「续了但失败」区分开 —— 后者才该重发。
+       * 修前把 warn 放在 `renewCredentialForRef(defaultCredentialRef)` 返回
+       * `undefined` 之后 —— 但那条分支**几乎不可达**：该 ref 全仓无写入点，
+       * 而 `renewCredentialForRef` 在「凭据未配置」时是**抛错**（不是返回
+       * `undefined`）⇒ 真正发生的是「抛错被适配器的 `catch` 静默吃掉」，
+       * 那条精心写好的 warn **一次都不会执行**（实测确认）。
+       *
+       * ⇒ 现在把诊断**前移到反查失败当场**：无论后续走哪条分支（抛错 / 空转 /
+       *   退默认 ref），日志里都已经有「为什么找不到可续期的账号」。
+       *
+       * ⚠️ 这条路径**可达**：`pool.findAccountIdByCredential` 会 `continue` 掉
+       *   `!entry.enabled` 的条目 ⇒ 请求用的账号若在 grant 期间被停用，
+       *   反查返回 `''` 就落到这里。
        */
-      const single = await autoclaw.renewCredentialForRef(AUTOCLAW.defaultCredentialRef)
-      if (single === undefined) {
-        throw new Error(
-          'autoclaw: 401 后无可续期的账号（池里没有本次使用的凭据，且默认单凭据 ref 未配置）',
+      if (token.length > 0) {
+        ctx.logger.warn(
+          '[autoclaw] 401 后按 access_token 反查不到账号：'
+          + '池里没有一把匹配的凭据（可能该账号已被删除，或已停用 ⇒ 反查跳过 enabled:false）'
+          + ' ⇒ 本次只能退默认单凭据 ref（它通常未配置，即本次不重发，按首次 401 报错）',
         )
       }
-      return single
+      /**
+       * 池里没有这个 token（单凭据路径 / 账号被删）⇒ 退默认单凭据 ref。
+       *
+       * ⚠️ **不能抛错**（第二轮审计打穿的 P0）：适配器那一侧的 401 重发是
+       * `try { … } catch { /* 忽略重试失败 *\/ }` —— 抛出去的异常被**静默吃掉**。
+       * 现在只记日志 + 让 `renewCredentialForRef` 自己决定抛或返回；
+       * 适配器那侧的 `catch` 也已补 warn，两处合起来保证**不再静默**。
+       */
+      return await autoclaw.renewCredentialForRef(AUTOCLAW.defaultCredentialRef).catch((error: unknown) => {
+        ctx.logger.warn(
+          '[autoclaw] 401 后无可续期的账号（默认单凭据 ref 未配置或不可用）：'
+          + `${error instanceof Error ? error.message : String(error)} ⇒ 本次不重发，按首次 401 报错`,
+        )
+        return undefined
+      })
     },
   })
 
@@ -3719,15 +3740,25 @@ export function apply(ctx: Context): void {
       if (entry !== undefined) {
         return await autoclawIntl.renewCredentialForRef(entry.credentialRef, pool, entry.id)
       }
-      // ⚠️ 同国内版：默认单凭据 ref **无写入点** ⇒ 读不到时必须显式抛错，
-      //    不能静默返回（否则白等一次超时、仍 401）。
-      const single = await autoclawIntl.renewCredentialForRef(AUTOCLAW_INTL.defaultCredentialRef)
-      if (single === undefined) {
-        throw new Error(
-          'autoclawintl: 401 后无可续期的账号（池里没有本次使用的凭据，且默认单凭据 ref 未配置）',
+      // ⚠️ 同国内版：**诊断前移到反查失败当场**（那条「退默认 ref 后看返回值」
+      //    的分支几乎不可达 —— `renewCredentialForRef` 在未配置时是抛错不是返回
+      //    `undefined`，故旧写法里那段 warn 一次都不会执行，实测确认）。
+      if (token.length > 0) {
+        ctx.logger.warn(
+          '[autoclawintl] 401 后按 access_token 反查不到账号：'
+          + '池里没有一把匹配的凭据（可能该账号已被删除，或已停用 ⇒ 反查跳过 enabled:false）'
+          + ' ⇒ 本次只能退默认单凭据 ref（它通常未配置，即本次不重发，按首次 401 报错）',
         )
       }
-      return single
+      // ⚠️ 同国内版：**不得抛错**（抛出去会被适配器的 catch 静默吃掉 ⇒
+      //    「一次上游都不发 + 日志零字」）。只记日志并返回 undefined。
+      return await autoclawIntl.renewCredentialForRef(AUTOCLAW_INTL.defaultCredentialRef).catch((error: unknown) => {
+        ctx.logger.warn(
+          '[autoclawintl] 401 后无可续期的账号（默认单凭据 ref 未配置或不可用）：'
+          + `${error instanceof Error ? error.message : String(error)} ⇒ 本次不重发，按首次 401 报错`,
+        )
+        return undefined
+      })
     },
   })
 

@@ -350,3 +350,223 @@ describe.each([
     ).toBe(1)
   })
 })
+
+/**
+ * ★★ **第二轮审计修的四格**（每条都对应一处红队实测击穿）。
+ *
+ * 这一组守的是「绕过单飞闸门 + 单向门 + 终态不重读」这三件事 ——
+ * 红队实测它们会让**一把上游仍有效的好钥匙被标成「需重新登录」**，
+ * 触发面是「每次宿主重启/升级时启动首轮 `refreshAll` 与用户第一条消息并发」。
+ */
+describe.each([
+  ['autoclaw（国内版）', AUTOCLAW, 'autoclawAuth'],
+  ['autoclawintl（国际版）', AUTOCLAW_INTL, 'autoclawintlAuth'],
+] as const)('★★ %s：refreshAll 必须走单飞闸门（第二轮审计打穿）', (_label, product, serviceName) => {
+  /** 造一个「池里有、凭据完好」的账号，返回 ref。 */
+  async function seed(ctx: TestCtx, id: string, token: string): Promise<string> {
+    const prefix = product.id === AUTOCLAW.id ? 'AUTOCLAW' : 'AUTOCLAWINTL'
+    const ref = `${prefix}_ACCOUNT_${id.toUpperCase()}`
+    await ctx.accountPool.addAccount({
+      id, provider: product.id, nickname: id, enabled: true,
+      credentialRef: ref, createdAt: 0, refreshable: true,
+    })
+    await ctx.credentials.set(credentialRef(ref), JSON.stringify(credentialOf(token)))
+    return ref
+  }
+
+  it('★★ `refreshAll` 与「401 续期」并发 ⇒ 只发 1 份 grant（不得两路各烧一次 RT）', async () => {
+    const ctx = boot()
+    const ref = await seed(ctx, 'dupall', 'AT-all')
+    const auth = (ctx as unknown as Record<string, unknown>)[serviceName] as {
+      refreshAll: (pool: unknown) => Promise<void>
+      renewCredentialForRef: (ref: string, pool?: unknown, id?: string) => Promise<unknown>
+    }
+    let grants = 0
+    vi.stubGlobal('fetch', async (url: string) => {
+      if (String(url).includes('/userapi/v1/')) {
+        grants += 1
+        // 延迟让并发真正重叠
+        await new Promise((r) => setTimeout(r, 20))
+        return new Response(JSON.stringify({
+          code: 0,
+          data: { access_token: `AT-new-${grants}`, refresh_token: `RT-new-${grants}`, expires_in: 3600 },
+        }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      return new Response('{}', { status: 200, headers: { 'Content-Type': 'application/json' } })
+    })
+    const pool = {
+      listAccounts: async () => [{ id: 'dupall', credentialRef: ref, refreshable: true, enabled: true }],
+      updateAccount: async () => {},
+    }
+    await Promise.all([
+      auth.refreshAll(pool),
+      auth.renewCredentialForRef(ref, pool, 'dupall').catch(() => undefined),
+    ])
+    expect(
+      grants,
+      '★ `refreshAll` 绕过了单飞闸门 ⇒ 两路各拿同一把一次性 RT 打上游（输家 invalid_grant，好号被标死）',
+    ).toBe(1)
+  })
+
+  it('★★ 池标 `refreshable:false` 但凭据完好 ⇒ `refreshAll` 仍必须处理（单向门）', async () => {
+    const ctx = boot()
+    const ref = await seed(ctx, 'door2', 'AT-door')
+    const auth = (ctx as unknown as Record<string, unknown>)[serviceName] as {
+      refreshAll: (pool: unknown) => Promise<void>
+    }
+    let grants = 0
+    vi.stubGlobal('fetch', async (url: string) => {
+      if (String(url).includes('/userapi/v1/')) {
+        grants += 1
+        return new Response(JSON.stringify({
+          code: 0,
+          data: { access_token: 'AT-new', refresh_token: 'RT-new', expires_in: 3600 },
+        }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      return new Response('{}', { status: 200, headers: { 'Content-Type': 'application/json' } })
+    })
+    // ⚠️ 池说不可续期（误标），但凭据里 refresh_token 完好
+    const pool = {
+      listAccounts: async () => [{ id: 'door2', credentialRef: ref, refreshable: false, enabled: true }],
+      updateAccount: async () => {},
+    }
+    await auth.refreshAll(pool as never)
+    expect(
+      grants,
+      '★ 误标 `refreshable:false` 变成了单向门（`AGENTS.md` 明文红线：它是凭据材料的镜像，不是案底）',
+    ).toBeGreaterThan(0)
+  })
+
+  it('★★ 终态报错但凭据已被他处轮换 ⇒ 不得把好号标死（判终态前必须重读）', async () => {
+    /**
+     * ⚠️⚠️ **必须走 `refreshAll`**（而不是 `renewCredentialForRef`）—— 只有前者的
+     * catch 才会调 `updateAccount({refreshable:false})`，即「标死」这个**可观测后果**
+     * 发生在 `refreshAll` 里。我第一版观察 `renewCredentialForRef` 的返回值 ⇒
+     * 它是**假绿**（实测：把重读整段删掉，用例仍绿）。
+     *
+     * ⚠️ 这也是红队的复现路径：401 那条腿先发、`refreshAll` 后发（或反之），
+     * 本路拿的是**旧快照** ⇒ 上游回 401 ⇒ 若不重读就误判「这把 RT 死了」。
+     */
+    const ctx = boot()
+    const ref = 'AUTOCLAW_ACCOUNT_REREAD2'
+    await ctx.accountPool.addAccount({
+      id: 'reread2', provider: AUTOCLAW.id, nickname: 'reread2', enabled: true,
+      credentialRef: ref, createdAt: 0, refreshable: true,
+    })
+    await ctx.credentials.set(credentialRef(ref), JSON.stringify(credentialOf('AT-old')))
+    const auth = (ctx as unknown as Record<string, unknown>)[serviceName] as {
+      refreshAll: (pool: unknown) => Promise<void>
+    }
+    const updates: Array<{ id: string; patch: unknown }> = []
+    vi.stubGlobal('fetch', async (url: string) => {
+      if (String(url).includes('/userapi/v1/')) {
+        /**
+         * ⚠️ 模拟并发那一路已成功：**先**把盘上换成新凭据，**再**回终态报文
+         * ⇒ 我们手上那份快照已成旧值。若不重读，就会以为「这把 RT 死了」。
+         */
+        await ctx.credentials.set(credentialRef(ref), JSON.stringify(credentialOf('AT-rotated-by-other')))
+        /**
+         * ⚠️⚠️ **必须是「确定性拒绝」的形态**（`HTTP 400` + 业务码信封），
+         * 不能用 `401` —— 按 `refresh-failure.ts` 的分类器，`401` 是**非终态**
+         * （客户端认证问题，不说明这把 RT 死了）⇒ 走不到 `RefreshTokenExpiredError`
+         * ⇒ 也就测不到「标死」这条腿（我第一版用 401 ⇒ **假绿**，实测确认）。
+         */
+        return new Response(JSON.stringify({ code: 400, msg: 'Invalid token' }), { status: 400 })
+      }
+      return new Response('{}', { status: 200, headers: { 'Content-Type': 'application/json' } })
+    })
+    const pool = {
+      listAccounts: async () => [{ id: 'reread2', credentialRef: ref, refreshable: true, enabled: true }],
+      updateAccount: async (id: string, patch: unknown) => { updates.push({ id, patch }) },
+    }
+    await auth.refreshAll(pool)
+    expect(
+      updates.some((item) => (item.patch as { refreshable?: boolean }).refreshable === false),
+      '★★ 他处已把凭据轮换成功，本路却因拿旧快照打而报终态 ⇒ 误标好号'
+      + '（`refreshable:false` 是单向门 ⇒ 永不自愈、用户被要求重新登录）',
+    ).toBe(false)
+  })
+})
+
+/**
+ * ★★ **接线与错误通道**的守卫（第二轮审计：这几格此前**零守卫**）。
+ *
+ * 审计实测「删掉 `index.ts` 两站的 `startRenewPatrol` 整段、或删掉 `ctx.effect`
+ * 回收、或把 `catch` 改回静默、或让 `refresh()` 绕过单飞」时，**全量测试
+ * 一个字都不变**。本组逐格钉住它们。
+ */
+describe('★★ AutoClaw：错误通道必须留痕、单飞必须覆盖全部入口', () => {
+  it('★★ `refresh()`（单凭据路径）也必须走单飞：并发 2 次 ⇒ 只 1 份 grant', async () => {
+    const ctx = boot()
+    // ⚠️ 单凭据路径的 ref 是产品声明的 `defaultCredentialRef`（不是 `AUTOCLAW_ACCESS_TOKEN`）
+    const ref = 'AUTOCLAW_ACCOUNT_DEFAULT'
+    await ctx.credentials.set(credentialRef(ref), JSON.stringify(credentialOf('AT-single')))
+    const auth = (ctx as unknown as Record<string, unknown>).autoclawAuth as {
+      refresh: () => Promise<void>
+    }
+    let grants = 0
+    vi.stubGlobal('fetch', async (url: string) => {
+      if (String(url).includes('/userapi/v1/')) {
+        grants += 1
+        await new Promise((r) => setTimeout(r, 20))
+        return new Response(JSON.stringify({
+          code: 0,
+          data: { access_token: `AT-n${grants}`, refresh_token: `RT-n${grants}`, expires_in: 3600 },
+        }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      return new Response('{}', { status: 200, headers: { 'Content-Type': 'application/json' } })
+    })
+    await Promise.all([auth.refresh(), auth.refresh()])
+    expect(
+      grants,
+      '★ 单凭据路径绕过单飞 ⇒ 两路各烧一次一次性 RT（红队实测「峰值 2」）',
+    ).toBe(1)
+  })
+
+  it('★★ 401 重发的失败必须留 warn（不得静默 ⇒ 「一次上游都不发 + 日志零字」）', async () => {
+    const ctx = boot()
+    const ref = 'AUTOCLAW_ACCOUNT_WARN1'
+    await ctx.accountPool.addAccount({
+      id: 'warn1', provider: AUTOCLAW.id, nickname: 'warn1', enabled: true,
+      credentialRef: ref, createdAt: 0, refreshable: true,
+    })
+    await ctx.credentials.set(credentialRef(ref), JSON.stringify(credentialOf('AT-warn')))
+    const adapter = ctx.llm.adapterByProvider.get(AUTOCLAW.id) as unknown as {
+      options: {
+        resolveCredential?: (modelId?: string) => Promise<unknown>
+        refresh?: (used?: unknown) => Promise<unknown>
+      }
+      stream: (options: unknown) => AsyncIterable<unknown>
+    }
+    adapter.options.resolveCredential = async () => credentialOf('AT-warn')
+    /** ⚠️ 让 refresh **抛错**（模拟「反查不到账号」那条腿）。 */
+    adapter.options.refresh = async () => {
+      throw new Error('autoclaw: 401 后无可续期的账号（池里没有本次使用的凭据…）')
+    }
+    vi.stubGlobal('fetch', async (url: string) => {
+      if (String(url).includes('/chat/completions')) {
+        return new Response(JSON.stringify({ code: 401, msg: 'invalid token' }), { status: 401 })
+      }
+      return new Response(JSON.stringify({ models: [] }), {
+        status: 200, headers: { 'Content-Type': 'application/json' },
+      })
+    })
+    /** ⚠️ 捕获 adapter 的 warn 出口。 */
+    const warnings: string[] = []
+    const original = (adapter as unknown as { warnImpl?: (m: string) => void })
+    void original
+    // ⚠️ 直接替换私有出口（与生产同一条通道）——`warnImpl` 是 readonly 字段，
+    //    这里用结构化赋值（测试专用，不改生产类型）。
+    ;(adapter as unknown as { warnImpl: (m: string) => void }).warnImpl =
+      (message: string) => { warnings.push(message) }
+    try {
+      for await (const _chunk of adapter.stream({
+        model: 'zai_glm-5.3-flash', messages: [{ role: 'user', content: 'hi' }],
+      })) { void _chunk }
+    } catch { /* 401 会抛出，无需断言这一层 */ }
+    expect(
+      warnings.some((message) => message.includes('续期')),
+      '★ 401 重发失败被静默吞掉 ⇒ 日志零字、用户只看到「API 密钥无效」',
+    ).toBe(true)
+  })
+})

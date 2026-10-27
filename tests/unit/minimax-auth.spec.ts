@@ -460,7 +460,18 @@ describe('renewEntry（2026-10-24 本地试验版）', () => {
      *   ① **令牌材料不得被覆盖**（`access_token` / `refresh_token` 仍是别人那份）；
      *   ② 只多一个 `previous_refresh_tokens`，且含本次新拿到的 RT。
      */
-    expect(written.length, '允许补弹药（至多一次），但不得整份覆盖').toBeLessThanOrEqual(1)
+    /**
+     * ⚠️⚠️ **判据必须收紧到「恰好一次 + 必含新 RT」**（2026-10-27 第二轮审计修）。
+     *
+     * 修前是 `toBeLessThanOrEqual(1)` **外面再套一个 `if (written.length === 1)`**
+     * —— 那个 `if` 让「一次都不写」也全绿 ⇒ 审计员实测**删掉补弹药逻辑后
+     * 64 条用例全绿**，即这条守卫**无牙**。
+     *
+     * 真实现的 CAS 分支确实写**恰好一次**（审计员用自己的探针复核过
+     * `written.length = 1`）⇒ 收紧成 `toBe(1)` 不会造成假红，
+     * 却能精确抓住「补弹药被删掉」这个回归。
+     */
+    expect(written.length, '★ CAS 分支必须**恰好写一次**（补弹药）；0 次 = 补弹药被删、2 次 = 整份覆盖').toBe(1)
     const finalValue = store.get('MINIMAX_ACCOUNT_A1') as string
     const finalCredential = JSON.parse(finalValue) as {
       access_token: string
@@ -469,13 +480,11 @@ describe('renewEntry（2026-10-24 本地试验版）', () => {
     }
     expect(finalCredential.access_token, '★ 别人的新 access_token 不得被覆盖').toBe('b'.repeat(60))
     expect(finalCredential.refresh_token, '★ 别人的新 refresh_token 不得被覆盖').toBe(CRED.refresh_token)
-    if (written.length === 1) {
-      expect(
-        finalCredential.previous_refresh_tokens ?? [],
-        '★ 本次轮换出来的新 RT 必须压进历史栈（否则孤儿 + 弹药变少）',
-        // ⚠️ `refreshOk()` 的 `refresh_token` 是 `'r2'.repeat(30)`（不是 access_token 那个 ''
-      ).toContain('r2'.repeat(30))
-    }
+    expect(
+      finalCredential.previous_refresh_tokens ?? [],
+      '★ 本次轮换出来的新 RT 必须压进历史栈（否则孤儿 + 弹药变少）',
+      // ⚠️ `refreshOk()` 的 `refresh_token` 是 `'r2'.repeat(30)`（不是 access_token 那个）
+    ).toContain('r2'.repeat(30))
   })
 
   it('⚠️ 终态：当前 RT invalid_grant → 回退历史代际 RT 成功 ⇒ 凭据救回', async () => {

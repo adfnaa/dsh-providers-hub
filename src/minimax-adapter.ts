@@ -1036,11 +1036,43 @@ export class MinimaxAdapter extends LlmAdapter {
      *
      * 必要性：本家凭据可能被服务端提前撤销而本地 `expiresAt` 仍在未来 —— 只靠
      * 上面的过期预判不会续期，401 会白打一轮。
+     *
+     * ⚠️⚠️ **续期失败必须分类处理**（2026-10-27 第二轮审计打穿）：
+     * `minimax-auth` 的续期会抛 `MinimaxRefreshTokenExpiredError`（RT 确实已死）。
+     * 那种情形下正确的出口是**把「请重新登录」这条指路文案传出去**，而不是吞成
+     * `AUTH` —— `AUTH` 会被客户端替换成固定文案「API 密钥无效」并丢掉原文
+     *（本仓库的既有纪律：`IKLBSH`，凡「文案本身就是出路」的错误必须避开 `AUTH`）。
+     *
+     * ⚠️ 同时留一条 warn，让「续期失败」与「续了但没用」可分。
      */
     if (response.status === 401 || response.status === 403) {
-      await this.options.refresh()
-      const refreshed = await this.options.resolveCredential(options.model)
+      let refreshError: unknown
+      try {
+        await this.options.refresh()
+      } catch (error) {
+        refreshError = error
+        this.options.warn?.(
+          `[minimax] 401 后按需续期失败：${error instanceof Error ? error.message : String(error)}`,
+        )
+      }
+      const refreshed = refreshError === undefined
+        ? await this.options.resolveCredential(options.model)
+        : undefined
       if (refreshed === undefined || refreshed.access_token.length === 0) {
+        /**
+         * ⚠️ 终态（RT 已死）⇒ 抛出**带指路文案**的错误，**不用 `AUTH`**。
+         * 其余情形（续期成功了但拿不到凭据 / 网络类失败）仍按原 `AUTH` 口径 ——
+         * 那是「凭据暂时取不到」，与「需要重新登录」是两件事。
+         */
+        const terminal = refreshError !== undefined
+          && (refreshError as { name?: unknown }).name === 'MinimaxRefreshTokenExpiredError'
+        if (terminal) {
+          throw new LlmError(
+            `minimax: refresh_token 已失效，请重新登录（${refreshError instanceof Error ? refreshError.message : String(refreshError)}）`,
+            'INVALID_REQUEST',
+            { status: response.status },
+          )
+        }
         throw new LlmError('minimax: credential expired and refresh failed', 'AUTH', { status: response.status })
       }
       credential = refreshed

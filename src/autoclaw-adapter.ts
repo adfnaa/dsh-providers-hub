@@ -695,8 +695,26 @@ export class AutoclawAdapter extends LlmAdapter {
             signal: controller.signal,
           })
         }
-      } catch {
-        // 忽略重试失败，交由下方错误检测
+      } catch (error) {
+        /**
+         * ⚠️⚠️ **绝不能完全静默**（2026-10-27 第二轮审计打穿）。
+         *
+         * 修前这里是裸 `catch {}`，注释写着「忽略重试失败，交由下方错误检测」。
+         * 而「下方错误检测」只会看见**第一次** response 的 401 并如实报 `AUTH`
+         * —— 于是「续期为什么没成功」这条**唯一能指路的信息**彻底消失。
+         *
+         * 实测的后果链（P0）：`index.ts` 的 refresh 闭包在「反查不到本次使用的账号」
+         * 时会**显式抛错**，那个错误被这里吃掉 ⇒ **一次上游都不发、用户看到 401、
+         * 日志零字**，比修复前的「静默空转」更难查（修前至少还会试一次
+         * `defaultCredentialRef`）。
+         *
+         * ⇒ 现在留一条 warn。**仍然不外抛**（重试失败不该改变主路径的错误分类：
+         * 用户该看到的是第一次那个 401 的语义），但日志里必须能查到**为什么**没重发。
+         */
+        this.warnImpl(
+          `[autoclaw] 401 后的续期/重发失败，本次不重发（将按首次响应报错）：`
+          + `${error instanceof Error ? error.message : String(error)}`,
+        )
       }
     }
 

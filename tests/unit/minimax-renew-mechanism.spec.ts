@@ -849,3 +849,334 @@ describe('★★ refreshAll 只对账（PR 的核心改动）', () => {
     ).toBe(true)
   })
 })
+
+// ─────────────────────────────────────────────────────────────
+// ⑨ 生命周期闭环：stop 之后**重新 start** 必须恢复巡检
+// ─────────────────────────────────────────────────────────────
+
+describe('★★ 巡检的 stop → start 闭环（`patrolStopped` 不得粘滞）', () => {
+  const REF = 'MINIMAX_ACCOUNT_RS'
+
+  it('★★ stop 之后再 start ⇒ 巡检必须恢复（否则永久静默空转）', async () => {
+    /**
+     * ⚠️ 缺陷形态（2026-10-27 自审发现）：修前 `startRenewPatrol` 只判
+     * `patrolTimer !== undefined`，而 `stopRenewPatrol` 会把 `patrolStopped`
+     * 置 `true` —— **粘滞**。于是 stop → start 拿到一个**永久空转的定时器**：
+     * tick 每次第一行就 return，巡检再也不续期，而 `patrolTimer` 又非空
+     * ⇒ 连幂等短路都挡住后续 start。症状是「账号再也不自动续期、日志零字」。
+     *
+     * 生产当前不可达（每次 `apply()` 都 `new MinimaxAuth`），但它是一颗哑弹：
+     * 任何「实例复用 / 把 start 挪进 ctx.effect / 用例间共享实例」的改动都会踩上。
+     */
+    vi.useFakeTimers()
+    const store = new Map([[REF, JSON.stringify(credential(-60_000))]])
+    let grants = 0
+    const { auth } = makeEnv({
+      store,
+      fetcher: (async () => { grants += 1; return grantOk(grants) }) as never,
+    })
+    const pool = {
+      listAccounts: async () => {
+        // 每轮都「临期」，让 grants 能随 tick 增长
+        store.set(REF, JSON.stringify(credential(-60_000)))
+        return [{ id: 'rs', credentialRef: REF, refreshable: true, enabled: true }]
+      },
+      updateAccount: async () => {},
+    } as never
+
+    auth.startRenewPatrol(pool)
+    await vi.advanceTimersByTimeAsync(10)
+    expect(grants, '首轮未跑').toBeGreaterThan(0)
+
+    auth.stopRenewPatrol()
+    const atStop = grants
+    await vi.advanceTimersByTimeAsync(120_000)
+    expect(grants, 'stop 之后仍在续期（clearInterval 未生效）').toBe(atStop)
+
+    // ★ 重新 start
+    auth.startRenewPatrol(pool)
+    await vi.advanceTimersByTimeAsync(10)
+    expect(
+      grants,
+      '★ stop 之后重新 start 却不再续期 ⇒ `patrolStopped` 粘滞，巡检永久静默空转',
+    ).toBeGreaterThan(atStop)
+    auth.stopRenewPatrol()
+  })
+})
+
+// ─────────────────────────────────────────────────────────────
+// ⑩ 第二轮审计修的四格（每条都对应一处实测击穿）
+// ─────────────────────────────────────────────────────────────
+
+describe('★★ 终态冷却：判明 RT 已死后不得每 60s 重打（第二轮审计打穿）', () => {
+  const REF = 'MINIMAX_ACCOUNT_COOL'
+
+  /** 造一个「RT 确定已死」的账号（当前 + 3 代历史全部 invalid_grant）。 */
+  function deadAccount() {
+    return credential(-60_000, {
+      refresh_token: 'RT-DEAD',
+      previous_refresh_tokens: ['RT-O1', 'RT-O2', 'RT-O3'],
+    })
+  }
+
+  it('★★ 首轮之后 5 分钟内不得再打任何上游请求（修前 +=20 次）', async () => {
+    vi.useFakeTimers()
+    const store = new Map([[REF, JSON.stringify(deadAccount())]])
+    let grants = 0
+    const { auth } = makeEnv({
+      store,
+      sleep: async () => {},
+      fetcher: (async () => {
+        grants += 1
+        return new Response(JSON.stringify({ error: 'invalid_grant' }), { status: 400 })
+      }) as never,
+    })
+    const pool = {
+      listAccounts: async () => [{ id: 'cool', credentialRef: REF, refreshable: true, enabled: true }],
+      updateAccount: async () => {},
+    } as never
+    auth.startRenewPatrol(pool)
+    await vi.advanceTimersByTimeAsync(10)
+    const afterFirst = grants
+    // 首轮：当前值 2 次尝试 + 3 代历史各 1 次 = 最多 5 次（实测 4 次）
+    expect(afterFirst, '首轮应当试过当前值与历史代际').toBeGreaterThan(1)
+
+    await vi.advanceTimersByTimeAsync(5 * 60_000)   // 5 分钟 = 5 个 tick
+    expect(
+      grants - afterFirst,
+      '★ 死号在冷却期内仍被重打 ⇒ 无效流量（修前实测 5 分钟 20 次）',
+    ).toBe(0)
+    auth.stopRenewPatrol()
+  })
+
+  it('★★ 凭据一变（重新登录）⇒ 冷却立即解除（不得把人锁死）', async () => {
+    vi.useFakeTimers()
+    const store = new Map([[REF, JSON.stringify(deadAccount())]])
+    let grants = 0
+    const { auth } = makeEnv({
+      store,
+      sleep: async () => {},
+      fetcher: (async () => {
+        grants += 1
+        return new Response(JSON.stringify({ error: 'invalid_grant' }), { status: 400 })
+      }) as never,
+    })
+    const pool = {
+      listAccounts: async () => [{ id: 'cool', credentialRef: REF, refreshable: true, enabled: true }],
+      updateAccount: async () => {},
+    } as never
+    auth.startRenewPatrol(pool)
+    await vi.advanceTimersByTimeAsync(10)
+    auth.stopRenewPatrol()
+    expect(grants, '首轮应当打过上游').toBeGreaterThan(0)
+
+    // ⚠️ 模拟「用户重新登录」：盘上换成一把全新的 RT
+    store.set(REF, JSON.stringify(credential(-60_000, { refresh_token: 'RT-BRAND-NEW' })))
+    grants = 0
+    await auth.renewEntry(
+      pool as never,
+      { id: 'cool', credentialRef: REF, refreshable: true, expiresAt: 0 },
+      { force: true, trigger: 'forced' } as never,
+    ).catch(() => undefined)
+    expect(
+      grants,
+      '★ 换了新凭据却仍被冷却挡住 ⇒ 用户重新登录后必须重启插件才能恢复',
+    ).toBeGreaterThan(0)
+  })
+})
+
+describe('★★ 抢救链：重试**仍是非终态**时也必须试历史代际（第二轮审计打穿）', () => {
+  const REF = 'MINIMAX_ACCOUNT_SV2'
+
+  it('★★ 首轮网络错 → 重试 503 ⇒ 仍要试历史代际（修前直接抛、跳过全部历史）', async () => {
+    /**
+     * ⚠️ 这是「响应丢失」这一设计主场景的另一半：服务端已轮换、回程丢了，
+     * 表现为**网络类失败**；重试一次仍非终态时，历史代际才是唯一出路。
+     * 修前 `throw error` 在这一格直接冒出去 ⇒ 历史代际一次不被试
+     * （审计实测试过的 RT = `["RT-CUR","RT-CUR"]`，且新增守卫 37/37 全绿）。
+     */
+    const store = new Map([[REF, JSON.stringify(
+      credential(-60_000, { refresh_token: 'RT-CUR', previous_refresh_tokens: ['RT-OLD'] }),
+    )]])
+    const tried: string[] = []
+    let n = 0
+    const { auth } = makeEnv({
+      store,
+      sleep: async () => {},
+      fetcher: (async (_url: string, init: RequestInit) => {
+        n += 1
+        const rt = new URLSearchParams(String(init.body)).get('refresh_token') ?? '?'
+        tried.push(rt)
+        if (n === 1) throw new TypeError('fetch failed')                       // 首轮：网络错
+        if (rt === 'RT-CUR') {
+          return new Response(JSON.stringify({ error: 'service unavailable' }), { status: 503 })  // 重试：仍非终态
+        }
+        return grantOk(1)                                                      // 历史代际：成功
+      }) as never,
+    })
+    const pool = { listAccounts: async () => [], updateAccount: async () => {} } as never
+    const out = await auth.renewEntry(pool, { id: 'sv2', credentialRef: REF, refreshable: true, expiresAt: 0 }, {
+      force: true,
+      trigger: 'patrol',
+    } as never)
+    expect(tried, '★★ 必须试过历史代际（修前这一格跳过全部历史）').toContain('RT-OLD')
+    expect(out.renewed, '历史代际有效 ⇒ 应当救回').toBe(true)
+  })
+
+  it('★ 没有历史代际时，非终态仍如实抛出（不得吞掉网络错误）', async () => {
+    const store = new Map([[REF, JSON.stringify(credential(-60_000, { refresh_token: 'RT-ONLY' }))]])
+    const { auth } = makeEnv({
+      store,
+      sleep: async () => {},
+      fetcher: (async () => { throw new TypeError('fetch failed') }) as never,
+    })
+    const pool = { listAccounts: async () => [], updateAccount: async () => {} } as never
+    await expect(
+      auth.renewEntry(pool, { id: 'sv2', credentialRef: REF, refreshable: true, expiresAt: 0 }, {
+        force: true,
+        trigger: 'patrol',
+      } as never),
+    ).rejects.toThrow(/fetch failed/)
+  })
+})
+
+describe('★★ `refresh()`（默认单凭据路径）也必须走单飞（第二轮审计打穿）', () => {
+  // ⚠️ `refresh()` 走的是**产品声明的默认单凭据 ref**（不是 `MINIMAX_ACCOUNT_*`）
+  const REF = 'MINIMAX_ACCESS_TOKEN'
+
+  it('★★ 并发 2 次 `refresh()` ⇒ 只发 1 份 grant（修前「同时在飞峰值 2」）', async () => {
+    /**
+     * ⚠️ 两个入口：
+     * - 有池时 `index.ts` 的 refresh 闭包走 `refreshAccountCredential`；
+     * - **池里取不到号时它退到 `refresh()`**（本方法的默认单凭据路径）。
+     * 修前 `refresh()` 自己直接 `refreshMinimaxCredential` + `set`，**完全在
+     * `renewInFlight` 之外** ⇒ 并发两次就各烧一把一次性 RT。
+     */
+    const store = new Map([[REF, JSON.stringify(credential(10 * 60_000, { refresh_token: 'RT-S' }))]])
+    let grants = 0
+    const { auth } = makeEnv({
+      store,
+      fetcher: (async () => {
+        grants += 1
+        await new Promise((r) => setTimeout(r, 20))
+        return grantOk(grants)
+      }) as never,
+    })
+    await Promise.all([auth.refresh(), auth.refresh()])
+    expect(
+      grants,
+      '★ 单凭据路径绕过单飞 ⇒ 两路各消费一次一次性 refresh_token（输家 invalid_grant）',
+    ).toBe(1)
+  })
+})
+
+// ─────────────────────────────────────────────────────────────
+// ⑪ CAS 的 fail-open（第二轮审计打穿：重读失败退回旧快照）
+// ─────────────────────────────────────────────────────────────
+
+describe('★★ repairAccountNicknames 的 CAS：重读失败时**绝不写盘**', () => {
+  const REF = 'MINIMAX_ACCOUNT_CASF'
+
+  it('★★ 写前重读失败（resolve 返回空）⇒ 一个字节都不写（否则覆盖他处新 RT）', async () => {
+    /**
+     * ⚠️⚠️ 修前是 `const base = latestCredential ?? credential` —— 那一行等于
+     * 「重读失败 ⇒ 用**我们手里那份旧凭据**展开整体 `set`」，**恰好又回到**
+     * 该段注释要修的那个缺陷（用旧快照覆盖别人的新会话）。
+     * 审计实测：盘上已是 `NEW_RT`、第二次 `resolve` 失败 ⇒ 落盘被写回 `OLD_RT`
+     * ⇒ 一次性 RT 语义下**账号报废**。
+     */
+    const store = new Map([[REF, JSON.stringify(credential(-60_000, {
+      refresh_token: 'RT-OLD', nickname: 'old-name',
+    }))]])
+    let resolves = 0
+    const writes: string[] = []
+    const ctx = new Context()
+    ctx.provide('credentials', {
+      resolve: async (ref: unknown) => {
+        resolves += 1
+        // ⚠️ 第 1 次 = 进循环时读凭据；第 2 次 = 写盘前的重读 ⇒ 让它失败
+        if (resolves >= 2) return undefined
+        return { value: store.get(String(ref)) }
+      },
+      set: async (ref: unknown, value: string) => {
+        writes.push(JSON.parse(value).refresh_token)
+        store.set(String(ref), value)
+      },
+      describe: async () => ({ source: 'file' }),
+    } as never)
+    const auth = new MinimaxAuth(ctx, {
+      product: MINIMAX,
+      sleep: async () => {},
+      fetchImpl: (async (url: string) => {
+        if (String(url).includes('user')) {
+          return new Response(JSON.stringify({
+            statusInfo: { code: 0 }, data: { userInfo: { name: 'NEW_N', userID: 'u9' } },
+          }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+        }
+        return grantOk(1)
+      }) as never,
+    })
+    const entry = { id: 'casf', credentialRef: REF, refreshable: true, enabled: true, nickname: 'old-name' }
+    const pool = {
+      listAccounts: async () => [entry],
+      listAccountsByProvider: () => [entry],
+      updateAccount: async () => {},
+      findAccountIdByCredential: async () => 'casf',
+    } as never
+    await auth.repairAccountNicknames(pool)
+    expect(
+      writes,
+      '★★ 重读失败却仍写了盘 ⇒ `base` 退回了旧快照，把他处刚轮换的新 token 覆盖成旧的',
+    ).toEqual([])
+    expect(
+      (JSON.parse(store.get(REF) as string) as { refresh_token: string }).refresh_token,
+      '盘上必须仍是原值（未被旧快照覆盖）',
+    ).toBe('RT-OLD')
+  })
+
+  it('★ 对照：重读成功时必须在**最新那份**上合并身份字段', async () => {
+    const store = new Map([[REF, JSON.stringify(credential(-60_000, {
+      refresh_token: 'RT-OLD', nickname: 'old-name',
+    }))]])
+    let resolves = 0
+    const ctx = new Context()
+    ctx.provide('credentials', {
+      resolve: async (ref: unknown) => {
+        resolves += 1
+        if (resolves === 2) {
+          // ⚠️ 模拟「他处刚轮换」：重读拿到的是新令牌材料
+          store.set(String(ref), JSON.stringify(credential(-60_000, {
+            refresh_token: 'RT-NEW-BY-OTHER', nickname: 'old-name',
+          })))
+        }
+        return { value: store.get(String(ref)) }
+      },
+      set: async (ref: unknown, value: string) => { store.set(String(ref), value) },
+      describe: async () => ({ source: 'file' }),
+    } as never)
+    const auth = new MinimaxAuth(ctx, {
+      product: MINIMAX,
+      sleep: async () => {},
+      fetchImpl: (async (url: string) => {
+        if (String(url).includes('user')) {
+          return new Response(JSON.stringify({
+            statusInfo: { code: 0 }, data: { userInfo: { name: 'NEW_N', userID: 'u9' } },
+          }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+        }
+        return grantOk(1)
+      }) as never,
+    })
+    const entry = { id: 'casf', credentialRef: REF, refreshable: true, enabled: true, nickname: 'old-name' }
+    const pool = {
+      listAccounts: async () => [entry],
+      listAccountsByProvider: () => [entry],
+      updateAccount: async () => {},
+      findAccountIdByCredential: async () => 'casf',
+    } as never
+    await auth.repairAccountNicknames(pool)
+    const final = JSON.parse(store.get(REF) as string) as { refresh_token: string; nickname?: string; user_id?: string }
+    expect(final.refresh_token, '★ 他处轮换的新 RT 必须保住').toBe('RT-NEW-BY-OTHER')
+    expect(final.nickname, '身份字段要补在最新那份上').toBe('NEW_N')
+    expect(final.user_id).toBe('u9')
+  })
+})

@@ -25,7 +25,7 @@ import {
   autoclawAccessTokenExpiresAtMs,
   type AutoclawCredential,
 } from './autoclaw.js'
-import { refreshFailureFromResponse } from './refresh-failure.js'
+import { isDefinitiveRefreshRejection, refreshFailureFromResponse } from './refresh-failure.js'
 
 export const AUTOCLAW_SEND_CODE_PATH = '/userapi/v1/agent-send-code'
 export const AUTOCLAW_LOGIN_PATH = '/userapi/v1/agent-login'
@@ -480,6 +480,18 @@ export async function refreshAutoclawToken(
         } catch {
           parsed = undefined
         }
+        /**
+         * ⚠️⚠️ **必须按业务码信封的键读 `msg`**（2026-10-27 第二轮审计打穿）。
+         *
+         * 本家的「token 无效」有两种载体：OAuth 的 `{error}` 与**业务码信封**
+         * 的 `{code, msg}`。修前这里用默认键 `'error'` ⇒ 遇到
+         * `HTTP 400 {code:401,msg:"Invalid token"}` 时 `oauthError` 是
+         * `undefined` ⇒ 终态判据拿不到结构化信息，只能退回文案启发式（而文案里
+         * 那句 `msg` 还会被整段拼进 message ⇒ 既可能漏判、又丢失原文）。
+         *
+         * ⇒ `refreshFailureFromResponse` 现在**两把键都读**（见其 doc），
+         *   这里不必再改调用点形态。
+         */
         throw refreshFailureFromResponse(
           `AutoClaw token refresh failed`,
           resp.status,
@@ -556,7 +568,20 @@ export async function refreshAutoclawToken(
         device_id: deviceId,
       }
     } catch (err) {
-      lastError = err instanceof Error ? err : new Error(String(err))
+      const error = err instanceof Error ? err : new Error(String(err))
+      /**
+       * ⚠️⚠️ **别让瞬时的端点错误掩盖确定性拒绝**（2026-10-27 第二轮审计打穿）。
+       *
+       * 本函数**依次试两个端点**。修前无条件覆盖：
+       * 端点1 回 `400 invalid_grant`（上游明确说这把 RT 死了）、端点2 回 `503`
+       * （网关瞬时抖动）⇒ 最终抛的是 **503** ⇒ 上层判据看不到那次确定性拒绝
+       * ⇒ 真死号不标死、退化成每轮白撞。
+       *
+       * ⇒ 一旦拿到「确定性拒绝」，就**锁定它**（后续端点的错误不再覆盖）。
+       */
+      if (lastError === undefined || !isDefinitiveRefreshRejection(lastError)) {
+        lastError = error
+      }
     }
   }
 

@@ -1016,6 +1016,36 @@ describe('MinimaxAdapter 请求级账号轮换（余额耗尽无感切号）', (
     expect(warnings[0]).toContain('续期失败')
   })
 
+  it('★★ 401 且续期抛「RT 已死」⇒ 必须报可诊断文案，**不得**吞成 `AUTH`', async () => {
+    /**
+     * ⚠️⚠️ 修前这一格是裸 `await this.options.refresh()` + 统一抛
+     * `new LlmError('…refresh failed', 'AUTH')` —— 而 `AUTH` 会被客户端
+     * **替换成固定文案「API 密钥无效」并丢掉原文**（本仓库既有纪律 `IKLBSH`：
+     * 凡「文案本身就是出路」的错误一律避开 `AUTH`）。
+     *
+     * 后果：用户只看到「API 密钥无效」，而真正该看到的是**「请重新登录」**。
+     */
+    const adapter = makeRotateAdapter({
+      resolveCredential: async () => ({ ...CRED_A, expires_at: String(Date.now() + 3_600_000) }),
+      refresh: async () => {
+        const error = new Error('refresh_token 已失效，请重新登录')
+        error.name = 'MinimaxRefreshTokenExpiredError'
+        throw error
+      },
+    })
+    const fetcher = (async () => new Response('{"code":401,"message":"auth failed"}', { status: 401 })) as typeof fetch
+    const { error } = await withFetch(fetcher, () => collect(adapter))
+    expect(error, '401 + RT 已死应当抛出可诊断错误').toBeDefined()
+    expect(
+      (error as { code?: string }).code,
+      '★ 用了 `AUTH` ⇒ 客户端会把 message 整个换成「API 密钥无效」，用户看不到「请重新登录」',
+    ).not.toBe('AUTH')
+    expect(
+      String((error as Error).message),
+      '★ 指路文案（请重新登录）必须留在 message 里',
+    ).toContain('重新登录')
+  })
+
   it('★ 401 授权失败：先续期一次、再换号，且**绝不写冷却标记**', async () => {
     const { pool, marks, picks } = makePoolStub()
     let refreshCalls = 0
