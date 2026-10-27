@@ -1,15 +1,6 @@
 import type { AccountPool } from './account-pool.js'
 import type { ProviderAccountEntry } from './types.js'
 import { REFRESH_LEAD_MS } from './refresh.js'
-/**
- * ⚠️ 只在「续期成功但落盘失败」时用来抛**终态**（见
- * `refreshAccountWithReconcile` 的注释）。
- *
- * 复用 codearts 侧的同一个类而不是新定义一个：各家 `refreshAll` 的终态判据
- * 都是 `instanceof RefreshTokenExpiredError`，新类会让九家全部失效。
- * 依赖方向是单向的（`oauth.ts` 只 import `types.js`），不构成循环。
- */
-import { RefreshTokenExpiredError } from './oauth.js'
 
 /**
  * 账号池「有效期」的共享回写与 lead-time 判据。
@@ -253,6 +244,15 @@ export async function refreshAccountWithReconcile<TCredential>(params: {
   refresh: (credential: TCredential) => Promise<TCredential>
   /** 续期成功后写回凭据存储。 */
   save: (credential: TCredential) => Promise<void>
+  /**
+   * 造出**本家**的「refresh_token 已失效」错误（见 `refreshAccountWithReconcile`
+   * 里落盘失败那一节）。
+   *
+   * ⚠️ **必填，且必须传自己那家的类**：各 provider 的 `refreshAll` 判的是自己
+   * 定义的同名类的 `instanceof`，共享模块借用任何一家的类都会让另外八家把
+   * 「凭据已死」当非终态 ⇒ 静默死号。必填是为了让漏接线在 `tsc` 就红。
+   */
+  makeTerminalError: (message: string) => Error
   warn?: (message: string) => void
   info?: (message: string) => void
 }): Promise<boolean> {
@@ -306,12 +306,25 @@ export async function refreshAccountWithReconcile<TCredential>(params: {
    *
    * ⇒ 必须抛**终态错误**，让调用方走「需重新登录」分支。
    *
-   * ## 为什么用 `RefreshTokenExpiredError` 而不是新错误类
+   * ## ⚠️⚠️ 终态错误的**类型必须由调用方给**（PR159 首版缺陷，2026-10-28 修）
    *
-   * 本模块被九家 provider 共用，不能只为 codearts 引入耦合（`oauth.js` 的
-   * 错误类在 codearts 侧）。而各家的 `refreshAll` 都已按
-   * `RefreshTokenExpiredError` 判终态 —— 复用同一个语义类，**九家同时受益**：
-   * officeace 文档里同样记着「先到者写盘前被打断 ⇒ 新 token 永久丢失」。
+   * 首版让本模块 `import { RefreshTokenExpiredError } from './oauth.js'`
+   * （codearts 的类），注释声称「各家 `refreshAll` 都按
+   * `instanceof RefreshTokenExpiredError` 判终态 ⇒ **九家同时受益**」。
+   * **这句不成立**：每家都有**自己的**同名类（buddy 用 `buddy-oauth.ts` 的、
+   * trae / qoder / cline / lobsterai 各自在 auth 文件里定义、gemini 是
+   * `GeminiRefreshTokenExpiredError`、minimax 是 `MinimaxRefreshTokenExpiredError`、
+   * accio 是 `AccioRefreshTokenExpiredError`），跨模块 `instanceof` **恒为 false**
+   * ⇒ 另外 8 家仍落「非终态」分支，账号照样静默死 —— 正是本修复要治的病。
+   *
+   * 另一种写法（本模块自定义一个中立类）同样不行：它不属于任何一家的判据。
+   * ⇒ 只能由调用方把自己的类**注入**进来（`makeTerminalError`）。
+   *
+   * ## 为什么该参数是**必填**而不是可选带默认值
+   *
+   * 可选 + 默认 = 「漏接线」是**静默**的（退回普通 Error ⇒ 又变回静默死号），
+   * 正是本缺陷的形态。必填 ⇒ 任何新增的调用点漏传都会在 `tsc --noEmit` 变红，
+   * 不依赖人记得。实测接线点：九家、共 10 处（gemini 有两处）。
    *
    * ⚠️ `save()` 抛的是**存储层**错误（权限/磁盘满/序列化），不是网络错误，
    * 且此刻服务端票据已消耗 ⇒ 重试无意义，**不属可自愈类**。
@@ -329,7 +342,7 @@ export async function refreshAccountWithReconcile<TCredential>(params: {
       + `${error instanceof Error ? error.message : String(error)}`
       + ` ⇒ refresh_token 已在服务端被消耗，本地凭据已失效，需重新登录`,
     )
-    throw new RefreshTokenExpiredError(
+    throw params.makeTerminalError(
       `${tag} 账号 ${accountId} 续期成功但**新凭据落盘失败**：`
       + `${provider} 的 refresh_token 是一次性的，服务端那份已被消耗，`
       + `本地仍停留在旧 token 上，继续重试只会得到「已被使用」⇒ 必须重新登录。`
