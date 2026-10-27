@@ -953,7 +953,11 @@ describe('MinimaxAdapter 请求级账号轮换（余额耗尽无感切号）', (
     }) as typeof fetch
 
     const adapter = makeRotateAdapter({
-      resolveCredential: async () => CRED_A,
+      // ⚠️ 2026-10-24 本地试验版：请求前预判从「已过期」收紧为「剩余 <60s」，
+      //    且**读不到过期时间视为该续**（与 shouldRefreshNow 同口径）——
+      //    故本用例的凭据必须给一个**远在未来**的 `expires_at`，
+      //    让预判不触发，单独守 401 路径（临期路径有专门用例守）。
+      resolveCredential: async () => ({ ...CRED_A, expires_at: String(Date.now() + 3_600_000) }),
       accountPool: pool,
       refresh: async () => { refreshCalls += 1 },
     })

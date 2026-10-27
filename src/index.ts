@@ -117,6 +117,8 @@ import { fetchAutoclawBalanceDetailed, fetchAutoclawCreditBalance } from './auto
 import type { RaccoonCredential } from './raccoon.js'
 import { MinimaxAuth } from './minimax-auth.js'
 import { registerMinimaxLlm } from './minimax-adapter.js'
+// ⚠️ 2026-10-24 本地试验版：journal 落盘根目录（`~/.dsh`，与 state.json 同源）。
+import { resolveJetHubHome } from './jet-hub-store.js'
 // ⚠️ MiniMax 国际站的**账号出口代理**解析器（与 gemini 同款：实例住在被依赖
 //    方向的下游，避免 `index → jet-hub-rpc → index` 的 ESM 环 —— 那条环会把
 //    引用变成 TDZ ⇒ 静默恒直连）。
@@ -3095,7 +3097,14 @@ export function apply(ctx: Context): void {
         pool.minimaxXff(),
       ),
   })
-  const minimax = new MinimaxAuth(ctx)
+  const minimax = new MinimaxAuth(ctx, {
+    // ⚠️ 2026-10-24 本地试验版：续期/身份 journal（`refresh-journal.jsonl`）。
+    journalHome: resolveJetHubHome(ctx),
+  })
+  // ⚠️ 2026-10-24 本地试验版：记住「上一次选中的账号」，401/临期续期时
+  //    **精准续它** —— 旧写法续的是「池内第一个可用账号」，那可能是另一个号
+  //    （选号器与 401 时刻之间隔着一整轮请求，池序没变但账号状态变了）。
+  let lastPickedMinimaxAccount = ''
   const minimaxAdapter = registerMinimaxLlm(ctx, {
     credentialRef: credentialRef(MINIMAX.defaultCredentialRef),
     // provider 实参用 MINIMAX 而非字面量：写死字面量在改名/多产品场景下
@@ -3103,7 +3112,10 @@ export function apply(ctx: Context): void {
     // ⚠️ 只从 minimax 自己的账号池取账号，回退到自己的单凭据 ref，
     // 保证不会串用其它 provider 的凭据。
     resolveCredential: createCredentialResolver<MinimaxCredential>(
-      { pool, reportAccount: (id) => { if (id !== undefined) reportLedgerAccount(MINIMAX.id, id) } },
+      { pool, reportAccount: (id) => {
+          if (id !== undefined) lastPickedMinimaxAccount = id
+          if (id !== undefined) reportLedgerAccount(MINIMAX.id, id)
+        } },
       {
         product: MINIMAX,
         // ⚠️ 与选号器**共用同一个**解析器（原先这里是一份内联的匿名箭头，
@@ -3151,20 +3163,22 @@ export function apply(ctx: Context): void {
       // ⚠️ MiniMax **有** refresh 端点（`/oauth2/token` 的 refresh_token 授权），
       // 这里是真续期（与 Loomy 的「只能探测有效性」不同）。
       //
-      // 仍须刷新**解析凭据时所用的那一个**账号，而不是默认单凭据 ref ——
-      // 否则续期的是另一份凭据，用户会看到「刚登录好却一直认证失败」。
-      const available = await pool.getAvailableAccount(MINIMAX.id, '')
-      if (available) {
+      // ⚠️ 2026-10-24 本地试验版：**精准续期** —— 优先续「上一次选中的账号」
+      //（401/临期预判都发生在它身上），找不到才退「池内第一个可用账号」。
+      //
+      // ⚠️ 走 `refreshAccountCredential`（lead-aware，1h 窗口）而不是
+      //    `renewEntry(force)`：① 它是 H2 契约的桩点（`refreshAccountCredential`
+      //    被替换成记录器时本闭包必须仍可驱动）；② 1h lead 窗口在巡检
+      //    （5-15min margin ⇒ 续后剩余恒 ~60min）下**恒命中**，401 时必发 grant，
+      //    与旧行为逐字节等价。抢断式强刷已由 `renewEntry` 的巡逻/兜底承担。
+      const entries = await pool.listAccounts(MINIMAX.id)
+      const target = entries.find((e) => e.id === lastPickedMinimaxAccount)
+        ?? (await pool.getAvailableAccount(MINIMAX.id, ''))?.entry
+      if (target !== undefined) {
         // ⚠️ **必须传 pool + entry.id**：续期成功后要把新的 `expiresAt` 写回
-        // 账号池，否则 UI 会一直显示「已过期」而实际能正常发消息
-        //（真实缺陷：JWT 已续到 15:09、账号池仍是 12:02，相差 3.1 小时）。
-        //
-        // ⚠️ `getAvailableAccount` 返回 **`{ entry, credential }`** 两层 ——
-        // 账号 id 与 credentialRef 在 **`available.entry`** 里，**不是**
-        // `available.id` / `available.credentialRef`（那是 `undefined`，
-        // 会让续期**静默写不回账号池**）。
+        // 账号池，否则 UI 会一直显示「已过期」而实际能正常发消息。
         await minimax.refreshAccountCredential(
-          available.entry.credentialRef, pool, available.entry.id,
+          target.credentialRef, pool, target.id,
         )
       } else {
         await minimax.refresh()
@@ -3215,13 +3229,19 @@ export function apply(ctx: Context): void {
   const minimaxIntl = new MinimaxAuth(ctx, {
     product: MINIMAX_INTL,
     fetchFor: minimaxIntlFetchForAccount,
+    journalHome: resolveJetHubHome(ctx),
   })
+  // ⚠️ 与中国版同因（2026-10-24）：记住「上一次选中的账号」，精准续期。
+  let lastPickedMinimaxIntlAccount = ''
   const minimaxIntlAdapter = registerMinimaxLlm(ctx, {
     credentialRef: credentialRef(MINIMAX_INTL.defaultCredentialRef),
     // ⚠️ provider 实参必须是 MINIMAX_INTL：写死 MINIMAX 会让国际站永远查不到
     // 自己的账号（本插件在 workbuddy 上踩过同类坑）。
     resolveCredential: createCredentialResolver<MinimaxCredential>(
-      { pool, reportAccount: (id) => { if (id !== undefined) reportLedgerAccount(MINIMAX_INTL.id, id) } },
+      { pool, reportAccount: (id) => {
+          if (id !== undefined) lastPickedMinimaxIntlAccount = id
+          if (id !== undefined) reportLedgerAccount(MINIMAX_INTL.id, id)
+        } },
       {
         product: MINIMAX_INTL,
         // ⚠️ 与中国版**共用同一个**解析器（见 `resolveMinimaxCredentialByRef` 的说明）。
@@ -3247,13 +3267,14 @@ export function apply(ctx: Context): void {
       },
     ),
     refresh: async () => {
-      // 同中国版：刷新**解析凭据时所用的那一个**账号，不是默认单凭据 ref。
-      const available = await pool.getAvailableAccount(MINIMAX_INTL.id, '')
-      if (available) {
-        // ⚠️ **必须传 pool + entry.id**（两层结构）：否则续期成功后新 `expiresAt`
-        // 写不回账号池，UI 会一直显示「已过期」而实际能正常发消息。
+      // 同中国版（2026-10-24 本地试验版）：**精准续期** —— 优先续「上一次选中
+      // 的账号」，走 `refreshAccountCredential`（lead-aware + 抢救链），理由见上。
+      const entries = await pool.listAccounts(MINIMAX_INTL.id)
+      const target = entries.find((e) => e.id === lastPickedMinimaxIntlAccount)
+        ?? (await pool.getAvailableAccount(MINIMAX_INTL.id, ''))?.entry
+      if (target !== undefined) {
         await minimaxIntl.refreshAccountCredential(
-          available.entry.credentialRef, pool, available.entry.id,
+          target.credentialRef, pool, target.id,
         )
       } else {
         await minimaxIntl.refresh()
@@ -4373,6 +4394,19 @@ const zcodeAdapter = registerZcodeLlm(ctx, {
   }).catch((error: unknown) => {
     ctx.logger.warn(`[jet-hub] 修正 MiniMax 国际版账号显示名失败：${String(error)}`)
   })
+
+  // ===== MiniMax 专属 60s 续期巡检（2026-10-24 本地试验版）=====
+  //
+  // ⚠️⚠️ **这是本次重构的核心**：全局 30min 调度器对 MiniMax 已改为
+  // **只对账**（`MinimaxAuth.refreshAll` 不再发 grant，见该方法注释），
+  // MiniMax 的轮换改由这里承担 —— margin 5min + 账号散列抖动 ⇒
+  // 各账号续期时刻天然错开，旧形态「全池同秒过期」的结构性根因被拆除。
+  //
+  // ⚠️ 两个站点**各一条**（同 repair 的双站点纪律，漏一处即该站静默不续期）。
+  // ⚠️ 请求路径兜底（临期 60s 预判 + 401 强刷）走 adapter 的 `refresh()`
+  //    → `renewEntry(force)`，与本巡检共用单飞闸门，不会并发轮换同一 RT。
+  void minimax.startRenewPatrol(pool)
+  void minimaxIntl.startRenewPatrol(pool)
 
   // ===== 多账号静默续期调度 =====
   // 替代原有的单账号 scheduleRefresh()，使用 refreshAll() 遍历所有账号续期

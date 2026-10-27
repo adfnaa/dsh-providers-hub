@@ -234,9 +234,34 @@ describe('refreshAll', () => {
     expect(updated.some((u) => u.id === 'a1')).toBe(true)
   })
 
-  it('⚠️ 按账号条目自身的 credentialRef 读写凭据（写错 ref 会续错账号）', async () => {
+  it('⚠️ reconcile-only：按账号条目自身的 credentialRef 读凭据对账，但不写凭据（写权在巡检 renewEntry）', async () => {
     const read: string[] = []
     const written: string[] = []
+    const updated: { id: string; patch: unknown }[] = []
+    const pool = {
+      listAccounts: async () => [
+        { id: 'a1', credentialRef: 'MINIMAX_ACCOUNT_A1', refreshable: true, enabled: true, expiresAt: 0 },
+      ],
+      updateAccount: async (id: string, patch: unknown) => { updated.push({ id, patch }) },
+      findAccountIdByCredential: async () => 'a1',
+    }
+    const auth = new MinimaxAuth(makeContext({
+      resolve: async (ref) => { read.push(keyOf(ref)); return { value: JSON.stringify(CRED) } },
+      set: async (ref) => { written.push(keyOf(ref)) },
+    }), { fetchImpl: (async () => refreshOk()) as never })
+    await auth.refreshAll(pool as never)
+    // 对账读的是**自己条目**的 ref（写错 ref 会读错账号）
+    expect(read).toEqual(['MINIMAX_ACCOUNT_A1'])
+    // ⚠️ 2026-10-24 reconcile-only：refreshAll 不发 grant ⇒ **不写凭据** ——
+    //    凭据的写权收口在 renewEntry（60s 巡检 / 请求路径兜底）。
+    expect(written).toEqual([])
+    // 但池镜像必须对账（entry.expiresAt=0 → 凭据真实值），否则 UI 恒显「已过期」
+    expect(updated.some((u) => u.id === 'a1')).toBe(true)
+  })
+
+  it('⚠️ reconcile-only：凭据已过期也**不发请求**（轮换权已移交 60s 巡检）', async () => {
+    const expired = { ...CRED, expires_at: String(Date.now() - 1_000) }
+    const fetcher = vi.fn()
     const pool = {
       listAccounts: async () => [
         { id: 'a1', credentialRef: 'MINIMAX_ACCOUNT_A1', refreshable: true, enabled: true, expiresAt: 0 },
@@ -245,12 +270,161 @@ describe('refreshAll', () => {
       findAccountIdByCredential: async () => 'a1',
     }
     const auth = new MinimaxAuth(makeContext({
-      resolve: async (ref) => { read.push(keyOf(ref)); return { value: JSON.stringify(CRED) } },
-      set: async (ref) => { written.push(keyOf(ref)) },
-    }), { fetchImpl: (async () => refreshOk()) as never })
+      resolve: async () => ({ value: JSON.stringify(expired) }),
+      set: async () => {},
+    }), { fetchImpl: fetcher as never })
     await auth.refreshAll(pool as never)
-    expect(read).toEqual(['MINIMAX_ACCOUNT_A1'])
-    expect(written).toEqual(['MINIMAX_ACCOUNT_A1'])
+    // ⚠️ 这是本次重构的**核心断言**：定时批量轮换必须消失，轮换只由
+    //    60s 巡检（renewEntry）与请求路径兜底承担（官方 oauth-core 即按需制）。
+    expect(fetcher).not.toHaveBeenCalled()
+  })
+})
+
+/**
+ * ★★ **renewEntry**（2026-10-24 本地试验版：60s 巡检 / 精准续期 / 401 强刷
+ * 共用的核心入口）。
+ *
+ * ## 守的纪律（缺一都是事故）
+ *
+ * - **margin**：剩余有效期远超 margin 时绝不发请求（轮换次数 = 风险预算）；
+ * - **写回自己的 ref**：per-ref 读写（「续错账号」的老缺陷防线，语义从
+ *   refreshAll 迁移到这里）；
+ * - **previous_refresh_tokens**：旧 RT 压栈（新→旧、去重、截 3 条）；
+ * - **CAS**：grant 前后重读凭据，被别人写过就丢弃（绝不覆盖更新的会话）；
+ * - **单飞**：同 ref 并发只发一份 grant；
+ * - **终态**：当前 RT 死了先回退历史代际，全失败才标 `refreshable:false`。
+ */
+describe('renewEntry（2026-10-24 本地试验版）', () => {
+  const ENTRY = { id: 'a1', credentialRef: 'MINIMAX_ACCOUNT_A1', refreshable: true } as const
+
+  /**
+   * 造一个**可变凭据存储** + 真实 Context 的续期环境。
+   *
+   * ⚠️ `journalHome` 刻意不传 ⇒ journal **绝不写盘**（单测不得污染用户 `~/.dsh`）。
+   */
+  function makeRenewEnv(options: {
+    store: Map<string, string>
+    fetcher: typeof fetch
+    sleep?: (ms: number) => Promise<void>
+  }) {
+    const written: Array<{ ref: string; value: string }> = []
+    const updated: Array<{ id: string; patch: unknown }> = []
+    const ctx = new Context()
+    ctx.provide('credentials', {
+      resolve: async (ref: unknown) => {
+        const value = options.store.get(keyOf(ref))
+        return value === undefined ? undefined : { value }
+      },
+      set: async (ref: unknown, value: string) => {
+        const name = keyOf(ref)
+        written.push({ ref: name, value })
+        options.store.set(name, value)
+      },
+    } as never)
+    const auth = new MinimaxAuth(ctx, {
+      fetchImpl: options.fetcher as never,
+      ...(options.sleep === undefined ? {} : { sleep: options.sleep }),
+    })
+    const pool = {
+      listAccounts: async () => [ENTRY],
+      updateAccount: async (id: string, patch: unknown) => { updated.push({ id, patch }) },
+      findAccountIdByCredential: async () => 'a1',
+    }
+    return { auth, pool, written, updated }
+  }
+
+  it('⚠️ 剩余远超 margin ⇒ 不发请求（轮换次数是风险预算）', async () => {
+    const store = new Map([['MINIMAX_ACCOUNT_A1', JSON.stringify(CRED)]]) // 1h 后过期
+    const fetcher = vi.fn()
+    const { auth, pool } = makeRenewEnv({ store, fetcher })
+    const out = await auth.renewEntry(pool, ENTRY, { marginMs: 5 * 60_000, trigger: 'patrol' })
+    expect(out.renewed).toBe(false)
+    expect(fetcher).not.toHaveBeenCalled()
+  })
+
+  it('⚠️ 已过期 ⇒ 发 grant、写回**自己的 ref**、池镜像更新、旧 RT 压入历史栈', async () => {
+    const expired = { ...CRED, expires_at: String(Date.now() - 1_000) }
+    const store = new Map([['MINIMAX_ACCOUNT_A1', JSON.stringify(expired)]])
+    const fetcher = vi.fn(async () => refreshOk())
+    const { auth, pool, written, updated } = makeRenewEnv({ store, fetcher })
+    const out = await auth.renewEntry(pool, ENTRY, { marginMs: 5 * 60_000, trigger: 'patrol' })
+    expect(out.renewed, '临期账号必须真的续期').toBe(true)
+    // 写回**自己的 ref**（续错账号的老缺陷防线，语义从 refreshAll 迁到这里）
+    expect(written.map((w) => w.ref)).toEqual(['MINIMAX_ACCOUNT_A1'])
+    const payload = JSON.parse(written[0]!.value) as {
+      access_token: string
+      previous_refresh_tokens?: string[]
+    }
+    expect(payload.access_token).toBe('n'.repeat(60))
+    expect(payload.previous_refresh_tokens, '旧 RT 必须压入历史栈（断链抢救的弹药）')
+      .toEqual([CRED.refresh_token])
+    expect(updated.some((u) => u.id === 'a1'), '池镜像必须跟着更新（UI 读池值）').toBe(true)
+  })
+
+  it('⚠️ 单飞：同 ref 并发只发一份 grant', async () => {
+    const expired = { ...CRED, expires_at: String(Date.now() - 1_000) }
+    const store = new Map([['MINIMAX_ACCOUNT_A1', JSON.stringify(expired)]])
+    let release!: () => void
+    const gate = new Promise<void>((resolve) => { release = resolve })
+    const fetcher = vi.fn(async () => { await gate; return refreshOk() })
+    const { auth, pool } = makeRenewEnv({ store, fetcher })
+    const first = auth.renewEntry(pool, ENTRY, { marginMs: 5 * 60_000, trigger: 'patrol' })
+    const second = auth.renewEntry(pool, ENTRY, { marginMs: 5 * 60_000, trigger: 'patrol' })
+    release()
+    await Promise.all([first, second])
+    expect(fetcher, '巡检/兜底/强刷并发想续同一账号时，只允许一份 grant 在天上').toHaveBeenCalledTimes(1)
+  })
+
+  it('⚠️ CAS：grant 期间凭据被别人改写 ⇒ 丢弃结果（绝不覆盖更新的会话）', async () => {
+    const expired = { ...CRED, expires_at: String(Date.now() - 1_000) }
+    const store = new Map([['MINIMAX_ACCOUNT_A1', JSON.stringify(expired)]])
+    const fetcher = vi.fn(async () => {
+      // ⚠️ grant 在天上时「别的写入方」落盘了一份新会话 —— 模拟登录并发。
+      store.set('MINIMAX_ACCOUNT_A1', JSON.stringify({
+        ...CRED,
+        access_token: 'b'.repeat(60),
+        expires_at: String(Date.now() + 3_600_000),
+      }))
+      return refreshOk()
+    })
+    const { auth, pool, written } = makeRenewEnv({ store, fetcher })
+    const out = await auth.renewEntry(pool, ENTRY, { marginMs: 5 * 60_000, trigger: 'patrol' })
+    expect(out.renewed).toBe(false)
+    expect(out.superseded, '必须判为「被别人抢先」而不是「续期成功」').toBe(true)
+    expect(written, '★ 覆盖回去等于把新钥匙换成旧钥匙 —— 绝不能写').toEqual([])
+  })
+
+  it('⚠️ 终态：当前 RT invalid_grant → 回退历史代际 RT 成功 ⇒ 凭据救回', async () => {
+    const dead = {
+      ...CRED,
+      expires_at: String(Date.now() - 1_000),
+      previous_refresh_tokens: ['old-rt-1'],
+    }
+    const store = new Map([['MINIMAX_ACCOUNT_A1', JSON.stringify(dead)]])
+    const fetcher = vi.fn(async (_url: unknown, init?: RequestInit) => {
+      const body = String(init?.body)
+      // 当前 RT 已死；上一代 RT 仍活着（上游只作废被用的那条的假说成立形态）
+      return body.includes('old-rt-1') ? refreshOk() : json({ error: 'invalid_grant' }, 400)
+    })
+    const { auth, pool, written } = makeRenewEnv({ store, fetcher })
+    const out = await auth.renewEntry(pool, ENTRY, { marginMs: 5 * 60_000, trigger: 'patrol' })
+    expect(out.renewed, '★ 旧代际救回 = 账号免于重登（本特性的全部意义）').toBe(true)
+    const payload = JSON.parse(written[0]!.value) as { access_token: string }
+    expect(payload.access_token).toBe('n'.repeat(60))
+  })
+
+  it('⚠️ 终态全失败（无历史代际）⇒ 抛终态错误 + 池标 refreshable:false', async () => {
+    const dead = { ...CRED, expires_at: String(Date.now() - 1_000) }
+    const store = new Map([['MINIMAX_ACCOUNT_A1', JSON.stringify(dead)]])
+    const fetcher = vi.fn(async () => json({ error: 'invalid_grant' }, 400))
+    const { auth, pool, updated } = makeRenewEnv({ store, fetcher })
+    await expect(
+      auth.renewEntry(pool, ENTRY, { marginMs: 5 * 60_000, trigger: 'patrol' }),
+    ).rejects.toBeInstanceOf(MinimaxRefreshTokenExpiredError)
+    expect(
+      updated.some((u) => u.id === 'a1' && (u.patch as { refreshable?: boolean }).refreshable === false),
+      '全失败必须标记需重登（与旧 refreshAll 终态行为一致）',
+    ).toBe(true)
   })
 })
 

@@ -13,8 +13,8 @@
  * | `nickname` | 账号卡片退回内部 id `minimax-xxxx`（IKP8UA 复发） |
  * | `user_id` | **同账号去重失去唯一判据** ⇒ 一个号可以无限建卡、各持一份 token |
  *
- * 定时续期是 30 分钟一轮、`SELF_HEAL_REFRESHABLE_PROVIDERS` 还会在积分查询前
- * 补一次 ⇒ 这个丢失**必然发生**，不是边角情况。
+ * 续期由 **60s 巡检 + 请求前预判 + 401 强刷**驱动（远比 30 分钟一轮频繁）、
+ * `SELF_HEAL_REFRESHABLE_PROVIDERS` 还会在积分查询前补一次 ⇒ 这个丢失**必然发生**，不是边角情况。
  *
  * 本机实测（2026-10-24）：`.credentials.yaml` 里三份 `MINIMAX_*` 凭据**零份**
  * 带 `user_id`、仅一份带 `nickname`。
@@ -210,21 +210,37 @@ describe('★★ 真跑一次续期：落盘凭据里身份必须还在（行为
    * ⇒ 补一条**纯源码**断言，它在任何环境都能跑。
    * ⚠️ 但它只是替代品，不是等价物：真正的行为判据仍是上面那格（完整安装时生效）。
    */
-  it('★★ refreshCredentialFor 必须调用 inheritMinimaxIdentity（缺 cordis 时的唯一守卫）', () => {
+  it('★★ 续期出口必须调用 inheritMinimaxIdentity（缺 cordis 时的唯一守卫）', () => {
     const src = readFileSync(resolve(here, '../../src/minimax-auth.ts'), 'utf8')
-    // 只看 refreshCredentialFor 方法体，避免被别处的同名字样满足。
-    const start = src.indexOf('async refreshCredentialFor(')
-    expect(start, 'minimax-auth.ts 找不到 refreshCredentialFor（改名/搬走了？）').toBeGreaterThan(-1)
-    const end = src.indexOf('\n  /**', start + 10)
-    const body = src.slice(start, end > start ? end : start + 4000)
+    /** 取某个方法的方法体（到下一个 `\n  /**` 或 8KB 封顶，避免被别处同名字样满足）。 */
+    const bodyOf = (signature: string): string => {
+      const start = src.indexOf(signature)
+      expect(start, `minimax-auth.ts 找不到 ${signature}（改名/搬走了？）`).toBeGreaterThan(-1)
+      const end = src.indexOf('\n  /**', start + signature.length)
+      return src.slice(start, end > start ? end : start + 8000)
+    }
+
+    // ⚠️ 2026-10-27 rebase 适配：本地重构把「继承」收口到**唯一的 grant 出口**
+    //    `grantOnce`，中间多了一层抢救（`grantWithSalvage`：非终态重试 + 旧 RT
+    //    回退）。判据随之**沿链**走 —— 钉住的东西没变：把
+    //    `return inheritMinimaxIdentity(refreshed, credential)` 改回
+    //    `return refreshed`，本用例仍精确变红。
+    const grant = bodyOf('private async grantOnce(')
     expect(
-      body,
+      grant,
       '★★ 续期没有继承身份字段 ⇒ 每续期一次就丢 nickname/user_id'
-      + '（去重失效 + 卡片退回内部 id），且定时续期 30 分钟一轮 ⇒ 必然复发',
+      + '（去重失效 + 卡片退回内部 id），且巡检/请求路径都会续期 ⇒ 必然复发',
     ).toContain('inheritMinimaxIdentity(')
-    expect(body, '★ 继承必须作用在**新**凭据与**旧**凭据之间').toMatch(
+    expect(grant, '★ 继承必须作用在**新**凭据与**旧**凭据之间').toMatch(
       /inheritMinimaxIdentity\(\s*refreshed\s*,\s*credential\s*\)/,
     )
+
+    // ★ 链路自证：这两跳任一被删，「继承」就永远到不了续期路径，而上面两条
+    //   （只看 `grantOnce` 本体）**仍然全绿** ⇒ 必须逐跳钉住。
+    expect(bodyOf('async refreshCredentialFor('), '★ refreshCredentialFor 必须走抢救链')
+      .toMatch(/return this\.grantWithSalvage\(/)
+    expect(bodyOf('private async grantWithSalvage('), '★ 抢救链必须落到唯一 grant 出口')
+      .toContain('this.grantOnce(')
   })
 })
 
@@ -238,7 +254,7 @@ describe('★★ 真跑一次续期：落盘凭据里身份必须还在（行为
  * —— 而「返回空」恰好是**同账号去重把两张卡都停用**之后的形态。该路径此前直接
  * `set(refreshMinimaxCredential(...))`，实测续期后落盘只剩令牌五件套
  * （`nickname` / `user_id` 双双消失）⇒ IKP8UA 复发 + 去重失去判据，
- * 且每 30 分钟一轮必然复现。
+ * 且巡检/请求路径都会续期 ⇒ 必然复现。
  *
  * ⚠️ 判据必须看**落盘内容**（不是看函数有没有调用继承）：只断言「调了」的写法
  * 在「调了但没用返回值」时仍然绿。
