@@ -25,7 +25,7 @@ import {
 } from './minimax-product.js'
 import { fetchMinimaxUserIdentity } from './minimax-identity.js'
 import { appendMinimaxJournal, type MinimaxJournalTrigger } from './minimax-refresh-journal.js'
-import { resolveJetHubHome } from './jet-hub-store.js'
+import { isTerminalRefreshFailure, isRefreshTransportFailure } from './refresh-failure.js'
 import {
   inheritMinimaxIdentity,
   fallbackToEntry,
@@ -136,19 +136,78 @@ const MINIMAX_PREVIOUS_REFRESH_TOKENS = 3
  *
  * ⚠️ 必须确定性（不能每次随机）：同一条账号的续期时刻要在**周期之间稳定**，
  * 否则「错峰」退化为「洗牌」。djb2 足够 —— 这里不需要密码学强度。
+ *
+ * ⚠️ **导出仅供测试**（2026-10-27 审计修）：本函数是「拆掉全池同秒过期」的
+ * **唯一机制**，而修前它在 `tests/` 下**零命中** —— 把它改成 `() => 0`
+ * 全量测试**一个字都不变**（实测）。导出让守卫能直接打它的取值域与确定性。
  */
-function renewJitterMs(accountId: string, spanMs: number): number {
+export function renewJitterMs(accountId: string, spanMs: number): number {
+  // ⚠️ `span <= 0` ⇒ 恒 0：`% 0` 是 `NaN`，而 `NaN` 会让续期阈值变成 `NaN`
+  //    ⇒ `expiresAt - now > NaN` 恒 `false` ⇒ **每轮都续**（把巡检退化成
+  //    30s 一次的全量轮换）。这是「零除」在定时判据里的真实后果。
+  if (!Number.isFinite(spanMs) || spanMs <= 0) return 0
   let hash = 5381
   for (let i = 0; i < accountId.length; i++) {
     hash = ((hash << 5) + hash + accountId.charCodeAt(i)) | 0
   }
-  return Math.abs(hash) % spanMs
+  // ⚠️ `Math.abs` 对 `-2147483648` 仍是负数（`|0` 的边界）⇒ 再 `>>> 0` 归一，
+  //    否则该 id 的抖动会变成**负值**（续期阈值反而变小，错峰方向翻转）。
+  return (Math.abs(hash) >>> 0) % spanMs
 }
 
-/** 判一条错误是不是「refresh_token 已死」的终态（与既有 refreshCredentialFor 同判据）。 */
+/**
+ * 判一条错误是不是「refresh_token 已死」的终态。
+ *
+ * ⚠️⚠️ **判据已收口到共享实现 `src/refresh-failure.ts`**（2026-10-27 审计修）。
+ *
+ * 修前是 `return /invalid_grant|expired|revoked/i.test(message)` —— 与
+ * `autoclaw-auth.ts` 逐字同形的第二份实现，且三处实测把**健康账号**判死：
+ *
+ * | 上游报文 | 修前 | 后果 |
+ * |---|---|---|
+ * | `HTTP 503 {"error":"token expired"}` | 终态 | 网关抖动一次 = 账号需重登 |
+ * | `HTTP 429 {"error":"rate limited, key expired soon"}` | 终态 | 限流一次 = 账号需重登 |
+ * | `fetch failed`（cause: `certificate has expired`） | 终态 | 证书/代理抖动 = 账号需重登 |
+ *
+ * 而池里的 `refreshable:false` 是**单向门**（`refreshAll` 与巡检都会 `continue`），
+ * 一旦误标就**永不自愈** —— 用户看到的就是「要一个个点回来」。
+ *
+ * ⇒ 现在：先排传输层（`certificate has expired` 在这一步被吃掉），再看 HTTP
+ *    状态码（5xx/429/408/401 一律非终态），最后只认结构化的 `invalid_grant`。
+ *    判据的完整理由与三条实测见 `refresh-failure.ts` 的模块头。
+ */
 function isTerminalRefreshError(error: unknown): boolean {
-  const message = error instanceof Error ? error.message : String(error)
-  return /invalid_grant|expired|revoked/i.test(message)
+  return isTerminalRefreshFailure(error)
+}
+
+/**
+ * 合并「历史代际 refresh_token」栈（**新→旧**、去重、截断到上限）。
+ *
+ * ## 为什么需要它（2026-10-27 审计修）
+ *
+ * 两个写入点要**同一口径**：
+ * - `grantOnce`（每次成功续期时把用掉的旧 RT 压栈）；
+ * - `renewEntryInner` 的 CAS 分支（丢弃本次结果时，把**本次新拿到的** RT 也补进去，
+ *   否则那把在上游已轮换的钥匙就永久消失 —— 见该处的长注释）。
+ *
+ * 收成一份纯函数是为了不让「同义判据两份实现」再次发生（本仓库红线）。
+ *
+ * @param existing 已有的历史栈（新→旧）。
+ * @param incoming 要压入的候选（按重要性从高到低；重复的自动丢弃）。
+ * @returns 合并后的栈；**没有任何有效项时返回 `undefined`**（调用方据此跳过写盘）。
+ */
+function mergePreviousRefreshTokens(
+  existing: readonly string[] | undefined,
+  ...incoming: ReadonlyArray<string | undefined>
+): string[] | undefined {
+  const merged: string[] = []
+  for (const token of [...incoming, ...(existing ?? [])]) {
+    if (typeof token !== 'string' || token.length === 0) continue
+    if (merged.includes(token)) continue
+    merged.push(token)
+    if (merged.length >= MINIMAX_PREVIOUS_REFRESH_TOKENS) break
+  }
+  return merged.length === 0 ? undefined : merged
 }
 
 /** 认证服务选项。 */
@@ -235,6 +294,14 @@ export class MinimaxAuth extends Service {
   private patrolTimer: ReturnType<typeof setInterval> | undefined
   /** 巡检防重入：一轮没跑完时跳过本轮（refreshAllCredentials 级别的教训）。 */
   private patrolBusy = false
+  /**
+   * 巡检是否已被显式停止（{@link stopRenewPatrol}）。
+   *
+   * ⚠️ 与 `patrolTimer === undefined` **不是**同一件事：定时器可以被清掉，
+   * 而**在飞的那一轮**（可能正卡在某个 `await grant` 上）仍会继续往下跑。
+   * 本标志让它在下一个账号之前退出，避免「已卸载的实例继续轮换一次性 RT」。
+   */
+  private patrolStopped = false
   /** journal 落盘根目录（`journalHome` 选项；undefined = 不写，见模块注释）。 */
   private readonly journalHome: string | undefined
 
@@ -461,12 +528,10 @@ export class MinimaxAuth extends Service {
    * ⚠️ **走共享实现 `refreshAccountWithReconcile`** —— 它保证「凭据仍有效」时
    * 也把池值对账（见 `refreshAll` 的注释）。
    *
-   * ⚠️⚠️ **2026-10-24 本地试验版：并入单飞闸门**（`renewInFlight`，与
-   * `renewEntry`/巡检共用同一把锁）。这不是洁癖 —— 旧形态下 401 路径与巡检
-   * **并发**对同一 ref 各发一份 grant，轮换式 RT 下**输家拿到 invalid_grant**；
-   * 若输家是巡检，会把账号**误标成需重登**（而赢家明明存下了一份好凭据）。
-   * 汇合语义：巡检的 grant 在天上时，这里**等它落地**再走自己的 lead-aware
-   * 流程（顺序双 grant 无害，并发双 grant 才致命）。
+   * ⚠️⚠️ **并入单飞闸门**（`renewInFlight`，与 `renewEntry`/巡检共用同一把锁）。
+   * 语义是**去重**（命中即在飞任务就等它、**不再发第二份**），不是「串行化」
+   * —— 后者会让并发 N 条各烧一把一次性 RT（2026-10-27 审计打穿的 P0，
+   * 详见方法体内那段注释）。
    */
   async refreshAccountCredential(
     refName: string,
@@ -487,8 +552,31 @@ export class MinimaxAuth extends Service {
       await this.ctx.credentials.set(ref, JSON.stringify(next))
       return
     }
+    /**
+     * ⚠️⚠️ **单飞：命中在飞任务就 await 并返回，绝不再发第二份 grant**。
+     *
+     * 修前（2026-10-27 审计打穿的 P0）：
+     * ```ts
+     * const existing = this.renewInFlight.get(refName)
+     * if (existing !== undefined) await existing.catch(() => undefined)   // ← 等完
+     * const task = (async () => { … grant … })()                          // ← 照样再发一份
+     * ```
+     * 即「串行化」而不是「去重」：并发 N 条 ⇒ N 份 grant，**且都用同一把 RT**。
+     * 实测并发 5 次 ⇒ 5 份 grant、同时在飞峰值 4；端到端三条并发请求
+     * （主回复 + 标题 + 压缩）⇒ 全部失败。
+     *
+     * 而 RT 是**一次性轮换**的：第 2 份起必然 `invalid_grant`，输家还会把
+     * 「别人刚续成功」误读成「RT 已死」⇒ 把好账号标 `refreshable:false`
+     * （单向门，永不自愈）。这正是 PR 声称要修的「要一个个点回来」。
+     *
+     * ⇒ 现在与 `renewEntry` **同形**：命中就等它落地、把结果视为本次结果。
+     *   语义上并发的 N 条请求都「续期成功」，因为那一份 grant 就是它们要的。
+     */
     const existing = this.renewInFlight.get(refName)
-    if (existing !== undefined) await existing.catch(() => undefined)
+    if (existing !== undefined) {
+      await existing.catch(() => undefined)
+      return
+    }
     const task = (async () => {
       const resolved = await this.ctx.credentials.resolve(ref)
       if (!resolved) throw new Error('凭据未配置')
@@ -532,23 +620,50 @@ export class MinimaxAuth extends Service {
    *   保持「凭据被别处更新过而索引没跟上」的自愈能力
    *   （`src/expiry-sync.ts` 模块头记录的缺陷反面）。
    *
-   * ⚠️ 纪律保持：**只按 `refreshable` 过滤，不看 `enabled`**；凭据缺失/
-   * 损坏仍标 `refreshable:false`；单账号失败不拖住其余。
+   * ⚠️ 纪律保持：**不看 `enabled`**（停用只影响自动选号）；单账号失败不拖住其余。
+   *
+   * ⚠️⚠️ **不再按池里的 `refreshable` 过滤**（2026-10-27 审计修）。
+   *
+   * 修前是 `if (!entry.refreshable) continue`。而那个布尔是**每轮由凭据对账
+   * 出来的镜像**，不是「曾被服务端拒绝过」的案底（`AGENTS.md`：「账号池的
+   * `refreshable` 只是凭据材料的镜像」；`docs/adding-a-new-provider.md:132-135`
+   * 把「不看 `refreshable`」列为**红线**，并给了事故原话：
+   * 「自动续期没工作、重启也没用」）。
+   *
+   * 拿它当门禁 ⇒ 任何一次误标都是**单向门**：定时那轮跳过它、启动首轮也跳过它。
+   * 而**写成 `refreshable:false` 的唯一来源**正是本文件（终态判定），一旦
+   * 判据偶发误判（见 `refresh-failure.ts` 的三条实测），账号就再也回不来。
+   *
+   * ⇒ 现在**读凭据本体**判材料（`isMinimaxRefreshable(credential)`）：
+   *   凭据里 `refresh_token` 为空才标 `refreshable:false`；否则照常对账。
+   *   读凭据只是**本地存储访问**，不花网络也不花额度 —— 拿它当门禁「省请求」
+   *   是错省，省下的是自愈能力。
    */
   async refreshAll(pool: AccountPool): Promise<void> {
     const accounts = await pool.listAccounts(this.product.id)
     for (const entry of accounts) {
-      // ⚠️ 判据只看 refreshable，不看 enabled
-      if (!entry.refreshable) continue
       try {
         const ref = credentialRef(entry.credentialRef)
         const resolved = await this.ctx.credentials.resolve(ref)
         if (!resolved) {
-          await pool.updateAccount(entry.id, { refreshable: false })
+          // ⚠️ 凭据**根本读不到**时**不得**标 `refreshable:false`（2026-10-27 审计修）：
+          // 那条路径的成因是「存储暂时读不出来 / 凭据被外部删除 / 备份未导入」，
+          // 与「服务端拒绝这把 RT」是两件事。误标它同样是单向门。
+          // ⇒ 只留日志，下一轮再试。
+          this.ctx.logger?.warn?.(
+            `[${this.product.id}] 账号 ${entry.id} 的凭据读不到（可能未导入），本轮只记日志、不改池标记`,
+          )
           continue
         }
         const credential = parseMinimaxCredential(resolved.value)
-        if (!credential || !isMinimaxRefreshable(credential)) {
+        if (!credential) {
+          this.ctx.logger?.warn?.(
+            `[${this.product.id}] 账号 ${entry.id} 的凭据解析失败（形状不对），本轮只记日志、不改池标记`,
+          )
+          continue
+        }
+        if (!isMinimaxRefreshable(credential)) {
+          // 这一格才是**权威**的「不可续期」：凭据里确实没有 refresh_token。
           await pool.updateAccount(entry.id, { refreshable: false })
           continue
         }
@@ -624,15 +739,12 @@ export class MinimaxAuth extends Service {
     // 供 `grantWithSalvage` 在终态失败时逐把回退（断链抢救）。
     // ⚠️ 这是**非令牌字段**：随下面 `inheritMinimaxIdentity` 的
     // `{ ...previous, ...refreshed }` 自然落盘，**不要**在这里手工透传。
-    const previous = [credential.refresh_token as string, ...(credential.previous_refresh_tokens ?? [])]
-    const deduped: string[] = []
-    for (const token of previous) {
-      if (typeof token === 'string' && token.length > 0 && !deduped.includes(token)) {
-        deduped.push(token)
-        if (deduped.length >= MINIMAX_PREVIOUS_REFRESH_TOKENS) break
-      }
-    }
-    if (deduped.length > 0) refreshed = { ...refreshed, previous_refresh_tokens: deduped }
+    // ⚠️ 与 CAS 分支共用 `mergePreviousRefreshTokens`（同义判据只留一份实现）。
+    const deduped = mergePreviousRefreshTokens(
+      credential.previous_refresh_tokens,
+      credential.refresh_token as string,
+    )
+    if (deduped !== undefined) refreshed = { ...refreshed, previous_refresh_tokens: deduped }
 
     /**
      * ⚠️⚠️ 续期**必须继承**身份字段（2026-10-24）。
@@ -652,42 +764,78 @@ export class MinimaxAuth extends Service {
   /**
    * grant + **两层抢救**（2026-10-24 本地试验版）。
    *
-   * ## 抢救顺序（顺序不可颠倒）
+   * ## 抢救顺序（**循环内合并**，不是两层互斥）
    *
    * 1. **非终态失败**（网络断/超时/5xx）⇒ 隔 1.5s **同 RT 重试一次**：
-   *    覆盖「服务端还没处理就断了」的情形；重试若转终态，说明服务端已经
-   *    轮换过（响应丢失）⇒ 落入第 2 层。
-   * 2. **终态失败** ⇒ 依次回退 **历史代际 RT**（`previous_refresh_tokens`，
+   *    覆盖「服务端还没处理就断了」的情形；
+   * 2. 重试若转**终态**，说明服务端已经轮换过（响应丢失）⇒ 必须继续落到
+   *    **历史代际回退**；
+   * 3. **终态** ⇒ 依次回退 **历史代际 RT**（`previous_refresh_tokens`，
    *    新→旧最多 3 把）：上游若只作废被用的那条而非整族，就能救回 ——
    *    全失败才抛终态（调用方标记需重登）。**实验特性**：上游语义未证实，
    *    全失败只是多花几次注定失败的请求，无新增风险；每次抢救结果都进 journal。
+   *
+   * ⚠️⚠️ **修前的层级断裂（2026-10-27 审计打穿）**：
+   * 修前是 `catch { if (终态) { …历史… } else { sleep; return grantOnce() } }`
+   * —— 第 1 层的重试若抛**终态**，那个异常会**直接冒出去**，历史代际**一次都不试**。
+   * 实测：首轮网络错→重试终态时 RT 序列 `['DEAD_RT','DEAD_RT']`（`OLD_RT_1`
+   * 从未被试）；而对照组「首轮即终态」是 `['DEAD_RT','OLD_RT_1']`（救回成功）。
+   *
+   * 而「响应丢失」正是本特性**最主要的**设计场景（PR 描述的根因③），
+   * 也就是说抢救链在它最该生效的形态下**恰好失效**。⇒ 改成单一循环：
+   * 不管终态是第几次抛出的，都过一遍历史代际。
    */
   private async grantWithSalvage(
     credential: MinimaxCredential,
     accountId?: string,
   ): Promise<MinimaxCredential> {
-    try {
-      return await this.grantOnce(credential, accountId)
-    } catch (error) {
-      if (error instanceof MinimaxRefreshTokenExpiredError) {
-        // 第 2 层：历史代际回退（当前值除外 —— 刚刚就是它死的）。
-        const history = (credential.previous_refresh_tokens ?? [])
-          .filter((rt) => rt !== credential.refresh_token)
-        for (const token of history) {
-          try {
-            return await this.grantOnce({ ...credential, refresh_token: token }, accountId)
-          } catch {
-            // 这把也死了 → 试下一把（journal 由调用方记最终结局）。
-          }
-        }
-        throw error
+    /** 本次是否已经做过「同 RT 重试一次」（只做一次，别把网络抖动放大成 N 次）。 */
+    let retried = false
+    /** 当前要试的 RT 序列：当前值在前，其后是历史代际（新→旧、去重）。 */
+    const candidates: string[] = []
+    const current = credential.refresh_token
+    if (typeof current === 'string' && current.length > 0) candidates.push(current)
+    for (const token of credential.previous_refresh_tokens ?? []) {
+      if (typeof token === 'string' && token.length > 0 && !candidates.includes(token)) {
+        candidates.push(token)
       }
-      // 第 1 层：非终态（网络抖动）→ 同 RT 重试一次。
-      await (this.options.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms))))(
-        MINIMAX_RENEW_RETRY_DELAY_MS,
-      )
-      return this.grantOnce(credential, accountId)
     }
+
+    let lastError: unknown
+    for (let index = 0; index < candidates.length; index += 1) {
+      const token = candidates[index] as string
+      const attemptCredential: MinimaxCredential = index === 0
+        ? credential
+        : { ...credential, refresh_token: token }
+      // ⚠️ 历史代际**不做**「同 RT 重试」：它们本就是抢救用的弹药，
+      //    每一把只试一次，别把注定失败的请求翻倍。
+      const maxAttemptsForThisToken = index === 0 ? 2 : 1
+      for (let attempt = 0; attempt < maxAttemptsForThisToken; attempt += 1) {
+        try {
+          return await this.grantOnce(attemptCredential, accountId)
+        } catch (error) {
+          lastError = error
+          if (error instanceof MinimaxRefreshTokenExpiredError) {
+            // 这一把 RT 被服务端明确拒绝 ⇒ 换下一代（跳出内层）。
+            break
+          }
+          // ⚠️ 非终态：只在**当前值**上重试一次（`retried` 防放大）。
+          if (index === 0 && !retried && attempt === 0) {
+            retried = true
+            await (this.options.sleep
+              ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms))))(
+              MINIMAX_RENEW_RETRY_DELAY_MS,
+            )
+            continue
+          }
+          // 重试也非终态 ⇒ 网络还没恢复，历史代际同样打不通 ⇒ 直接抛。
+          throw error
+        }
+      }
+    }
+    throw lastError instanceof Error
+      ? lastError
+      : new MinimaxRefreshTokenExpiredError('refresh_token 已失效，请重新登录')
   }
 
   /**
@@ -738,11 +886,28 @@ export class MinimaxAuth extends Service {
     const ref = credentialRef(entry.credentialRef)
     const resolved = await this.ctx.credentials.resolve(ref)
     if (!resolved) {
-      await pool.updateAccount(entry.id, { refreshable: false }).catch(() => {})
+      /**
+       * ⚠️⚠️ **读不到凭据时不得标 `refreshable:false`**（2026-10-27 审计修）。
+       *
+       * 那一格的成因是「存储暂时读不出来 / 凭据被外部删除 / 备份还没导入」，
+       * 与服务端**拒绝这把 RT** 是两件事。而 `refreshable:false` 会挡住
+       * `refreshAll` 与巡检（单向门）⇒ 误标一次就再也没人重试。
+       * ⇒ 只留日志；`refreshable` 保持原值，下一轮巡检再读一次。
+       */
+      this.ctx.logger?.warn?.(
+        `[${this.product.id}] 账号 ${entry.id} 的凭据读不到（可能未导入），本轮跳过且不改池标记`,
+      )
       return { renewed: false }
     }
     const credential = parseMinimaxCredential(resolved.value)
-    if (credential === undefined || !isMinimaxRefreshable(credential)) {
+    if (credential === undefined) {
+      this.ctx.logger?.warn?.(
+        `[${this.product.id}] 账号 ${entry.id} 的凭据解析失败（形状不对），本轮跳过且不改池标记`,
+      )
+      return { renewed: false }
+    }
+    if (!isMinimaxRefreshable(credential)) {
+      // 这一格才是**权威**的不可续期：凭据里确实没有 refresh_token。
       await pool.updateAccount(entry.id, { refreshable: false }).catch(() => {})
       return { renewed: false }
     }
@@ -757,11 +922,45 @@ export class MinimaxAuth extends Service {
     const started = Date.now()
     try {
       const next = await this.grantWithSalvage(credential, entry.id)
-      // CAS：grant 期间凭据若被别人写过（登录 / RPC 续期），丢弃本次结果 ——
+      // CAS：grant 期间凭据若被别人写过（登录 / RPC 续期），**不覆盖** ——
       // 别人写的是更新的会话，覆盖回去等于把新钥匙换成旧的。
       const reRead = await this.ctx.credentials.resolve(ref)
       const reReadCredential = reRead === undefined ? undefined : parseMinimaxCredential(reRead.value)
       if (reReadCredential !== undefined && reReadCredential.access_token !== credential.access_token) {
+        /**
+         * ⚠️⚠️ **丢弃前必须把本次轮换出来的新 RT 压进历史栈**（2026-10-27 审计修）。
+         *
+         * ## 修前的净损失
+         *
+         * 修前直接 `return`：本次 grant **已在上游完成轮换**，而我们把这把新 RT
+         * 丢掉了（实测：落盘仍是 `OTHER_RT`，`MINE_NEW_RT` 永久消失且**未压栈**）。
+         * 若上游是「用一次即作废」—— 本 PR 的整个前提 —— 这把 RT 就成了
+         * **孤儿且已作废**；更糟的是它顶替了旧值，救援链的弹药反而少了一把。
+         * 也就是说「丢弃」在一次性 RT 语义下**不是零代价**，它花掉一次轮换额度
+         * 却什么也没留下。
+         *
+         * ## 修法
+         *
+         * 把 `next.refresh_token`（本次新拿到的）作为**额外一代**压进
+         * `reReadCredential.previous_refresh_tokens` 后再落盘 —— 令牌材料用
+         * **别人那份更新的**（不覆盖 `access_token`），只把「弹药」补上。
+         * 这样即使 `MINE_NEW_RT` 在上游仍有效，后续 `invalid_grant` 时能被抢救链试到。
+         *
+         * ⚠️ 只补 RT、**绝不碰** `access_token` / `expires_at`（那两份是别人的新会话）。
+         */
+        const salvagedHistory = mergePreviousRefreshTokens(
+          reReadCredential.previous_refresh_tokens,
+          // 本次新拿到的（可能就是别人那份，去重后自然只剩一条）
+          next.refresh_token,
+          // 本次用掉的那把（上游可能已作废，但留作末位弹药无副作用）
+          credential.refresh_token,
+        )
+        if (salvagedHistory !== undefined) {
+          await this.ctx.credentials.set(
+            ref,
+            JSON.stringify({ ...reReadCredential, previous_refresh_tokens: salvagedHistory }),
+          ).catch(() => { /* 补弹药失败不得反噬主路径 */ })
+        }
         appendMinimaxJournal(this.journalHome, {
           ts: Date.now(),
           provider: this.product.id,
@@ -817,7 +1016,7 @@ export class MinimaxAuth extends Service {
   }
 
   /**
-   * **60s 专属续期巡检**（2026-10-24 本地试验版；重复调用幂等）。
+   * **60s 专属续期巡检**（重复调用幂等；生命周期由接线层的 `ctx.effect` 回收）。
    *
    * ## 为什么不塞进全局 30min 调度器
    *
@@ -828,17 +1027,61 @@ export class MinimaxAuth extends Service {
    *
    * ⚠️ **立即先跑一轮**（与 `MultiAccountRefreshScheduler.start` 同理由）：
    * 宿主重启后不该等满 60s 才开始补。
+   *
+   * ⚠️⚠️ **必须由 {@link stopRenewPatrol} 回收**（2026-10-27 审计打穿）：
+   * 修前只有 `setInterval` + `unref`、**没有 clear 路径**，而 `unref` 只解决
+   * 「不阻止进程退出」，**不解决「fiber 卸载后仍在跑」**。
+   *
+   * 实测：`fiber.dispose()` 之后推进 130s ⇒ 巡检 tick **照跑**（+3 次），
+   * 而旧实例读的是**共享的 credentials 后端**（不是快照）⇒ 它会继续对**新池**
+   * 发 grant。插件热重载/`apply()` 重入时旧实例没死 + 新实例已起 ⇒ **两个实例
+   * 并发轮换同一批一次性 RT**，输家拿到 `invalid_grant` 并把好号标死。
+   * 这恰好是本 PR 自己声称要修的「并发轮换」形态。
+   *
+   * ⇒ 接线层必须 `ctx.effect(() => () => auth.stopRenewPatrol())`（两站各一条），
+   *   由 `index.ts` 负责；`lifecycle-cleanup` 那组守卫逐站点名。
    */
   startRenewPatrol(pool: AccountPool): void {
     if (this.patrolTimer !== undefined) return
+    /** 本实例已停止 ⇒ tick 直接不再动作（防 dispose 后在飞的一轮继续打）。 */
     const tick = async (): Promise<void> => {
-      if (this.patrolBusy) return
+      if (this.patrolStopped || this.patrolBusy) return
       this.patrolBusy = true
       try {
         const accounts = await pool.listAccounts(this.product.id)
         for (const entry of accounts) {
-          // ⚠️ 只按 refreshable 过滤，不看 enabled（AGENTS.md 既有铁律）。
-          if (!entry.refreshable) continue
+          /**
+           * ⚠️ **每个账号之前都要再看一眼 `patrolStopped`**（2026-10-27 审计修）。
+           *
+           * tick 开头那次检查**不够**：一轮可能卡在某个 `await grant` 上几十秒，
+           * 期间 fiber 被卸载（插件热重载）⇒ 它醒来后会继续把这个账号**之后
+           * 的所有账号**都轮换一遍 —— 而那时实例已 dispose，读的却是**共享的**
+           * credentials 后端 ⇒ 会真的对上游换钥匙（一次性 RT，且与新实例
+           * 并发）⇒ 输家 `invalid_grant`，好号被标死。
+           *
+           * 实测：删掉本行 + `stopRenewPatrol` 的置位后，守卫精确变红。
+           */
+          if (this.patrolStopped) return
+          /**
+           * ⚠️⚠️ **巡检的判据是「凭据里还有没有 refresh_token」，不是池里的
+           * `refreshable`**（2026-10-27 审计修）。
+           *
+           * 修前是 `if (!entry.refreshable) continue` —— 而 `refreshable` 是
+           * **每轮由凭据对账出来的镜像**，不是「曾被服务端拒绝过」的案底。
+           * 拿它当门禁 ⇒ 任何一次误标都变成**单向门**：巡检跳过它、`refreshAll`
+           * 也跳过它 ⇒ 「自动续期没工作、重启也没用」，而凭据明明还能用。
+           *
+           * 这条在 `docs/adding-a-new-provider.md:132-135`（「不看 `refreshable`」）
+           * 与 `AGENTS.md` 的「refreshable 只是凭据材料的镜像」两处都是明文红线，
+           * 而本 PR 在巡检里**新复制了同一个门**。
+           *
+           * ⇒ 这里**不再看 `refreshable`**，直接交给 `renewEntry`：
+           *   它内部的 `renewEntryInner` 会读凭据、判 `isMinimaxRefreshable(credential)`
+           *   （凭据材料才是权威），凭据真的缺 RT 才标 `refreshable:false`。
+           *   代价只有每轮多一次**本地**存储读（不花网络、不花额度）。
+           *
+           * ⚠️ 仍然**不看 `enabled`**（停用只影响自动选号，不该让凭据烂掉）。
+           */
           try {
             await this.renewEntry(pool, entry, {
               marginMs: MINIMAX_RENEW_MARGIN_MS + renewJitterMs(entry.id, MINIMAX_RENEW_JITTER_SPAN_MS),
@@ -868,6 +1111,24 @@ export class MinimaxAuth extends Service {
     this.patrolTimer = setInterval(() => { void tick() }, MINIMAX_RENEW_PATROL_INTERVAL_MS)
     // ⚠️ 不持进程：宿主退出时定时器不该是「退不下去」的原因。
     this.patrolTimer.unref?.()
+  }
+
+  /**
+   * 停止续期巡检（**幂等**；由接线层的 `ctx.effect` 在 fiber 卸载时调用）。
+   *
+   * ⚠️⚠️ 这是 2026-10-27 审计补的**唯一** clear 路径。修前整个类没有它，
+   * 而 `unref()` 只保证「不阻止进程退出」，不保证「fiber 卸载后停手」——
+   * 实测 dispose 后巡检仍对新池发 grant（详见 {@link startRenewPatrol} 的注释）。
+   *
+   * ⚠️ 同时置 `patrolStopped`：**在飞的那一轮**（可能正卡在某个 await 上）
+   * 也会在下一个账号前退出，不再继续轮换。
+   */
+  stopRenewPatrol(): void {
+    this.patrolStopped = true
+    if (this.patrolTimer !== undefined) {
+      clearInterval(this.patrolTimer)
+      this.patrolTimer = undefined
+    }
   }
 
   /**
@@ -1111,10 +1372,45 @@ export class MinimaxAuth extends Service {
         const needsUserIdBackfill = identity.userId !== undefined
           && (credential as { user_id?: string }).user_id !== identity.userId
         if (needsNicknameBackfill || needsUserIdBackfill) {
+          /**
+           * ⚠️⚠️ **写盘前必须重读凭据（CAS）** —— 2026-10-27 审计打穿的真缺陷。
+           *
+           * ## 缺陷
+           *
+           * 本函数在 `:1105` 读一次凭据，然后 `await` 一次身份端点（实测 ~120ms），
+           * 再拿**那份旧凭据**展开整体 `set`。而 `src/index.ts` 把本函数（fire-and-forget）
+           * 与 **60s 巡检的首轮**排成了相邻两行 ⇒ 启动时两者必然并发。
+           *
+           * 实测时序（我构造的确定性复现）：
+           * ```
+           * repair.resolve → OLD            （读到旧凭据）
+           *  巡检 grant   → NEW_RT 落盘     （换了一把新钥匙）
+           * repair.set   → {...OLD, nickname}（用旧凭据展开，把 NEW_RT 覆盖回去）
+           * ```
+           * `set` 序列实测为 `['NEW_RT', 'OLD_RT']` ⇒ **刚轮换出来的新 RT 被丢掉**。
+           * 若上游是一次性轮换（本 PR 的整个前提），这把旧 RT 已在上游作废 ⇒
+           * **账号报废、只能重登**。且这条自愈在生产上**每次启动必现**（本机三份
+           * 存量凭据**零份**带 `user_id` ⇒ 必然写盘）。
+           *
+           * ## 修法
+           *
+           * grant 的成功结果里带的是**新** `access_token`；只要重读发现
+           * `access_token` 变了，就说明「别人写过更新的会话」⇒ 只在**最新那份**上
+           * 合并身份字段，绝不覆盖令牌材料。这与 `renewEntryInner` 的 CAS 同一条纪律。
+           *
+           * ⚠️ 与 `renewEntryInner` 的差别：那里「被抢先」要**丢弃整次结果**（因为
+           * 它的产出就是令牌）；本函数的产出是**身份字段**，与令牌无关 ⇒ 应当
+           * 合并到最新凭据上而不是放弃（否则 `user_id` 永远补不上，去重继续失效）。
+           */
+          const latest = await this.ctx.credentials.resolve(ref)
+          const latestCredential = latest === undefined
+            ? undefined
+            : parseMinimaxCredential(latest.value)
+          const base = latestCredential ?? credential
           await this.ctx.credentials.set(
             ref,
             JSON.stringify({
-              ...credential,
+              ...base,
               nickname: identity.name,
               ...identity.userId === undefined ? {} : { user_id: identity.userId },
             }),

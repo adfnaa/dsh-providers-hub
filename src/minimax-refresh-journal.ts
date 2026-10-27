@@ -43,8 +43,20 @@ export interface MinimaxJournalEntry {
   latencyMs?: number
   /** 续期成功后的新过期时刻（毫秒，ISO 化前原值；便于与 state.json 对照）。 */
   newExpiresAt?: number
-  /** 身份/补充探针的原始 JSON（取证用；只写一次）。 */
-  raw?: unknown
+  /**
+   * ⚠️ **刻意没有「原始响应体」字段**（2026-10-27 审计删）。
+   *
+   * 修前这里有一个 `raw?: unknown`，注释写着「身份/补充探针的原始 JSON
+   *（取证用；只写一次）」。它全仓**零写入点**，但本身是一条**现成的
+   * token 泄漏面**：journal 落在 `~/.dsh/jet-hub/refresh-journal.jsonl`
+   *（明文、无脱敏、会被备份/同步工具带走），谁哪天顺手把上游响应体塞进来，
+   * 那里面就有 `access_token` / `refresh_token` / `nickname` / `user_id`。
+   *
+   * 本仓库既有纪律是「日志只记结论，绝不记凭据原文」（`proxy-mask.ts` 的中立
+   * 脱敏、`docs/agent-notes/` 的多条事故记录）。既然没有消费者，就不要留这个
+   * 口子 —— 需要取证时应当临时加**带脱敏**的专用字段，而不是留一个
+   * 类型为 `unknown` 的万能槽。
+   */
 }
 
 /** 单文件上限；超过即轮转（`.jsonl` → `.jsonl.old`，覆盖旧 `.old`）。 */

@@ -506,65 +506,34 @@ describe('★ AutoClaw：降级结果的缓存 TTL 必须与错误同档（短�
 })
 
 /**
- * ★★ **AutoClaw：401 按需续期这条腿必须存在**（2026-10-25 补，真实缺陷）。
+ * ★★ **AutoClaw 401 按需续期** 的守卫已**迁出本文件**。
  *
- * ## 守的是什么
+ * ## 为什么搬走（2026-10-27 两轮审计的共同结论）
  *
- * `autoclaw-adapter.ts` 的 401 重试判据是
- * `if (!response.ok && (401 || 403) && this.options.refresh)` ——
- * **`options.refresh` 缺失时整段不执行**（不续期、不重发）⇒ 401 直接归 `AUTH`
- * ⇒ 而 `AUTH` 会被 DSH 客户端**换成固定文案「API 密钥无效」并丢掉原文**
- *（本仓库自记：`autoclaw.ts` 的 `isAutoclawQuotaError` 上方注释 /
- * `docs/agent-notes/client-ui.md`）⇒ 用户看到的正是「API 密钥无效」。
+ * 原先这里是四条**源码文本断言**（`toMatch(/refresh:\s*async\s*\(\)\s*=>/)`
+ * + `toContain('…refreshAccountCredential(')` + 一条 `not.toMatch` 反向断言）。
+ * 红队逐字复刻判据后实测，以下五种**假接线全部绿**：
  *
- * ⚠️ **两个实例自 `6da5505`（首次接入）起都没传过它**，故本组用例是**首条**守卫。
- * ⚠️ 断言必须**先剥注释**（`indexCode`）：本文件与 `src` 的注释里都大量出现
- *    `options.refresh` 这个词，不去注释的话「删掉真代码」照样绿。
+ * | 假接线 | 为什么骗过文本断言 |
+ * |---|---|
+ * | 片段塞进**字符串字面量** | `toContain` 只找子串 |
+ * | **行尾** `//` 冒充（`codeOnly` 只剥整行 `//`） | 剥注释不覆盖行尾 |
+ * | `if (false) { …真接线… }` | 字面量在死分支里照样存在 |
+ * | `if (Math.random() >= 0) return` 恒早退 | 真实现变 no-op，文本一字不少 |
+ * | 整块塞进 `false ? … : async () => {}` | 同上 |
+ *
+ * 反向还有**假红**：`refresh: () => autoclaw.refresh()` 这类合法重构会红
+ * —— 判据钉的是**字面写法**而不是行为。
+ *
+ * ⇒ 改为 **行为级** 守卫：`tests/unit/autoclaw-401-refresh-wiring.spec.ts`
+ *   真跑 `apply()`、真驱动适配器、让第一次请求 401，断言
+ *   「被续期的是**本次实际用的那个账号**」且「重发用的是**新** token」。
+ *
+ * 变异验证（6 个，全部逐条跑过，见该文件的模块头）：
+ * 忽略 `used` / 不返回新凭据 / 删键 / 不传 `entry.id` / 空实现 / 国际版忽略 `used`
+ * ⇒ **全部变红**（其中「忽略 used」「空实现」「国际版忽略 used」在旧的文本守卫下
+ * 是**绿的**，即本文件原先那组确实无牙）。
+ *
+ * ⚠️ 本文件保留的**其它**组（永久积分锁定、选号器接线、分档行为）判据形态不变 ——
+ * 它们守的是「接线点在不在」这一较弱的不变式，且已有行为层用例兜底。
  */
-describe('★★ AutoClaw：401 按需续期（options.refresh）必须接线', () => {
-  /** 取某个 `registerAutoclawLlm(...)` 调用块（到下一个 `const ` 或文件尾）。 */
-  function adapterBlock(at: number): string {
-    const candidates = [
-      indexCode.indexOf('\n  const ', at + 1),
-      indexCode.indexOf('\n  /**', at + 1),
-    ].filter((i) => i > at)
-    return indexCode.slice(at, candidates.length > 0 ? Math.min(...candidates) : indexCode.length)
-  }
-
-  it('★★ 国内版与该站 instance 都注入了非空 refresh（不得是空实现）', () => {
-    // 两个实例的注册点：国内版与国际版各一处，次序与 `new AutoclawAuth` 一致。
-    const sites = [...indexCode.matchAll(/registerAutoclawLlm\(ctx, \{/g)].map((m) => m.index ?? -1)
-    expect(sites.length, 'registerAutoclawLlm 的调用点数变了（接线形态漂移）').toBe(2)
-
-    for (const [i, at] of sites.entries()) {
-      const block = adapterBlock(at)
-      const label = i === 0 ? '国内版(autoclaw)' : '国际版(autoclawintl)'
-      // ① refresh 键必须存在
-      expect(block, `${label} 未注入 refresh ⇒ 401 不续期不重发 ⇒ 报「API 密钥无效」`)
-        .toMatch(/refresh:\s*async\s*\(\)\s*=>\s*\{/)
-      // ② 不得是 `async () => {}` 这类空实现（那是「传了等于没传」的形态）
-      expect(block, `${label} 的 refresh 是空实现（等于没传）`)
-        .not.toMatch(/refresh:\s*async\s*\(\)\s*=>\s*\{\s*\}/)
-      // ③ 必须真的调到该站自己的续期入口（用错站会续错账号）
-      const service = i === 0 ? 'autoclaw' : 'autoclawIntl'
-      expect(block, `${label} 的 refresh 未调用 ${service}.refreshAccountCredential`)
-        .toContain(`${service}.refreshAccountCredential(`)
-      // ④ 池空时要有单凭据兜底，不得静默无操作
-      expect(block, `${label} 的 refresh 缺少池空时的 ${service}.refresh() 兜底`)
-        .toContain(`${service}.refresh()`)
-    }
-  })
-
-  it('★ 续期必须传 pool + entry.id（否则 expiresAt 写不回池，UI 恒显「已过期」）', () => {
-    const sites = [...indexCode.matchAll(/registerAutoclawLlm\(ctx, \{/g)].map((m) => m.index ?? -1)
-    for (const [i, at] of sites.entries()) {
-      const block = adapterBlock(at)
-      const label = i === 0 ? '国内版' : '国际版'
-      expect(block, `${label}：续期未传 pool/entry.id ⇒ 新 expiresAt 写不回账号池（!IKIRTT 形态）`)
-        .toMatch(/refreshAccountCredential\(\s*available\.entry\.credentialRef,\s*pool,\s*available\.entry\.id,/)
-      // ⚠️ 反向：不得退化成「续默认单凭据 ref」（会续错账号）
-      expect(block, `${label}：续期退到了默认单凭据 ref`)
-        .not.toMatch(/refreshAccountCredential\(\s*[A-Z_]*defaultCredentialRef/)
-    }
-  })
-})

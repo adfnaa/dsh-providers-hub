@@ -40,6 +40,7 @@ import {
   syncAccountExpiry,
   type ExpiryAccessors,
 } from './expiry-sync.js'
+import { isTerminalRefreshFailure, refreshFailureFromResponse } from './refresh-failure.js'
 
 /**
  * 计算一条凭据的**账号身份**（同账号判据）。
@@ -118,6 +119,25 @@ export class RefreshTokenExpiredError extends Error {
   }
 }
 
+/**
+ * AutoClaw 自己的「refresh_token 被拒」词汇（**精确匹配、大小写无关**）。
+ *
+ * ## 为什么必须在调用点显式声明
+ *
+ * AutoClaw 的业务码信封（HTTP 200 + `{code, msg}`）用它自己的措辞表达
+ * 「token 无效」—— 实测是 `msg: "Invalid token"`，**不是** OAuth 的
+ * `invalid_grant`（上游没有实现 RFC 6749 的错误码命名）。
+ *
+ * ⚠️ 也**刻意不含** `expired` 这个宽词：红队实测 `503 {"error":"token expired"}`
+ *   （网关抖动）与 `429 "key expired soon"`（限流）都含它，把它们判成终态
+ *   就会把健康账号标死（`refreshable:false` 是单向门，永不自愈）。
+ *   证书过期的 `certificate has expired` 由 `isRefreshTransportFailure` 更早吃掉。
+ */
+const AUTOCLAW_TERMINAL_OAUTH_ERRORS: readonly string[] = [
+  'Invalid token',
+  'invalid_token',
+]
+
 export interface AutoclawAuthOptions {
   readonly product?: AutoclawProduct
   readonly serviceName?: string
@@ -149,6 +169,18 @@ export class AutoclawAuth extends Service {
   private refreshTokenInvalid = false
   private lastRefreshError: string | undefined
   private active = true
+  /**
+   * 每 ref 的**单飞（去重）闸门**（2026-10-27 审计补）。
+   *
+   * 语义与 `MinimaxAuth.renewInFlight` **逐字同形**：命中在飞任务就 `await`
+   * 并**直接返回它的结果**，绝不再发第二份 grant。
+   *
+   * ⚠️ key 用**原始 `refName` 实参**（与 minimax 同口径）：`credentialRef()`
+   * 只做正则校验、**不做归一**（`@deepseek-ai/dsh-credentials` 的
+   * `credentialRef` 是 `brandString`）。生产三条腿（adapter 401 / 面板按钮 /
+   * 积分自愈）传的都是同一个 `entry.credentialRef` 字符串 ⇒ 无别名风险。
+   */
+  private readonly refreshInFlight = new Map<string, Promise<AutoclawCredential>>()
 
   constructor(ctx: Context, private readonly options: AutoclawAuthOptions = {}) {
     const product = options.product ?? AUTOCLAW
@@ -182,6 +214,16 @@ export class AutoclawAuth extends Service {
 
   /**
    * 刷新指定的凭据对象。
+   *
+   * ⚠️⚠️ **终态判据已收口到共享实现 `src/refresh-failure.ts`**（2026-10-27 审计修）。
+   *
+   * 修前是 `msg.includes('Invalid token') || msg.includes('expired') || msg.includes('401')`
+   * —— 与 `minimax-auth.ts` 逐字同形的第二份实现，三条实测把**健康账号**判死：
+   * `503 {"error":"token expired"}`（网关抖动）、`429 "key expired soon"`（限流）、
+   * 以及传输层的 `certificate has expired`（本仓库笔记记着检查代理约 50% 概率打断）。
+   *
+   * ⚠️ 尤其 `'401'` 这个**子串**判据：任何报文里带 `401` 三个字符都会命中，
+   * 包括 `"request id 401xy"` 之类的无关内容。
    */
   async refreshCredential(credential: AutoclawCredential): Promise<AutoclawCredential> {
     if (!isAutoclawRefreshable(credential)) {
@@ -195,8 +237,8 @@ export class AutoclawAuth extends Service {
       })
       return refreshed
     } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err)
-      if (msg.includes('Invalid token') || msg.includes('expired') || msg.includes('401')) {
+      if (isTerminalRefreshFailure(err, AUTOCLAW_TERMINAL_OAUTH_ERRORS)) {
+        const msg = err instanceof Error ? err.message : String(err)
         throw new RefreshTokenExpiredError(`AutoClaw refresh_token 已失效：${msg}`)
       }
       throw err
@@ -204,13 +246,75 @@ export class AutoclawAuth extends Service {
   }
 
   /**
-   * 按凭据 ref 续期指定账号的凭据。
+   * 按凭据 ref 续期指定账号的凭据（**H2 契约入口，返回 `void`**）。
+   *
+   * ⚠️⚠️ **per-ref 单飞（去重）**（2026-10-27 审计修的 P0）：
+   *
+   * 修前本方法**没有任何并发保护**（全仓 autoclaw 唯一的 in-flight 表在
+   * `autoclaw-credits.ts` 的 `inflightRefreshes`，**不覆盖这条腿**）。
+   * 实测同一 ref 并发 3 次 ⇒ **3 份 grant，三份都用同一把 `RT-0`**。
+   *
+   * 而 RT 是**一次性轮换**的（本 PR 的前提）：3 份里 2 份必然 `invalid_grant`；
+   * 更糟的是上游处理序 ≠ 本地完成序时，盘上可能留下**已作废的 RT** ⇒ 账号报废。
+   * 这与 `docs/adding-a-new-provider.md:143-147` 的明文纪律冲突：
+   * 「三条续期入口会并发消费同一份 `refresh_token` ⇒ 必须上 per-`credentialRef`
+   * 的 `SerialQueue`」。
+   *
+   * ⚠️ 修 PR154 之前这条风险是「偶发」（401 根本不续期，只有定时器 / 面板 /
+   *    积分自愈三条入口）；补上请求级续期后，DSH 每轮并发发「主回复 + 标题 +
+   *    压缩」三条请求 ⇒ 每次过期边界**必然**撞车。
+   *
+   * ⚠️ 返回值刻意保持 `void`（`JetHubAuthLike` 契约），凭据由
+   * {@link renewCredentialForRef} 返回给需要重发的调用方（适配器 401 重试）。
+   * 两者**共用同一张在飞表** ⇒ 无论谁先发起，都只有一份 grant。
    */
   async refreshAccountCredential(
     refName: string,
     pool?: AccountPool,
     accountId?: string,
   ): Promise<void> {
+    await this.renewViaFlight(refName, pool, accountId)
+  }
+
+  /**
+   * 同 {@link refreshAccountCredential}，但**返回续好的新凭据**。
+   *
+   * 适配器的 401 重试用它来「用同一份凭据重发」—— 避免
+   * `resolveCredential` 重新选号（那会让「续对了号」也白费，见
+   * `AutoclawAdapterOptions.refresh` 的签名说明）。
+   */
+  async renewCredentialForRef(
+    refName: string,
+    pool?: AccountPool,
+    accountId?: string,
+  ): Promise<AutoclawCredential | undefined> {
+    return this.renewViaFlight(refName, pool, accountId)
+  }
+
+  /**
+   * 单飞闸门本体：命中在飞任务就**等它并返回同一份结果**，绝不再发第二份。
+   *
+   * ⚠️ 与 `MinimaxAuth.refreshAccountCredential` 逐字同形（那边修的是
+   * 「等完再发一份」= 串行化而非去重，实测并发 5 次 ⇒ 5 份 grant）。
+   */
+  private async renewViaFlight(
+    refName: string,
+    pool?: AccountPool,
+    accountId?: string,
+  ): Promise<AutoclawCredential | undefined> {
+    const existing = this.refreshInFlight.get(refName)
+    if (existing !== undefined) return existing.catch(() => undefined)
+    const task = this.refreshAccountCredentialInner(refName, pool, accountId)
+      .finally(() => { this.refreshInFlight.delete(refName) })
+    this.refreshInFlight.set(refName, task)
+    return task
+  }
+
+  private async refreshAccountCredentialInner(
+    refName: string,
+    pool?: AccountPool,
+    accountId?: string,
+  ): Promise<AutoclawCredential> {
     const ref = credentialRef(refName)
     const resolved = await this.ctx.credentials.resolve(ref)
     if (!resolved) throw new Error('凭据未配置')
@@ -229,6 +333,25 @@ export class AutoclawAuth extends Service {
     }
 
     const refreshed = await this.refreshCredential(credential)
+    /**
+     * ⚠️ CAS：grant 期间凭据若被别人写过（登录 / 面板按钮 / 定时器），
+     * **不覆盖**别人的新会话（与 `MinimaxAuth.renewEntryInner` 同一条纪律）。
+     *
+     * ⚠️ 但仍要把**本次新拿到的 refresh_token 记下来** —— 本次 grant 已在上游
+     * 完成轮换，丢掉它等于让那把钥匙成为孤儿。AutoClaw 的凭据结构里没有
+     * `previous_refresh_tokens` 字段（那是 minimax 独有的抢救链），故这里
+     * 只**判**不写：记录一条 warn 供排查，令牌材料仍以别人那份为准。
+     */
+    const reRead = await this.ctx.credentials.resolve(ref)
+    const reReadCredential = reRead === undefined ? undefined : parseAutoclawCredential(reRead.value)
+    if (reReadCredential !== undefined
+      && reReadCredential.access_token !== credential.access_token) {
+      this.ctx.logger?.warn?.(
+        `[autoclaw] 续期期间凭据已被他处更新（${accountId ?? refName}），`
+        + '本次结果不覆盖；新 token 未落盘（上游可能已轮换，如需重登请查看该告警）',
+      )
+      return reReadCredential
+    }
     await this.ctx.credentials.set(ref, JSON.stringify(refreshed))
     await syncAccountExpiry({
       pool,
@@ -239,6 +362,7 @@ export class AutoclawAuth extends Service {
       tag: '[autoclaw]',
       warn: (message) => this.ctx.logger?.warn?.(message),
     })
+    return refreshed
   }
 
   /**

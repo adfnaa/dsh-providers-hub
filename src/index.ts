@@ -3591,22 +3591,59 @@ export function apply(ctx: Context): void {
      * 都会拉长它），窗口内任何请求都 401 且**无按需自愈** ⇒ 每次过期边界附近
      * 都可能撞上。补上本回调后，401 会先续期再原样重发一次，请求级自愈。
      *
-     * ## 形态
+     * ## 形态（⚠️ 2026-10-27 审计修：**不再自己问池要号**）
      *
-     * 与 accio（本文件下方 `refresh`）逐字同构：续「解析凭据时所用的那一个」
-     * 账号（`getAvailableAccount`），池空时退默认单凭据 ref。
-     * ⚠️ 必须传 `pool + entry.id`，否则续期成功后新 `expiresAt` 写不回账号池，
-     * UI 会一直显示「已过期」而实际可用（issue !IKIRTT 的形态）。
+     * 修前是 `pool.getAvailableAccount(AUTOCLAW.id, '')` —— 续到的号与请求实际
+     * 用的号**不是同一个**，而这是本 PR **目标没达成**的直接原因：
+     *
+     * | 判据 | 请求用的号（`createCredentialResolver` + `balance` 分档） | 修前的续期号 |
+     * |---|---|---|
+     * | 排序 | 按到期档位（`pickBuddyAccount`） | 用户手动序第一个 |
+     * | 限流过滤 | 按真 `modelId` | 传 `''` ⇒ **整体短路** |
+     *
+     * 实测（真跑 `createCredentialResolver` + 复刻池逻辑）：分档选中 B 号，
+     * 而 `getAvailableAccount` 返回 A 号 ⇒ 续 A、重发仍用 B 的旧 token ⇒
+     * 401 原样复现，A 被白轮换一把 RT。端到端三次请求 `["AUTH","AUTH","AUTH"]`。
+     *
+     * ⇒ 现在用适配器传进来的 `used`（**本次实际发请求的那份凭据**）：
+     *   ① 按 `access_token` 反查它在池里的条目（与适配器自己的记账判据同源）；
+     *   ② 续它、并**把新凭据返回给适配器重发**（不再 `resolveCredential` 重选号）。
+     *
+     * ⚠️ 反查不到（单凭据路径 / 池里没有这个 token）⇒ 退默认单凭据 ref。
+     * ⚠️ 仍传 `pool + entry.id`，否则新 `expiresAt` 写不回池（issue !IKIRTT）。
      */
-    refresh: async () => {
-      const available = await pool.getAvailableAccount(AUTOCLAW.id, '')
-      if (available) {
-        await autoclaw.refreshAccountCredential(
-          available.entry.credentialRef, pool, available.entry.id,
-        )
-      } else {
-        await autoclaw.refresh()
+    refresh: async (used) => {
+      const token = used?.access_token ?? ''
+      // ⚠️ 反查的第二参是**凭据内容**（access_token）而不是 ref 名 ——
+      //    传 ref 名会恒匹配失败且**静默**（本仓库已复发多次）。
+      const accountId = token.length > 0
+        ? await pool.findAccountIdByCredential(AUTOCLAW.id, token).catch(() => '')
+        : ''
+      const entry = accountId.length > 0
+        ? (await pool.listAccounts(AUTOCLAW.id)).find((item) => item.id === accountId)
+        : undefined
+      if (entry !== undefined) {
+        return await autoclaw.renewCredentialForRef(entry.credentialRef, pool, entry.id)
       }
+      /**
+       * 池里没有这个 token（或根本没有池 / 单凭据路径）⇒ 退默认单凭据 ref。
+       *
+       * ⚠️⚠️ **修前这一格是空转**（2026-10-27 审计 P2）：
+       * `autoclaw.refresh()` 读的是 `AUTOCLAW.defaultCredentialRef`，而该 ref
+       * 全仓**没有任何写入点**（`grep AUTOCLAW_ACCESS_TOKEN` 只有产品定义与
+       * `fallback` 声明）⇒ `refresh()` 里 `if (!resolved) return` 静默返回，
+       * 用户白等一次 60s 超时，然后仍然 401。
+       *
+       * ⇒ 现在显式抛错（让适配器走原有的 401 分类路径），把「没有可续的账号」
+       *   与「续了但失败」区分开 —— 后者才该重发。
+       */
+      const single = await autoclaw.renewCredentialForRef(AUTOCLAW.defaultCredentialRef)
+      if (single === undefined) {
+        throw new Error(
+          'autoclaw: 401 后无可续期的账号（池里没有本次使用的凭据，且默认单凭据 ref 未配置）',
+        )
+      }
+      return single
     },
   })
 
@@ -3662,20 +3699,35 @@ export function apply(ctx: Context): void {
     /**
      * ⚠️⚠️ **2026-10-25 补：401 按需续期这条腿此前完全缺失**（与国内版同因同源）。
      *
-     * 证据与形态**逐字同国内版那条**（见上）：`autoclaw-adapter.ts:636` 的 401
+     * 证据与形态**逐字同国内版那条**（见上）：`autoclaw-adapter.ts` 的 401
      * 重试判据带 `&& this.options.refresh`，而两个实例自 `6da5505` 起都没传它
      * ⇒ 401 不续期不重发 ⇒ 归 `AUTH` ⇒ 客户端换成「API 密钥无效」。
      * 两个站点**各补一条**（本仓库既有纪律：双站点每处都要到位）。
+     *
+     * ⚠️ 形态与国内版**逐字同构**（含「按 `used.access_token` 反查」与
+     * 「返回新凭据供重发」）：两站的选号规则差异（都接了 `balance` 分档）
+     * 完全一样，照抄国内版才是同一条纪律；各写一套必然漂移。
      */
-    refresh: async () => {
-      const available = await pool.getAvailableAccount(AUTOCLAW_INTL.id, '')
-      if (available) {
-        await autoclawIntl.refreshAccountCredential(
-          available.entry.credentialRef, pool, available.entry.id,
-        )
-      } else {
-        await autoclawIntl.refresh()
+    refresh: async (used) => {
+      const token = used?.access_token ?? ''
+      const accountId = token.length > 0
+        ? await pool.findAccountIdByCredential(AUTOCLAW_INTL.id, token).catch(() => '')
+        : ''
+      const entry = accountId.length > 0
+        ? (await pool.listAccounts(AUTOCLAW_INTL.id)).find((item) => item.id === accountId)
+        : undefined
+      if (entry !== undefined) {
+        return await autoclawIntl.renewCredentialForRef(entry.credentialRef, pool, entry.id)
       }
+      // ⚠️ 同国内版：默认单凭据 ref **无写入点** ⇒ 读不到时必须显式抛错，
+      //    不能静默返回（否则白等一次超时、仍 401）。
+      const single = await autoclawIntl.renewCredentialForRef(AUTOCLAW_INTL.defaultCredentialRef)
+      if (single === undefined) {
+        throw new Error(
+          'autoclawintl: 401 后无可续期的账号（池里没有本次使用的凭据，且默认单凭据 ref 未配置）',
+        )
+      }
+      return single
     },
   })
 
@@ -4395,7 +4447,7 @@ const zcodeAdapter = registerZcodeLlm(ctx, {
     ctx.logger.warn(`[jet-hub] 修正 MiniMax 国际版账号显示名失败：${String(error)}`)
   })
 
-  // ===== MiniMax 专属 60s 续期巡检（2026-10-24 本地试验版）=====
+  // ===== MiniMax 专属 60s 续期巡检 =====
   //
   // ⚠️⚠️ **这是本次重构的核心**：全局 30min 调度器对 MiniMax 已改为
   // **只对账**（`MinimaxAuth.refreshAll` 不再发 grant，见该方法注释），
@@ -4403,8 +4455,21 @@ const zcodeAdapter = registerZcodeLlm(ctx, {
   // 各账号续期时刻天然错开，旧形态「全池同秒过期」的结构性根因被拆除。
   //
   // ⚠️ 两个站点**各一条**（同 repair 的双站点纪律，漏一处即该站静默不续期）。
-  // ⚠️ 请求路径兜底（临期 60s 预判 + 401 强刷）走 adapter 的 `refresh()`
-  //    → `renewEntry(force)`，与本巡检共用单飞闸门，不会并发轮换同一 RT。
+  //
+  // ⚠️⚠️ **必须挂 `ctx.effect` 回收**（2026-10-27 审计修）。
+  //    修前这两行是裸调用：`startRenewPatrol` 装了一个 60s `setInterval`，
+  //    而**没有任何 clear 路径**（`unref` 只保证「不阻止进程退出」，不保证
+  //    「fiber 卸载后停手」）。实测 `fiber.dispose()` 后推进 130s ⇒ 巡检 tick
+  //    照跑，而旧实例读的是**共享 credentials 后端**（不是快照）⇒ 它会继续对
+  //    **新池**发 grant；插件热重载时旧实例没死 + 新实例已起 ⇒ **两个实例并发
+  //    轮换同一批一次性 RT**，输家拿到 `invalid_grant` 并把好号标死
+  //    （`refreshable:false` 是单向门）—— 恰好是本 PR 自己声称要修的形态。
+  //    ⚠️ 回收点必须与 `refreshScheduler.stop()`（下方 `ctx.effect`）同处：
+  //    那是本文件既有的生命周期约定，别另开一套。
+  ctx.effect(() => () => {
+    minimax.stopRenewPatrol()
+    minimaxIntl.stopRenewPatrol()
+  })
   void minimax.startRenewPatrol(pool)
   void minimaxIntl.startRenewPatrol(pool)
 

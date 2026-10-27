@@ -25,6 +25,7 @@ import {
   autoclawAccessTokenExpiresAtMs,
   type AutoclawCredential,
 } from './autoclaw.js'
+import { refreshFailureFromResponse } from './refresh-failure.js'
 
 export const AUTOCLAW_SEND_CODE_PATH = '/userapi/v1/agent-send-code'
 export const AUTOCLAW_LOGIN_PATH = '/userapi/v1/agent-login'
@@ -462,7 +463,28 @@ export async function refreshAutoclawToken(
 
       if (!resp.ok) {
         const text = await resp.text().catch(() => '')
-        throw new Error(`AutoClaw token refresh failed with status ${resp.status}: ${text}`)
+        /**
+         * ⚠️⚠️ **必须抛结构化错误**（2026-10-27 审计修）。
+         *
+         * 修前是裸 `new Error('... failed with status N: <body>')` —— 状态码只在
+         * 文案里，而 `autoclaw-auth.ts` 的终态判据只能 `msg.includes(...)` 捞词，
+         * 于是 `503` 报文里出现 `expired` / `Invalid token` / `401` 三个字符就
+         * 把健康账号判死（`refreshable:false` 是**单向门**，永不自愈）。
+         *
+         * ⇒ 现在把 `status` 与上游 OAuth `error` 一起带出来，判据读结构化字段。
+         * ⚠️ 响应体可能不是 JSON（网关 HTML 页）⇒ 解析失败时只带状态码。
+         */
+        let parsed: unknown
+        try {
+          parsed = JSON.parse(text)
+        } catch {
+          parsed = undefined
+        }
+        throw refreshFailureFromResponse(
+          `AutoClaw token refresh failed`,
+          resp.status,
+          parsed,
+        )
       }
 
       const json = (await resp.json()) as {
@@ -478,7 +500,25 @@ export async function refreshAutoclawToken(
       }
 
       if (json.code !== 0 || !json.data?.access_token) {
-        throw new Error(`AutoClaw token refresh returned code ${json.code}: ${json.msg ?? 'unknown'}`)
+        /**
+         * ⚠️⚠️ 业务码信封（HTTP 200 + `{code, msg}`）也必须**结构化**。
+         *
+         * AutoClaw 用它自己的词汇表达「token 无效」—— 实测是 `msg: "Invalid token"`，
+         * **不是** OAuth 的 `invalid_grant`。所以这里把 `msg` 作为 `oauthError` 带出，
+         * 并由调用点（`autoclaw-auth.ts`）在
+         * `isTerminalRefreshFailure(err, AUTOCLAW_TERMINAL_OAUTH_ERRORS)` 里
+         * **显式声明**自己的词表 —— 而不是把宽词塞回共享模块（那样又会退化成一个
+         * 大正则管所有家，正是本模块存在的理由）。
+         *
+         * ⚠️ 状态码用 `200`（信封在 HTTP 200 里）：`isTerminalRefreshFailure`
+         * 只对 `400` / `200` 两种「确定性拒绝」判定终态，5xx 一律非终态。
+         */
+        throw refreshFailureFromResponse(
+          'AutoClaw token refresh returned non-zero code',
+          200,
+          json,
+          'msg',
+        )
       }
 
       const newAccess = cleanBearerToken(json.data.access_token)
