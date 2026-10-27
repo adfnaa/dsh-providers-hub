@@ -465,7 +465,7 @@ describe('★ codeArtsExpiry：读不到到期时间就不猜（一律 NEVER）'
     // ⚠️ 本条的**真实价值**是挡住一个具体提议（PR #81 审计，2026-10-07）：
     //    把折算改成 `credit.total > 0 ? 当日 : UNUSABLE`，理由是「额度已尽仍被
     //    auto 选中」。该推理对本渠道不成立 —— codearts 有 benefit（免费额度）模型
-    //    （`isCodeArtsBenefitModel`），积分余额 0 的账号**仍能推理**；且账号可用性
+    //    （现为 `isCodeArtsBenefitModelKnown`；旧的静态表 `isCodeArtsBenefitModel` 已删除），积分余额 0 的账号**仍能推理**；且账号可用性
     //    的权威判据是**探测是否成功**（`!result.ok`），不是余额数值。
     //    写成 UNUSABLE 会把一个可用账号从 auto 候选里**永久剔除**。
     stubFetch({

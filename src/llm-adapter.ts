@@ -134,6 +134,113 @@ const BENEFIT_NOT_FOUND_CODE = 'BENEFIT_NOT_FOUND'
 const CODEARTS_BENEFIT_NOT_FOUND_ERROR_CODE = 'InferHub.4004.200'
 
 /**
+ * ⚠️⚠️ **本进程内「补头成功过」的模型 id**（2026-10-27 审计 P1 修）。
+ *
+ * ## 为什么需要它
+ *
+ * `benefitHeaderPromoted` 是 `stream()` 局部的 ⇒ 远端集合取不到时
+ * （本机常态：`gateway/config` 回 `4000 invalid channel`），benefit-only 模型
+ * **每条请求**都要「无头 404 → 补头 → 成功」两次 chat。修前（有静态表）只需 1 次
+ * ⇒ 这是 PR156 引入的净回归。实测：连续两次 `stream()` 头序列
+ * `[null,'benefit',null,'benefit']`，一轮 3 条并发 ⇒ **6 次上游**。
+ *
+ * ## 边界（如实登记）
+ *
+ * - **只在进程内**，不落盘：落盘会污染「权威集合」的语义（那只能由远端
+ *   `gateway/config` 写）。重启后重新探测一次，代价仅 1 轮。
+ * - 只记「补头后**真的成功了**」的模型（`markCodeArtsBenefitLearned` 只在
+ *   收到成功响应后调用）⇒ 不会把「上游根本不存在这个模型」记成 benefit。
+ * - 上限 {@link CODEARTS_BENEFIT_LEARNED_MAX} 条，防「用户狂换模型 id」把内存撑爆。
+ */
+const codeArtsBenefitLearned = new Set<string>()
+/** 学习集合上限（CodeArts 目录实际只有十来条，留足余量）。 */
+const CODEARTS_BENEFIT_LEARNED_MAX = 64
+
+/** 该模型在本进程内是否已被「补头成功」证明过要带 `maas_type: benefit`。 */
+export function codeArtsBenefitLearnedFor(model: string): boolean {
+  return codeArtsBenefitLearned.has(model)
+}
+
+/** 记下「该模型补头后成功」；只由成功路径调用。 */
+export function markCodeArtsBenefitLearned(model: string): void {
+  if (model.length === 0) return
+  if (codeArtsBenefitLearned.size >= CODEARTS_BENEFIT_LEARNED_MAX) {
+    // 淘汰最早的（Set 迭代序＝插入序），保持内存有界。
+    const oldest = codeArtsBenefitLearned.values().next()
+    if (!oldest.done) codeArtsBenefitLearned.delete(oldest.value)
+  }
+  codeArtsBenefitLearned.add(model)
+}
+
+/** 清空学习集合（仅供单测隔离）。 */
+export function resetCodeArtsBenefitLearned(): void {
+  codeArtsBenefitLearned.clear()
+}
+
+/**
+ * ⚠️⚠️ **领取福利的跨请求去重表**（2026-10-27 审计 P2 修）。
+ *
+ * 修前只有 `stream()` 局部的 `benefitClaimAttempted` ⇒ 3 条并发请求各领一次
+ * （实测 `claims=3`）。而领取是**写操作**，标题/压缩是后台请求，用户看不到
+ * 它们的失败但写请求照发；若上游对领取做了限流/审计，等于每次对话 3 发。
+ *
+ * ⇒ 按 `access_token` 的短哈希做 key，**同一个 Promise 在 60s 内复用**：
+ * - 并发场景：3 条同时进入 ⇒ 拿到**同一个** Promise ⇒ 只发 1 次写；
+ * - 跨轮场景：60s 内第二轮复用结果 ⇒ 不再重复领。
+ *
+ * ⚠️ 用 token 短哈希而不是完整 token：表只在内存里，但别把凭据原文当 key
+ *   （本仓库纪律：日志/索引都不留凭据原文）。
+ */
+const CODEARTS_BENEFIT_CLAIM_DEDUPE_MS = 60_000
+interface ClaimDedupEntry { at: number; promise: Promise<string> }
+const codeArtsBenefitClaimFlight = new Map<string, ClaimDedupEntry>()
+
+/** 领取去重的 key：凭据标识的短哈希（不落原文）。 */
+function claimDedupKey(credential: CodeArtsCredential): string {
+  // ⚠️ CodeArts 凭据没有 `access_token`（那是别的 provider 的形状），
+  //    身份是 `access_key_id`（+ 可选的 `user_id`）。
+  const token = `${credential.access_key_id ?? ''}:${credential.user_id ?? ''}`
+  let hash = 0
+  for (let i = 0; i < token.length; i += 1) {
+    hash = (hash * 31 + token.charCodeAt(i)) | 0
+  }
+  return `${token.length}:${(hash >>> 0).toString(16)}`
+}
+
+/**
+ * 领取福利（跨请求去重版）。返回 `claimCodeArtsBenefit` 的原字符串。
+ *
+ * ⚠️ 去重窗口内**复用同一个 Promise**，因此并发的三条请求只会真正发一次写请求。
+ * ⚠️ 失败结果也复用（避免「失败 → 立刻重试」放大写请求）；窗口过了才重新领。
+ */
+export async function claimCodeArtsBenefitShared(
+  credential: CodeArtsCredential,
+  fetcher: typeof fetch,
+  options?: { signal?: AbortSignal },
+): Promise<string> {
+  const key = claimDedupKey(credential)
+  const now = Date.now()
+  const existing = codeArtsBenefitClaimFlight.get(key)
+  if (existing !== undefined && now - existing.at < CODEARTS_BENEFIT_CLAIM_DEDUPE_MS) {
+    return existing.promise
+  }
+  const promise = claimCodeArtsBenefit(credential, fetcher, options)
+  codeArtsBenefitClaimFlight.set(key, { at: now, promise })
+  // ⚠️ 结算后**不移除**条目：窗口内要复用结果（含失败）。过期条目在下次调用时
+  //    被替换，且上限兜底防泄漏。
+  if (codeArtsBenefitClaimFlight.size > 128) {
+    const oldest = codeArtsBenefitClaimFlight.keys().next()
+    if (!oldest.done) codeArtsBenefitClaimFlight.delete(oldest.value)
+  }
+  return promise
+}
+
+/** 清空领取去重表（仅供单测隔离）。 */
+export function resetCodeArtsBenefitClaimFlight(): void {
+  codeArtsBenefitClaimFlight.clear()
+}
+
+/**
  * 「模型未注册」的稳定失败码 —— 用于反向补 `maas_type: benefit`。
  *
  * CodeArts 对**只按 benefit 通道注册**的模型（如 `glm-5.3-flash`）会以
@@ -873,6 +980,37 @@ export function isBenefitNotFoundBody(body: string): boolean {
  * 一个说「不该带却带了」。判据同样按**实测全等**，不放松成前缀。
  */
 export function isModelNotRegisteredBody(body: string): boolean {
+  /**
+   * ⚠️⚠️ **优先按 JSON 的 `error_code` 全等判，裸子串只作兜底**（2026-10-27 审计修）。
+   *
+   * 修前是裸 `body.includes('InferHub.002002009.404')` —— 对抗审计构造了一个
+   * **与「未注册」完全无关**的 400：正文是
+   * `invalid tool call arguments: {"q":"InferHub.002002009.404"}`（用户内容被回显）
+   * ⇒ 也命中 ⇒ 多打一次上游，还把 `maas_type` 送给一个非 benefit 模型。
+   *
+   * 而 SSE 通道那条用的是 `data.error_code === '…'` **全等**判据 ——
+   * 所以 PR 注释里「两条通道同源同判据」是**不实**的（现在按全等优先，才真的同源）。
+   *
+   * ⚠️ 兜底保留裸子串的理由：4xx 的报文形态与 SSE 不同（字段名可能不叫
+   * `error_code`），本函数上方注释记载过这条教训（`isBenefitNotFoundBody` 同型）。
+   * 兜底只在「解析不出结构化 error_code」时才走。
+   */
+  const trimmed = body.trim()
+  if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
+    try {
+      const parsed: unknown = JSON.parse(trimmed)
+      const code = typeof parsed === 'object' && parsed !== null
+        ? (parsed as { error_code?: unknown; errorCode?: unknown }).error_code
+          ?? (parsed as { errorCode?: unknown }).errorCode
+        : undefined
+      if (typeof code === 'string') {
+        // 结构化字段存在 ⇒ 只认全等，不再看正文（避免把回显内容当信号）。
+        return code === CODEARTS_MODEL_NOT_REGISTERED_ERROR_CODE
+      }
+    } catch {
+      // 不是合法 JSON ⇒ 走下面的兜底
+    }
+  }
   return body.includes(CODEARTS_MODEL_NOT_REGISTERED_ERROR_CODE)
 }
 
@@ -1748,8 +1886,12 @@ export class CodeArtsAdapter extends LlmAdapter {
     // 只试一次，避免与真实失败互相掩盖。
     let benefitHeaderDropped = false
     // 反向：该模型只按 benefit 通道注册（不带该头 → InferHub.002002009.404）
-    // 时补上该头重试一次。与 `benefitHeaderDropped` 互斥且各只一次，因此
-    // 两者叠加最多两轮，不会来回乒乓。
+    // 时补上该头重试一次。与 `benefitHeaderDropped` 互斥且各只一次。
+    //
+    // ⚠️ 实测（2026-10-27 审计）**最坏是三次发送**，不是「两轮」：
+    //    无头(404) → 补头(4004.200，此时可能先领一次) → 去头(404) → 抛。
+    //    即 `benefitHeaderPromoted` 与 `benefitHeaderDropped` **不互斥**（先补后去），
+    //    两条自愈都允许发生一次 ⇒ 序列长度 3。断言「最多两轮」会与实际不符。
     let benefitHeaderPromoted = false
     /**
      * 本轮请求**实际带上了** `maas_type: benefit` 没有。
@@ -1772,21 +1914,64 @@ export class CodeArtsAdapter extends LlmAdapter {
     // `chat.headers` 钩子里写 `if (model_id ∈ gatewayConfig.models) headers.maas_type
     // = "benefit"`，没有任何静态表（2026-10-26 逆向 `agentkernelServer-win32-x64.exe`）。
     // 本仓库曾另有一张静态兜底表，两次都因后端改注册通道而误判，已删除：
-    // 猜错的代价是**首条消息直接报 4004.200**，比「首次多一轮 404 往返」贵得多。
+    // 猜错的代价是**首条消息直接报 4004.200**，比"首次多一轮 404 往返"贵得多。
     const benefitHeaderCertain = isCodeArtsBenefitModelKnown(options.model)
+    /**
+     * ⚠️⚠️ **本进程内「补头成功」的记忆**（2026-10-27 审计 P1 修）。
+     *
+     * ## 为什么必须有
+     *
+     * `benefitHeaderPromoted` 是 `stream()` 的**局部变量** ⇒ 下一轮从"没带头"
+     * 重新开始。而远端集合取不到时（本机常态：`gateway/config` 回
+     * `4000 invalid channel`，见 `docs/agent-notes/providers-codearts.md:57`），
+     * `benefitHeaderCertain` 恒 `false` ⇒ benefit-only 模型（`glm-5.3-flash`，
+     * 在 `DEFAULT_MODELS` 里）**每条请求**都要「无头 404 → 补头 → 成功」两次 chat。
+     *
+     * 实测（对抗审计）：连续两次 `stream()` 的头序列 `[null,'benefit',null,'benefit']`；
+     * DSH 一轮 3 条并发（主回复/标题/压缩）⇒ **6 次上游**。
+     * 而修前（有静态表）同场景只需 1 次 ⇒ 这是本 PR 引入的**净回归**。
+     *
+     * ## 为什么是进程内（不落盘）
+     *
+     * 落盘会污染「权威集合」的语义（那必须只由远端 `gateway/config` 写），
+     * 而这里只是"实践证伪了远端集合的完备性"的**观测**：进程内学习足够消除
+     * 同一次运行里的重复代价，重启后重新探测一次也无妨（代价仅 1 轮）。
+     */
+    const learnedThisProcess = codeArtsBenefitLearnedFor(options.model)
     /**
      * 领一次限时福利（幂等）。`true` = 领到 ⇒ 调用方**保持** `maas_type: benefit`
      * 头重试；`false` = 领不到 ⇒ 退回既有的去头降级。
      *
-     * ⚠️ 只由调用方的 `benefitClaimAttempted` 保证「一次」；这里自身不记状态，
-     * 好让 SSE 与 4xx 两条通道**共用同一个门禁**（与 `benefitHeaderDropped`
-     * 同构 —— 两条通道各试一次会把一个上游条件放大成两轮）。
+     * ⚠️⚠️ **两个门禁，缺一不可**（2026-10-27 审计 P2 修）：
+     * 1. 调用方的 `benefitClaimAttempted` —— 「本次 `stream()` 内只领一次」；
+     * 2. {@link claimCodeArtsBenefitShared} 的**跨请求去重** —— 「同一凭据
+     *    在一段时间内只领一次」。
+     *
+     * 修前**只有**第 1 条，而它是 `stream()` 局部变量 ⇒ 3 条并发请求各领一次
+     * （实测 `claims=3`）。而领取是**写操作**，标题/压缩请求是后台的、用户看不到
+     * 它们的失败，但写请求照发。
      */
     const claimBenefitOnce = async (): Promise<boolean> => {
       // 闭包里拿不到外层「credential 已判非空」的收窄（`let` 可变），自己再判一次。
       if (credential === undefined) return false
+      /**
+       * ⚠️⚠️ **只有远端集合确认过的模型才允许领取**（2026-10-27 审计 P1 修）。
+       *
+       * `InferHub.4004.200` 这个码**不区分**两种语义：
+       * ① 该账号没有 benefit 包；② 这个模型根本不该带该头（PR 自己取证过：
+       * 把该头送给非 benefit 模型就回 `4004.200`）。
+       *
+       * 而补头方向（`MODEL_NOT_REGISTERED`）会把**任意**未确认模型也带上该头
+       * ⇒ 于是「模型不存在 / 打错 id」这种与福利无关的场景，会走到这里**领一次福利**
+       * （实测：一次 `stream()` 里 4 次 chat + 1 次写）。
+       *
+       * ⇒ 领取的前置条件收紧成「该模型由远端 `gateway/config` **确认**过」
+       *   （或本进程内补头成功过）。未确认时直接返回 `false`，走既有的去头降级 ——
+       *   那条路径**只发读请求**。
+       */
+      if (!benefitHeaderCertain && learnedThisProcess === false) return false
       try {
-        return (await claimCodeArtsBenefit(credential, this.fetchImpl)) === 'success'
+        return (await claimCodeArtsBenefitShared(credential, this.fetchImpl, options)) === 'success'
       } catch {
         // 领取路径的任何异常都不得掩盖原失败：领不到就走降级。
         return false
@@ -1794,11 +1979,11 @@ export class CodeArtsAdapter extends LlmAdapter {
     }
     for (;;) {
       // `maas_type: benefit` 参与 SDK-HMAC-SHA256 签名（不签就 401），故只能在这里
-      // 决定。首次是否带只看 `benefitHeaderCertain`（远端 gateway/config 确认）；
+      // 决定。首次是否带只看三条腿：远端确认 / 本进程补头成功过 / 本次已补头。
       // 其余一律先发常规请求 —— 与官方内核「model_id ∈ gatewayConfig.models 才写该头」
       // 同一口径。后端若另有安排，由下方两个自愈方向兜住（各一次）。
       const extraSignedHeaders = !benefitHeaderDropped
-        && (benefitHeaderCertain || benefitHeaderPromoted)
+        && (benefitHeaderCertain || learnedThisProcess || benefitHeaderPromoted)
         ? { maas_type: 'benefit' }
         : undefined
       benefitHeaderSent = extraSignedHeaders !== undefined
@@ -1833,6 +2018,19 @@ export class CodeArtsAdapter extends LlmAdapter {
         // SseQueueRetryError，落入下方排队重试逻辑，与 TM.00001041 一致。
         try {
           yield* this.consumeSse(response, options)
+          /**
+           * ⚠️⚠️ **补头后真的出流成功 ⇒ 记入进程内学习集合**（2026-10-27 审计 P1 修）。
+           *
+           * 只有走到这里（`consumeSse` 正常返回、没抛任何自愈错误）才算
+           * 「这个模型确实需要 `maas_type: benefit`」⇒ 下一轮请求直接带头，
+           * 不再每次先付一轮 404 往返（远端集合取不到时那是**每条请求**的代价，
+           * 实测一轮 3 条并发 = 6 次上游）。
+           *
+           * ⚠️ 刻意**不**在 `benefitHeaderPromoted = true` 那一刻记 —— 那只是
+           * 「决定补头」，补上去仍可能失败（模型不存在 / 账号无权限）。记错了会让
+           * 后续请求把该头送给一个不该带的模型，而那正是本 PR 要修的缺陷形态。
+           */
+          if (benefitHeaderPromoted) markCodeArtsBenefitLearned(options.model)
           break
         } catch (error) {
           if (error instanceof SseQuotaExhaustedError) {

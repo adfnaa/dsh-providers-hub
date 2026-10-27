@@ -592,10 +592,21 @@ export async function fetchCodeArtsAccountInfo(
  * {@link fetchCodeArtsAccountInfo} 的带原因版本。
  *
  * 失败分支**必须带 `code`**：上层（`credits.claimAll` / `credits.balances`）要靠
- * 它判断「这次失败是不是凭据过期（401/403）」，进而触发本机快照自愈并重试一次。
  * 早期这里只留 `message`，调用方拿到的是被压平的字符串，只能靠匹配文案猜 ——
  * 这正是用户报障「账户信息查询失败：HTTP 401：APIG.0301 …」时无法自愈的原因。
  * 网络异常/无法解析等非 HTTP 失败沿用 `-1`（与 {@link SnapResult} 同口径）。
+ *
+ * ⚠️⚠️ **`code` 目前是「仅供 UI / 诊断透出」的载荷，没有任何自愈消费者**
+ * （2026-10-27 对抗审计核实）。
+ *
+ * 旧注释曾写「它判断这次失败是不是 401/403，进而触发本机快照自愈并重试一次」——
+ * **不实**：全仓读这个字段的调用点只取 `.ok` / `.info` / `.message`
+ * （`src/aggregate-expiry.ts`、`src/provider-credits.ts:380-381`）；
+ * 真正的凭据自愈是**端点入口**的 `healExpiredAccounts(accounts)`
+ * （`src/jet-hub-rpc.ts:2714`），按账号 `expiresAt` 判定，**与返回值无关**。
+ *
+ * ⇒ 保留字段（诊断有用）但改准注释；若将来真要「按 401 触发自愈」，
+ *   必须**新接**一条消费者并补行为用例，别以为它已经接上了。
  */
 export type CodeArtsAccountInfoResult =
   | { ok: true; info: CodeArtsAccountInfo }
@@ -847,6 +858,14 @@ export async function claimCodeArtsDailyCheckin(
 export async function claimCodeArtsBenefit(
   credential: CodeArtsCredential,
   fetcher: typeof fetch = fetch,
+  /**
+   * ⚠️ **必须接调用方的 signal**（2026-10-27 审计修）。
+   *
+   * 修前本函数自带一个 30 秒的 `AbortSignal.timeout`，与 `options.signal`
+   * **完全无关** ⇒ 用户按下「停止」后，这条**写请求**仍会继续跑到超时
+   * （最多再等 30 秒），而适配器里其它 await（`delay(…, options.signal)`）都是可中断的。
+   */
+  options?: { signal?: AbortSignal },
 ): Promise<'success' | 'failed'> {
   const { access_key_id: ak, secret_access_key: sk, security_token: st } = credential
   if (!ak || !sk) return 'failed'
@@ -863,7 +882,15 @@ export async function claimCodeArtsBenefit(
       method: 'POST',
       headers,
       body,
-      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+      /**
+       * ⚠️ 两个信号**合并**：既保留自身的 30s 兜底超时，又能被调用方的
+       * 「停止」立即打断（`AbortSignal.any` 是 Node 20+ 标准）。
+       * 修前这里恒为 `AbortSignal.timeout(...)` ⇒ 用户按停止后这条**写请求**
+       * 仍会跑到超时（最多再等 30 秒）。
+       */
+      signal: options?.signal === undefined
+        ? AbortSignal.timeout(REQUEST_TIMEOUT_MS)
+        : AbortSignal.any([options.signal, AbortSignal.timeout(REQUEST_TIMEOUT_MS)]),
     })
     if (!response.ok) return 'failed'
     const parsed: unknown = JSON.parse(await response.text())

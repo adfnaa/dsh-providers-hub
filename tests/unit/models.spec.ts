@@ -130,9 +130,23 @@ describe('fetchCodeArtsRemoteModels', () => {
     const ids = models.map((m) => m.id)
     // benefit 模型
     expect(ids).toContain('glm-5.3-flash')
-    // 日期后缀被 normalizeModelId 去掉
-    expect(ids).toContain('deepseek-v4-flash')
-    expect(ids).not.toContain('deepseek-v4-flash-0731')
+    /**
+     * ⚠️⚠️ **带日期版本后缀的模型必须「独立且直接暴露」**（2026-10-27 修）。
+     *
+     * 修前这里断言的是「日期后缀被 `normalizeModelId` 去掉」⇒ 上游并存的旧版与
+     * 新版会被合并成一条，带版本号的那条**静默消失**（真实报障：IDE 已更新到
+     * `DeepSeek-V4.1-Flash-1017`，插件列表没更新）。
+     *
+     * 实测依据（IDE 内核日志 `kernel-codeartsdoer-incognito-2026-10-27T220300`）：
+     * `/v1/model/builtin` 同时下发 `deepseek-v4.1-flash` 与
+     * `deepseek-v4.1-flash-1017` **两个独立条目**，两者 `model_type` 都是 `admin`、
+     * `context` 都是 `1048576` ⇒ 是上游并存的版本，不是同一模型的两种写法。
+     *
+     * ⇒ 现在对外 id 用原始 `model_id`；`seen` 去重键也用 rawId。
+     */
+    expect(ids, '★ 带版本后缀的 id 必须原样暴露（上游把它们当独立模型）')
+      .toContain('deepseek-v4-flash-0731')
+    expect(ids, '★ 不得再归一成无后缀、与旧版合并成一条').not.toContain('deepseek-v4-flash')
     // 常规模型
     expect(ids).toContain('GLM-5.2')
     // 去重：glm-5.3-flash 只出现一次
@@ -360,12 +374,55 @@ describe('benefit 身份判定与缓存（远端集合唯一权威）', () => {
     expect(loadModelsCache()).toEqual([{ id: 'GLM-5.2', name: 'GLM-5.2' }])
   })
 
-  it('空目录不得固化为「已确认」', () => {
-    // loadBenefitCache() 对空数组返回 undefined（不是 []），
-    // 因此「上游把 benefit 模型全部下架」只会退回未确认，不会残留旧正值。
+  it('★★ 空集合 = 「确认无」，必须与「未确认」区分（2026-10-27 审计 P1 修）', () => {
+    /**
+     * ⚠️⚠️ **修前这条用例的注释与断言都是错的**（对抗审计 P5a 打穿）：
+     *
+     * 注释写「`loadBenefitCache()` 对空数组返回 undefined，因此上游把 benefit
+     * 模型全部下架只会退回未确认，不会残留旧正值」—— 但**残留恰恰会发生**：
+     * 生产写路径 `saveBenefitCache` 只在 `benefitIds.length > 0` 时被调用，
+     * `[]` 根本写不进磁盘 ⇒ 旧值一直留着。而本用例手动 `saveBenefitCache([])`
+     * 恰好**绕开了生产写路径**，属**假守卫**（实测：把生产写条件改回
+     * `length > 0`，本用例仍绿）。
+     *
+     * ⇒ 现在语义明确区分：
+     * | 磁盘 | `loadBenefitCache()` | 含义 |
+     * |---|---|---|
+     * | 不存在/解析失败 | `undefined` | **未确认**（靠自愈补头） |
+     * | `[]` | `[]` | **确认无** benefit 模型 |
+     * | `[id…]` | 数组 | 确认有这些 |
+     *
+     * 这样「确认无」才能落到磁盘、跨重启生效，陈旧集合才会被真正清掉
+     * （否则会「带头 → 4004.200 → **领取写** → 去头 → 成功」每条请求一次写）。
+     */
     saveBenefitCache([])
     setBenefitMemoryCache(undefined)
+    expect(loadBenefitCache(), '★ 空数组必须原样返回 []（= 确认无），不能退化成「未确认」').toEqual([])
     expect(isCodeArtsBenefitModelKnown('glm-5.3-flash')).toBe(false)
+  })
+
+  it('★★ 上游回空集合 ⇒ 必须**覆盖**磁盘上的旧值（消除陈旧正值）', async () => {
+    /**
+     * ⚠️ 对抗审计实测（P5a）：磁盘上留着旧版本写的 `["glm-5.3-flash"]`、
+     * 而 gateway 合法回 `{"result":{"models":[]}}` —— 修前什么都不做
+     * ⇒ 判定仍是 `true` ⇒ 每条请求都「带头 → 4004.200 → 领取（写）→ 去头」
+     * （实测 3 条请求 = 3 次领取 + 6 次 chat），跨重启存活。
+     *
+     * 这与本 PR 删掉静态表的理由（「静态表会过时」）是同一个病，只是搬到了磁盘。
+     */
+    saveBenefitCache(['glm-5.3-flash'])
+    setBenefitMemoryCache(undefined)
+    expect(isCodeArtsBenefitModelKnown('glm-5.3-flash'), '前置：旧值应生效').toBe(true)
+    const { fetcher } = makeFetcher({
+      [OPENGW_GATEWAY_CONFIG_URL]: { body: JSON.stringify({ result: { models: [] } }) },
+      [SNAP_MODEL_BUILTIN_URL]: { body: JSON.stringify({ builtinModels: [] }) },
+    })
+    await fetchCodeArtsRemoteModels(makeCredential(), fetcher)
+    expect(
+      isCodeArtsBenefitModelKnown('glm-5.3-flash'),
+      '★★ 上游确认「无 benefit 模型」后，陈旧正值必须被清掉（否则每轮一次写请求）',
+    ).toBe(false)
+    expect(loadBenefitCache(), '★ 磁盘也必须被覆盖成 []').toEqual([])
   })
 
   it('倍率经缓存往返不丢（rateLabel 落盘/读回）', () => {

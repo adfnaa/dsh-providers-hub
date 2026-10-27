@@ -1,5 +1,5 @@
 import { LlmError } from '@deepseek-ai/dsh-llm'
-import { describe, expect, it, vi } from 'vitest'
+import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { readFileSync } from 'node:fs'
 import { credentialRef } from '@deepseek-ai/dsh-credentials'
 import {
@@ -17,6 +17,10 @@ import {
 } from '../../src/llm-adapter.js'
 import { nextUtc8DayStartMs } from '../../src/model-queue.js'
 import { setBenefitMemoryCache } from '../../src/models.js'
+import {
+  resetCodeArtsBenefitClaimFlight,
+  resetCodeArtsBenefitLearned,
+} from '../../src/llm-adapter.js'
 import { CODEARTS_BENEFIT_CLAIM_URL } from '../../src/codearts-credits.js'
 import type { CodeArtsCredential } from '../../src/types.js'
 
@@ -131,6 +135,23 @@ function stripCommentsAndKeepStrings(source: string): string {
   }
   return out
 }
+
+/**
+ * ⚠️⚠️ **必须逐用例隔离两个模块级缓存**（2026-10-27）。
+ *
+ * `claimCodeArtsBenefitShared` 的跨请求去重表与 `codeArtsBenefitLearned` 都是
+ * **模块级**的 —— 那是生产想要的行为（同一凭据 60s 内只领一次、补头成功过就记住），
+ * 但单测里会**跨用例污染**：前一条用例领过 ⇒ 后一条在 60s 窗口内复用旧 Promise
+ * ⇒ `claimCalls` 变 0，报出「领了一次却没发请求」这种无从归因的假红（实测踩过）。
+ *
+ * ⚠️ 也可能反向污染：前一条用例「补头成功」把模型记进 learned ⇒ 后一条
+ * 「未确认」用例变成直接带头 ⇒ 序号序列整体错位。
+ */
+beforeEach(() => {
+  resetCodeArtsBenefitClaimFlight()
+  resetCodeArtsBenefitLearned()
+  setBenefitMemoryCache(undefined)
+})
 
 describe('CodeArtsAdapter', () => {
   it('providerInfo identifies the codearts route', () => {
@@ -3589,8 +3610,22 @@ describe('CodeArtsAdapter', () => {
         }
         // 常规 → 补头 → 去头（三轮）后收敛。
         expect(seen).toEqual([null, 'benefit', null])
-        // 领取仍只试一次（两条通道共用同一门禁）。
-        expect(claimCalls).toBe(1)
+        /**
+         * ⚠️⚠️ **未确认的模型不得领取**（2026-10-27 审计 P1 修，期望值由 1 改为 0）。
+         *
+         * 本用例的 `setBenefitMemoryCache([])` 表示「远端确认**没有** benefit 模型」
+         * ⇒ `benefitHeaderCertain === false`。而 `InferHub.4004.200` 这个码**不区分**：
+         * ① 该账号没有 benefit 包；② 这个模型根本不该带该头（PR 自己取证过：
+         * 把该头送给非 benefit 模型就回 `4004.200`）。
+         *
+         * 于是这条「补头方向带出来的 4004.200」如果去领取，就是**在无关场景里
+         * 打一次写请求**（对抗审计实测：一次 `stream()` 里 4 次 chat + 1 次写）。
+         *
+         * ⇒ 修法：领取的前置条件收紧成「该模型由远端 `gateway/config` 确认过」
+         *   （或本进程内补头成功过）。未确认时直接走既有的去头降级 —— 只发读请求。
+         *   序列不变（逃→补→去→抛），只是不再有那次写。
+         */
+        expect(claimCalls, '★ 未确认模型不得触发领取（写操作）').toBe(0)
         // 如实抛出「未注册」——此时已无可用手段。
         expect((thrown as LlmError).code).toBe('MODEL_NOT_REGISTERED')
       } finally {
@@ -3696,3 +3731,239 @@ describe('CodeArtsAdapter 残缺目录自愈（★ IKJVTF I3）', () => {
     expect(calls).toBe(afterFirst)
   })
 })
+
+  /**
+   * ★★ **2026-10-27 审计修的四条不变式**（每条都对应一处实测击穿）。
+   *
+   * 这一组钉的是「自愈状态机」的**边界**：写操作的前置条件、跨请求去重、
+   * 进程内学习、以及「只领一次」这条原先**完全没被守卫**的不变式
+   * （对抗审计实测：删掉那条门禁后 115 条用例全绿，而探针变成无限循环）。
+   */
+  describe('★★ benefit 自愈的写操作边界（2026-10-27 审计修）', () => {
+    it('★★★ 领取恒成功 + 上游恒 4004.200 ⇒ 只领一次、且必然收敛（钉住「不乒乓」）', async () => {
+      /**
+       * ⚠️⚠️ 这是本轮**最关键的守卫**：对抗审计把 `if (!benefitClaimAttempted)`
+       * 改成 `if (true)` 后，PR 原有的 115 条用例**全绿**，而同配置的探针
+       * 变成「chat+claim 无限循环」（4s 超时）。
+       *
+       * 根因：`claimBenefitOnce()` 成功 ⇒ `continue` 保持头重放 ⇒ 又 4004.200
+       * ⇒ 若门禁被去掉就**再领一次** ⇒ 永远出不去。也就是说「各只一次」这条
+       * 被写进 PR 描述的不变式，原先**一条用例都没钉住**。
+       *
+       * ⇒ 本用例：领取**恒成功**、上游**恒** 4004.200，断言
+       *   ① chat 有界（≤3）；② 领取**恰好一次**；③ 最终如实抛错。
+       */
+      setBenefitMemoryCache(['deepseek-v4.1-flash'])
+      try {
+        const seen: Array<string | null> = []
+        let claimCalls = 0
+        const fetchImpl = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+          const url = String(input)
+          if (url.startsWith(QUEUE_STATUS_BASE)) {
+            return new Response('{"status":"working"}', { status: 200, headers: { 'content-type': 'application/json' } })
+          }
+          if (url === CODEARTS_BENEFIT_CLAIM_URL) {
+            claimCalls += 1
+            // ⚠️ 领取**永远成功** —— 这是让「无门禁版本」无限循环的关键设定。
+            return new Response(JSON.stringify({ error_code: '0000' }), { status: 200 })
+          }
+          const maasType = new Headers(init?.headers).get('maas_type')
+          seen.push(maasType)
+          // ⚠️ 上游**永远**回 4004.200（无论带不带头）⇒ 逼出自愈上限。
+          return new Response(
+            'data:{"text":"[DONE]","error_code":"InferHub.4004.200","error_msg":"benefit not found"}\n\n',
+            { status: 200, headers: { 'content-type': 'text/event-stream' } },
+          )
+        })
+        const adapter = makeAdapter({ fetchImpl })
+        let thrown: unknown
+        try {
+          for await (const _ of adapter.stream({ ...streamOptions, model: 'deepseek-v4.1-flash' } as never)) { /* 不应产出 */ }
+        } catch (error) {
+          thrown = error
+        }
+        expect(
+          claimCalls,
+          '★★★ 领取是**写操作**，必须**恰好一次**；无门禁版本会无限循环（审计实测 4s 超时）',
+        ).toBe(1)
+        expect(seen.length, '★ 自愈必须收敛（chat 有界），不得乒乓').toBeLessThanOrEqual(3)
+        expect((thrown as LlmError).code).toBe('BENEFIT_NOT_FOUND')
+      } finally {
+        setBenefitMemoryCache(undefined)
+      }
+    })
+
+    it('★★ 3 条并发同时 4004.200 ⇒ 只发 1 次领取（写操作必须跨请求去重）', async () => {
+      /**
+       * ⚠️ 修前 `benefitClaimAttempted` 是 `stream()` 局部的 ⇒ 3 条并发各领一次
+       * （对抗审计实测 `claims=3`）。而 DSH 一轮会并发发主回复 + 标题 + 压缩
+       * 三条请求，标题/压缩是后台的、用户看不到它们的失败，但**写请求照发**。
+       */
+      setBenefitMemoryCache(['deepseek-v4.1-flash'])
+      try {
+        let claimCalls = 0
+        const fetchImpl = vi.fn(async (input: RequestInfo | URL) => {
+          const url = String(input)
+          if (url.startsWith(QUEUE_STATUS_BASE)) {
+            return new Response('{"status":"working"}', { status: 200, headers: { 'content-type': 'application/json' } })
+          }
+          if (url === CODEARTS_BENEFIT_CLAIM_URL) {
+            claimCalls += 1
+            // ⚠️ 故意慢一点，让三条请求真正重叠（否则测不出「复用同一个 Promise」）
+            await new Promise((resolve) => setTimeout(resolve, 10))
+            return new Response(JSON.stringify({ error_code: 'APIG.9999' }), { status: 200 })
+          }
+          return new Response(
+            'data:{"text":"[DONE]","error_code":"InferHub.4004.200","error_msg":"benefit not found"}\n\n',
+            { status: 200, headers: { 'content-type': 'text/event-stream' } },
+          )
+        })
+        const adapter = makeAdapter({ fetchImpl })
+        const run = async (): Promise<void> => {
+          try {
+            for await (const _ of adapter.stream({ ...streamOptions, model: 'deepseek-v4.1-flash' } as never)) { /* noop */ }
+          } catch { /* 三条都应失败，不影响断言 */ }
+        }
+        await Promise.all([run(), run(), run()])
+        expect(
+          claimCalls,
+          '★★ 并发去重失效 ⇒ 一轮对话发 3 次写请求（标题/压缩是后台请求，用户看不到）',
+        ).toBe(1)
+      } finally {
+        setBenefitMemoryCache(undefined)
+      }
+    })
+
+    it('★★ 远端集合取不到时，补头成功一次后**下一轮直接带头**（不得每条请求都付两轮）', async () => {
+      /**
+       * ⚠️ 修前 `benefitHeaderPromoted` 是 `stream()` 局部变量 ⇒ 远端集合为空时
+       * （本机常态：`gateway/config` 回 `4000 invalid channel`）benefit-only 模型
+       * **每条请求**都要「无头 404 → 补头 → 成功」两次 chat。
+       * 实测：连续两次 `stream()` 头序列 `[null,'benefit',null,'benefit']`；
+       * 一轮 3 条并发 ⇒ **6 次上游**。修前（有静态表）同场景只需 1 次。
+       */
+      setBenefitMemoryCache([])   // ← 远端「确认无」⇒ 首轮一定不带头
+      try {
+        const seen: Array<string | null> = []
+        const fetchImpl = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+          const url = String(input)
+          if (url.startsWith(QUEUE_STATUS_BASE)) {
+            return new Response('{"status":"working"}', { status: 200, headers: { 'content-type': 'application/json' } })
+          }
+          if (url === CODEARTS_BENEFIT_CLAIM_URL) {
+            return new Response(JSON.stringify({ error_code: 'APIG.9999' }), { status: 200 })
+          }
+          const maasType = new Headers(init?.headers).get('maas_type')
+          seen.push(maasType)
+          if (maasType === null) {
+            // 无头 ⇒ 未注册（逼出补头方向）
+            return new Response(
+              'data:{"text":"[DONE]","error_code":"InferHub.002002009.404","error_msg":"not registered"}\n\n',
+              { status: 200, headers: { 'content-type': 'text/event-stream' } },
+            )
+          }
+          // 带头 ⇒ 成功出流
+          return new Response('data: {"choices":[{"delta":{"content":"ok"}}]}\n\ndata: [DONE]\n\n', { status: 200 })
+        })
+        const adapter = makeAdapter({ fetchImpl })
+        const first = async (): Promise<void> => {
+          for await (const _ of adapter.stream({ ...streamOptions, model: 'deepseek-v4.1-flash' } as never)) { /* noop */ }
+        }
+        await first()
+        expect(seen, '首轮：无头 → 补头（这是远端集合缺失时的正常代价）').toEqual([null, 'benefit'])
+        seen.length = 0
+        await first()
+        expect(
+          seen,
+          '★★ 第二轮仍从「无头」开始 ⇒ 每条请求都多付一次上游往返（进程内学习没生效）',
+        ).toEqual(['benefit'])
+      } finally {
+        setBenefitMemoryCache(undefined)
+      }
+    })
+
+    it('★★ 4xx 判据必须优先读结构化 error_code：正文回显同串不得触发补头', async () => {
+      /**
+       * ⚠️ 修前 `isModelNotRegisteredBody` 是裸 `body.includes('InferHub.002002009.404')`
+       * ⇒ 对抗审计构造了一个**与「未注册」无关**的 400：正文里回显了用户内容，
+       * 而用户内容恰好含这串字符 ⇒ 也命中 ⇒ 多打一次上游，还把 `maas_type`
+       * 送给一个非 benefit 模型。
+       *
+       * ⇒ 现在：能解析出结构化 `error_code` 时**只认全等**（与 SSE 通道同判据）；
+       * 裸子串只作「解析不出结构化字段」时的兜底。
+       *
+       * ⚠️ 本用例的关键是 `error_code` **存在但不等于**该码，且正文**仍含**该串 ——
+       * 只有这样才能区分「全等优先」与「裸子串」两种实现（我第一版用「无 error_code
+       * 字段」的报文，两种实现都给 true ⇒ **无牙**，变异实测全绿）。
+       */
+      setBenefitMemoryCache([])
+      try {
+        const seen: Array<string | null> = []
+        const fetchImpl = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+          const url = String(input)
+          if (url.startsWith(QUEUE_STATUS_BASE)) {
+            return new Response('{"status":"working"}', { status: 200, headers: { 'content-type': 'application/json' } })
+          }
+          if (url === CODEARTS_BENEFIT_CLAIM_URL) {
+            return new Response(JSON.stringify({ error_code: 'APIG.9999' }), { status: 200 })
+          }
+          seen.push(new Headers(init?.headers).get('maas_type'))
+          // ⚠️ 结构化码是「别的东西」，但 error_msg 里回显了未注册码的那串字符。
+          return new Response(JSON.stringify({
+            error_code: 'InferHub.9999.400',
+            error_msg: 'invalid tool call arguments: {"q":"InferHub.002002009.404"}',
+          }), { status: 400, headers: { 'content-type': 'application/json' } })
+        })
+        const adapter = makeAdapter({ fetchImpl })
+        try {
+          for await (const _ of adapter.stream({ ...streamOptions, model: 'glm-5.3' } as never)) { /* noop */ }
+        } catch { /* 预期抛出 */ }
+        expect(
+          seen,
+          '★ 正文回显的同串字符串不得被当成「模型未注册」（结构化 error_code 优先）',
+        ).toEqual([null])
+      } finally {
+        setBenefitMemoryCache(undefined)
+      }
+    })
+
+    it('★★ 未确认模型被补头带出 4004.200 时不得领取（写操作只对确认过的模型开放）', async () => {
+      /**
+       * ⚠️ 对抗审计实测：一个从未被远端确认的模型（手填 / 打错大小写 / 已下线）
+       * 在一次 `stream()` 里打出 **4 次 chat + 1 次领取**。
+       *
+       * 而 `4004.200` **不区分**「该账号没有 benefit 包」与「这个模型不该带该头」
+       * ⇒ 在「模型根本不存在」这种与福利无关的场景里打一次写请求。
+       */
+      setBenefitMemoryCache([])   // ← 一个模型都没确认
+      try {
+        let claimCalls = 0
+        const fetchImpl = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+          const url = String(input)
+          if (url.startsWith(QUEUE_STATUS_BASE)) {
+            return new Response('{"status":"working"}', { status: 200, headers: { 'content-type': 'application/json' } })
+          }
+          if (url === CODEARTS_BENEFIT_CLAIM_URL) {
+            claimCalls += 1
+            return new Response(JSON.stringify({ error_code: '0000' }), { status: 200 })
+          }
+          const maasType = new Headers(init?.headers).get('maas_type')
+          const code = maasType === null ? 'InferHub.002002009.404' : 'InferHub.4004.200'
+          return new Response(
+            `data:{"text":"[DONE]","error_code":"${code}","error_msg":"x"}\n\n`,
+            { status: 200, headers: { 'content-type': 'text/event-stream' } },
+          )
+        })
+        const adapter = makeAdapter({ fetchImpl })
+        try {
+          for await (const _ of adapter.stream({ ...streamOptions, model: 'some-paid-or-typo-model' } as never)) { /* noop */ }
+        } catch { /* 预期抛出 */ }
+        expect(
+          claimCalls,
+          '★★ 模型未被远端确认却去领取 ⇒ 在与福利无关的场景（打错 id / 模型下线）打一次写请求',
+        ).toBe(0)
+      } finally {
+        setBenefitMemoryCache(undefined)
+      }
+    })
+  })
