@@ -1017,6 +1017,24 @@ describe('供应商开关的样式约束（源码级回归）', () => {
       expect(source, '模型块必须落 data-open，否则展开态样式永不命中').toMatch(
         /className: 'dim-jh-aggModel',\s*\n\s*'data-open': open \? 'true' : undefined,/,
       )
+
+      // ── 渲染侧：箭头必须**真的是** svg + path ──
+      // ⚠️ 上面的样式断言只证明「有 rotate 规则」。把 svg 退回字符 `▸`、或把 path
+      //    删空，样式规则照样在、本文件照样全绿（2026-10-28 审计实测：path → null
+      //    仍是 **115 passed**）⇒ 必须再从渲染侧钉一遍。
+      const modelAt = source.indexOf('const renderModel = (model)')
+      expect(modelAt, 'renderModel 不见了').toBeGreaterThan(-1)
+      const modelBody = source.slice(modelAt, source.indexOf('const renderCandidate = (model', modelAt))
+      expect(modelBody.length, 'renderModel 切片为空 —— 本用例的判据失效').toBeGreaterThan(200)
+      expect(modelBody, '箭头容器不见了').toContain("className: 'dim-jh-aggChevron'")
+      expect(modelBody, '箭头必须 aria-hidden（可访问名不该被装饰图形污染）')
+        .toMatch(/className: 'dim-jh-aggChevron', 'aria-hidden': 'true'/)
+      expect(modelBody, '箭头必须真的是 svg（退回字符 ▸ 会丢掉过渡）')
+        .toMatch(/className: 'dim-jh-aggChevron'[\s\S]{0,600}React\.createElement\('svg'/)
+      // 方向也要钉：朝右的折线，靠 CSS rotate(90deg) 转成朝下 ——
+      // 把 d 换成朝左/朝下的折线，「展开时转 90°」就变成侧向或倒过来了。
+      expect(modelBody, '箭头路径必须是朝右的折线（d 换向会让 rotate 90° 的方向错）')
+        .toContain("d: 'M9 6l6 6-6 6'")
     })
 
     /**
@@ -1060,6 +1078,13 @@ describe('供应商开关的样式约束（源码级回归）', () => {
       expect(body, '补丁角标不见了 —— 规格 §7.1 的人工核查标记丢失')
         .toContain("className: 'dim-jh-aggCandidatePatch'")
       expect(body, '补丁角标必须由 parts.patched 控制').toMatch(/parts\.patched/)
+
+      // ── 「免费」必须由 price === 0 触发 data-free（不是无条件、也不是恒 undefined）──
+      // ⚠️ 只断言「样式里有 [data-free='true'] 规则」是**假绿**：把这里的接线删掉，
+      //    样式规则依然在，而界面上的「免费」会悄悄退回普通灰（2026-10-28 审计实测：
+      //    把接线改成 `undefined` 后，本文件 **115 条全绿**）。
+      expect(body, '「免费」必须由 parts.price === 0 触发 data-free')
+        .toMatch(/'data-free':\s*parts\.price === 0 \? 'true' : undefined/)
 
       // ── 反向钉子：不得退回「整串直接塞进 span」──
       // ⚠️ 这正是改造前的形态：`React.createElement('span', { className: '...CandidateLabel' }, candidateRowLabel(candidate))`

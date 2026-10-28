@@ -824,6 +824,30 @@ describe('永久积分锁定能力', () => {
       expect(copy.lockTitle).not.toContain('天内到期')
     })
 
+    /**
+     * ⚠️⚠️ `lockTitle` 与 `lockedTitle` **必须可区分**，且只有**前者**带条件标记。
+     *
+     * 2026-10-28 审计实测：把两者改成**逐字相同**之后，`credits-capabilities` 47 条 +
+     * 两条 permanent-lock 的 31 条**全绿** —— 没有任何判据守这一点。
+     *
+     * 为什么这是缺陷而不是措辞洁癖：`lockTitle` 渲染在**未锁定**状态的按钮上，
+     * 那一刻「永久积分留着不动」是**假的**（永久积分正被消耗）；只有 `lockedTitle`
+     * 才能直陈现状。两者同文 ⇒ 说明与实际计费口径相反。
+     * 另一侧同样要钉住：同面板「刚解锁」的 `unlockedNotice` 说「会继续使用永久积分」，
+     * 若未锁定的 `lockTitle` 也说「留着不动」，两句话在同一屏上自相矛盾。
+     */
+    it('★★ 未锁定的 lockTitle 必须带「锁定后」条件标记，且不得与 lockedTitle 同文', () => {
+      for (const id of [...SUPPORTED, 'codearts']) {
+        const copy = permanentLockCopy(id)
+        expect(copy.lockTitle, `${id}：未锁定的按钮文案丢了「锁定后」⇒ 直陈现状，与体感相反`)
+          .toContain('锁定后')
+        expect(copy.lockTitle, `${id}：lockTitle 与 lockedTitle 同文 ⇒ 锁定/未锁定两种状态分不清`)
+          .not.toBe(copy.lockedTitle)
+        expect(copy.lockedTitle, `${id}：已锁定的文案不该带「锁定后」（那句本来就是现状）`)
+          .not.toContain('锁定后')
+      }
+    })
+
     it('四个文案位都齐（面板直接取用，缺一个就渲染出 undefined）', () => {
       for (const id of [...SUPPORTED, 'codearts']) {
         const copy = permanentLockCopy(id)

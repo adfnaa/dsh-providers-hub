@@ -33,21 +33,31 @@ const HERE = dirname(fileURLToPath(import.meta.url))
 const styles = readFileSync(resolve(HERE, '../../plugin-src/client/jet-hub-styles.js'), 'utf8')
 const hub = readFileSync(resolve(HERE, '../../plugin-src/client/jet-hub.js'), 'utf8')
 
+/**
+ * 剥掉注释后的样式文本 —— **所有**「某条声明在不在」的判据都必须在它上面做。
+ *
+ * ⚠️⚠️ 2026-10-28 审计实测：把 `container-type: inline-size;` 包进 CSS 注释
+ *    （`/* … *\/`）之后，原先直接匹配**源文件字符串**的判据仍然命中 ⇒ 本文件
+ *    **12 条全绿**，而浏览器里 `@container` 整块静默失效（浏览器不报错，
+ *    只是永不匹配）。同一个坑在本仓库已登记多次（判据必须先剥注释）。
+ */
+const stylesBare = styles.replace(/\/\*[\s\S]*?\*\//g, '')
+
 /** 取一条 CSS 规则（选择器 + 第一对花括号）。 */
 function ruleOf(selector: string): string {
   const escaped = selector.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-  const found = styles.match(new RegExp(`${escaped} \\{[^}]*\\}`))?.[0]
+  const found = stylesBare.match(new RegExp(`${escaped} \\{[^}]*\\}`))?.[0]
   expect(found, `找不到规则 ${selector}`).toBeDefined()
   return found!
 }
 
-/** 取 `@container (max-width: Npx)` 整块。 */
+/** 取 `@container (max-width: Npx)` 整块（在剥注释后的文本上取）。 */
 function containerBlock(): string {
-  const start = styles.indexOf('@container (max-width: 420px)')
+  const start = stylesBare.indexOf('@container (max-width: 420px)')
   expect(start, '找不到窄容器查询块').toBeGreaterThan(-1)
-  const end = styles.indexOf('\n}', start)
+  const end = stylesBare.indexOf('\n}', start)
   expect(end, '窄容器查询块没有闭合').toBeGreaterThan(start)
-  return styles.slice(start, end)
+  return stylesBare.slice(start, end)
 }
 
 describe('★ 积分行：单行 + 省略号（窄容器）', () => {
@@ -72,10 +82,10 @@ describe('★ 积分行：单行 + 省略号（窄容器）', () => {
 
   it('★★ 子元素 inline 化，且段间距由相邻兄弟选择器提供', () => {
     // 改成 block 后子元素必须回到 inline 流，省略号才有「整体被截断」的语义。
-    expect(styles, '缺少子元素 inline 化规则')
+    expect(stylesBare, '缺少子元素 inline 化规则')
       .toMatch(/\.dim-jh-metaRow dd\.dim-jh-creditValue > \* \{[^}]*display:\s*inline/)
     // 原 flex gap 已不存在，间距必须另有来源，否则各段黏成一团。
-    expect(styles, '缺少段间距规则（原 flex gap 已移除）')
+    expect(stylesBare, '缺少段间距规则（原 flex gap 已移除）')
       .toMatch(/\.dim-jh-metaRow dd\.dim-jh-creditValue > \* \+ \* \{[^}]*margin-left:\s*6px/)
   })
 
@@ -147,9 +157,9 @@ describe('★ 窄容器：按钮组下移，不与积分文字同行', () => {
   })
 
   it('⚠️ 阈值必须落在设置页与侧栏两档宽度之间', () => {
-    const at = styles.indexOf('@container (max-width:')
+    const at = stylesBare.indexOf('@container (max-width:')
     expect(at, '找不到 @container 阈值').toBeGreaterThan(-1)
-    const px = Number(/max-width:\s*(\d+)px/.exec(styles.slice(at, at + 60))?.[1])
+    const px = Number(/max-width:\s*(\d+)px/.exec(stylesBare.slice(at, at + 60))?.[1])
     expect(Number.isFinite(px), '@container 阈值不是像素值').toBe(true)
     // 设置页卡片内容宽约 300–380px、侧栏约 520–700px（实测区间）。
     expect(px, `阈值 ${px}px 太低，设置页会漏`).toBeGreaterThan(380)

@@ -114,31 +114,59 @@ const balanceOf = (total = 1670.57) => ({ total, packages: PACKAGES, expiredTota
 
 describe('★★ hover 全文：必须是数字，不是名词解释', () => {
   it('★★★ 子元素一律不挂 title（否则会抢走父级的 hover 全文）', async () => {
-    const root = await renderRow({
-      balance: balanceOf(), error: undefined, loading: false,
-      windowDays: 15, provider: 'codearts',
-    })
-    // 遍历整棵树：除根 dd 外，任何子节点都不许有 title。
-    const dd = findAll(root, 'dim-jh-creditValue')[0]
-    expect(dd, '找不到积分值节点').toBeDefined()
-    expect(dd!.props.title, '根节点必须有 hover 全文').toBeTruthy()
+    // ⚠️ 必须**逐 provider** 跑：title 的挂载点在不同分支里是不同元素。
+    //    只测 codearts 会漏掉 **accio 的倒计时 span** —— 2026-10-28 审计实测：
+    //    给它挂回 title 之后本用例仍 **9 passed**（无牙），而 accio 倒计时正是用户
+    //    原始报障「悬浮显示名词解释」的三处之一。
+    const CASES = [
+      {
+        label: 'codearts（三档分桶）',
+        props: {
+          balance: balanceOf(), error: undefined, loading: false,
+          windowDays: 15, provider: 'codearts',
+        },
+      },
+      {
+        label: 'accio（倒计时）',
+        props: {
+          balance: {
+            total: 199,
+            packages: [{
+              name: '每日积分', unit: 'credit', remaining: 199, total: 200, used: 1,
+              active: true, cycleStartTime: '',
+              cycleEndTime: new Date(Date.now() + 3 * 3600_000).toISOString(),
+              expiredTime: '',
+            }],
+            expiredTotal: 0,
+          },
+          error: undefined, loading: false, windowDays: 15, provider: 'accio',
+        },
+      },
+    ]
+    for (const { label, props } of CASES) {
+      const root = await renderRow(props)
+      // 遍历整棵树：除根 dd 外，任何子节点都不许有 title。
+      const dd = findAll(root, 'dim-jh-creditValue')[0]
+      expect(dd, `${label}：找不到积分值节点`).toBeDefined()
+      expect(dd!.props.title, `${label}：根节点必须有 hover 全文`).toBeTruthy()
 
-    const offenders: string[] = []
-    const walk = (n: unknown) => {
-      if (n === null || typeof n !== 'object') return
-      if (Array.isArray(n)) { n.forEach(walk); return }
-      const item = n as Node
-      if (item !== dd && typeof item.props?.title === 'string') {
-        offenders.push(`${String(item.props.className ?? item.type)}: ${item.props.title.slice(0, 30)}`)
+      const offenders: string[] = []
+      const walk = (n: unknown) => {
+        if (n === null || typeof n !== 'object') return
+        if (Array.isArray(n)) { n.forEach(walk); return }
+        const item = n as Node
+        if (item !== dd && typeof item.props?.title === 'string') {
+          offenders.push(`${String(item.props.className ?? item.type)}: ${item.props.title.slice(0, 30)}`)
+        }
+        item.children?.forEach(walk)
       }
-      item.children?.forEach(walk)
+      walk(root)
+      expect(
+        offenders,
+        `${label}：子元素挂了 title ⇒ 浏览器优先显示它，父级的 hover 全文永远看不到`
+        + `（这正是「悬浮显示名词解释」那个报障的成因）：${offenders.join(' | ')}`,
+      ).toEqual([])
     }
-    walk(root)
-    expect(
-      offenders,
-      '子元素挂了 title ⇒ 浏览器优先显示它，父级的 hover 全文永远看不到'
-      + `（这正是「悬浮显示名词解释」那个报障的成因）：${offenders.join(' | ')}`,
-    ).toEqual([])
   })
 
   it('★★★ hover 全文第一段必须是行内那一整行（含被截断的分桶数字）', async () => {
@@ -265,14 +293,19 @@ describe('★★ hover 全文：必须是数字，不是名词解释', () => {
     expect(firstBlock, '倒计时必须在行内第一段').toMatch(/后刷新/)
   })
 
-  it('★★ 无任何内容时 title 为 undefined（不挂空串）', async () => {
+  it('★★ 余额为 0 时 title 仍是行内那个「0」，且绝不为空串', async () => {
+    // ⚠️ 2026-10-28 审计修正：本用例原先叫「无任何内容时 title 为 undefined」，
+    //    断言是 `title === undefined || String(title).length > 0` —— 后半段对任何
+    //    非空 title 恒真，前半段又永远不成立（`lineText` 至少含主数值 `total`），
+    //    ⇒ **整条恒真**，而且用例名与事实不符。
+    //    真实行为：空包时行内只有一个「0」，title 就是 "0"（不是 undefined、也不是空串）。
     const root = await renderRow({
       balance: { total: 0, packages: [], expiredTotal: 0 },
       error: undefined, loading: false, windowDays: 15, provider: 'codearts',
     })
     const dd = findAll(root, 'dim-jh-creditValue')[0]!
-    // 空串 title 会让浏览器显示一个空 tooltip 框 —— 比没有更糟。
-    expect(dd.props.title === undefined || String(dd.props.title).length > 0).toBe(true)
+    expect(dd.props.title, '空包时 title 必须仍是行内那个「0」').toBe('0')
+    // 反向钉子：空串 title 会让浏览器弹一个空白 tooltip 框 —— 比没有更糟。
     expect(dd.props.title, 'title 不许是空串').not.toBe('')
   })
 })
