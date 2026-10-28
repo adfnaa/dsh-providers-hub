@@ -19,10 +19,10 @@ import type { CodeArtsCredential } from '../../src/types.js'
  *
  * 1. **两种响应信封**：`ops/*` 是 `{code,message,data}`，而 `statistics/plugin`
  *    是**裸对象**。只支持其中一种会让另一端点恒判失败。
- * 2. **账户类型门控**：Token 计费账户必须判为 `inactive` 而不是 `failed`
- *    —— 前者是正常业务状态，后者会让用户去排查并不存在的故障。
- * 3. **幂等预检**：本协议没有幂等键、也没有「今天已签到」业务码，
- *    唯一的保护就是 `claimable` / `status` 预检；漏了会重复发领取请求。
+ * 2. **账户类型不是门禁**：`is_credit_package=false` 的体验版账号实测照样能签到
+ *    （活动列表说了算）；账户类型只用来修饰「没有可领取活动」时的文案。
+ * 3. **幂等**：`claimable` / `status` 预检 + 服务端重复领取业务码 `40001`
+ *    都要判成「今天已领取」，不能报 failed。
  */
 
 const CREDENTIAL: CodeArtsCredential = {
@@ -722,20 +722,76 @@ describe('claimCodeArtsDailyCheckin（领取）', () => {
     if (outcome.kind === 'claimed') expect(outcome.credit).toBe(1000)
   })
 
-  it('Token 计费账户判为 inactive（不是 failed）', async () => {
-    // 这是账户类型门控的核心断言：非活动范围的账户是**正常业务状态**，
-    // 报 failed 会让用户去排查并不存在的故障。
+  it('Token 计费账户（体验版）有可领取活动时照样领取 —— isCreditPackage 不是门禁', async () => {
+    // 真实缺陷回归（2026-10-08 第三重根因）：体验版账号
+    // （spec=codearts.agent.trial、is_credit_package=false、is_token_package=true）
+    // 的 statistics/plugin 里没有任何积分 metric，但同一凭据下
+    // GET /v1/ops/delivery 明确返回 USER_LOGIN 且 claimable:true，
+    // POST /v1/ops/claim 实测 HTTP 200 并真发 1000 积分。
+    // 旧的 `!isCreditPackage ⇒ inactive` 提前返回是假阴性：凭据修好了也永远
+    // 显示「Token 计费账户，不在积分活动范围」，用户永远看不到签到成功。
     const { fetcher, calls } = claimFetcher({ isCredit: false, isToken: true })
     const outcome = await claimCodeArtsDailyCheckin(CREDENTIAL, fetcher)
+    expect(
+      outcome.kind,
+      'isCreditPackage=false 的账号被提前判 inactive：签到永远领不到',
+    ).toBe('claimed')
+    expect(calls.some((call) => call.url.includes('/v1/ops/claim'))).toBe(true)
+  })
+
+  it('非积分非 Token 账户有可领取活动时同样领取', async () => {
+    const { fetcher } = claimFetcher({ isCredit: false, isToken: false })
+    const outcome = await claimCodeArtsDailyCheckin(CREDENTIAL, fetcher)
+    expect(outcome.kind).toBe('claimed')
+  })
+
+  it('Token 计费账户且无每日签到活动 → inactive，文案指出账户类型', async () => {
+    // 账户类型降级为**文案修饰**：服务端确实没给每日签到活动时，
+    // 用 isTokenPackage 给出比「未找到每日签到活动」更具体的原因。
+    const { fetcher, calls } = claimFetcher({
+      isCredit: false,
+      isToken: true,
+      items: [{ campaignId: 'c-9', type: 'INVITE_USER', title: '邀请', claimable: true, status: 'ENTRY' }],
+    })
+    const outcome = await claimCodeArtsDailyCheckin(CREDENTIAL, fetcher)
     expect(outcome.kind).toBe('inactive')
-    // 且不应发出领取请求
+    if (outcome.kind === 'inactive') {
+      expect(outcome.message).toBe('Token 计费账户，不在积分活动范围')
+    }
     expect(calls.some((call) => call.url.includes('/v1/ops/claim'))).toBe(false)
   })
 
-  it('非积分非 Token 的账户同样判为 inactive', async () => {
-    const { fetcher } = claimFetcher({ isCredit: false, isToken: false })
+  it('积分账户且无每日签到活动 → inactive「未找到每日签到活动」', async () => {
+    const { fetcher } = claimFetcher({
+      items: [{ campaignId: 'c-9', type: 'INVITE_USER', title: '邀请', claimable: true, status: 'ENTRY' }],
+    })
     const outcome = await claimCodeArtsDailyCheckin(CREDENTIAL, fetcher)
     expect(outcome.kind).toBe('inactive')
+    if (outcome.kind === 'inactive') {
+      expect(outcome.message).toBe('未找到每日签到活动')
+    }
+  })
+
+  it('重复领取的业务码 40001 判为 already-claimed（不是 failed）', async () => {
+    // 实测：领取成功后活动列表的 claimable 会在一段时间内仍是 true，
+    // 再发一次 POST /v1/ops/claim ⇒ HTTP 200
+    // {"code":40001,"message":"尚未到达权益刷新时间，暂时无法领取","data":null}。
+    // 这是「今天已经领过」，不是故障；判成 failed 会让用户看到一个并不存在的错误。
+    const { fetcher } = claimFetcher({
+      claimBody: { code: 40001, message: '尚未到达权益刷新时间，暂时无法领取', data: null },
+    })
+    const outcome = await claimCodeArtsDailyCheckin(CREDENTIAL, fetcher)
+    expect(outcome.kind).toBe('already-claimed')
+    if (outcome.kind === 'already-claimed') {
+      expect(outcome.message).toBe('今天已领取')
+    }
+  })
+
+  it('其它业务码仍判为 failed 并带出服务端文案（40001 不是万能兜底）', async () => {
+    const { fetcher } = claimFetcher({ claimBody: { code: 40002, message: '活动已结束' } })
+    const outcome = await claimCodeArtsDailyCheckin(CREDENTIAL, fetcher)
+    expect(outcome.kind).toBe('failed')
+    if (outcome.kind === 'failed') expect(outcome.code).toBe(40002)
   })
 
   it('已领取状态（CLAIMED）判为 already-claimed，且不发领取请求', async () => {

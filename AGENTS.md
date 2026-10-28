@@ -377,6 +377,68 @@ cmd /c mklink /J "D:\...\wt-a1\node_modules" "D:\...\主工作区\node_modules"
   `{ ...entry, ...patch }`，写 `undefined` 落盘会被 `JSON.stringify` 整个丢弃，
   UI 于是从「已过期」变成「未知」—— 保留旧信息更有价值。
 
+### ⚠️⚠️ 续期失败的**终态判据**必须结构化，**不得**用 message 正则（2026-10-27 两轮审计）
+
+本仓库曾有**两份逐字同形**的实现（`autoclaw-auth.ts` 与 `minimax-auth.ts`）：
+
+```ts
+// ❌ 修前
+if (/invalid_grant|expired|revoked/i.test(message)) throw new TerminalError(...)
+// autoclaw 那份更宽：msg.includes('Invalid token') || msg.includes('expired') || msg.includes('401')
+```
+
+实测三处**误判**，每一处都把**健康账号**标成「需重登」：
+
+| 上游报文 | 旧判据 | 后果 |
+|---|---|---|
+| `HTTP 503 {"error":"token expired"}` | 终态 | 网关抖动一次 = 账号需重登 |
+| `HTTP 429 {"error":"rate limited, key expired soon"}` | 终态 | 限流一次 = 账号需重登 |
+| `fetch failed`（`cause: certificate has expired`） | 终态 | 证书/代理抖动 = 账号需重登 |
+
+⚠️ 第三条最隐蔽：本仓库自己记着「环境 HTTPS 检查代理约 50% 概率打断」，而
+`certificate has expired` 里恰含 `expired`。⚠️ `includes('401')` 更是**子串**判据。
+
+⚠️⚠️ 而 `refreshable:false` 是**单向门**（`refreshAll` 与巡检都会跳过）⇒ 误标一次
+**永不自愈** —— 用户看到的就是「要一个个点回来」。
+
+⇒ 现收口在 **`src/refresh-failure.ts`**（全仓唯一实现），三步**顺序不可颠倒**：
+
+1. **先排传输层**（沿 `cause` 链读 `UND_ERR_*` / `CERT_*` / 文案含 `certificate`）⇒ 非终态；
+2. **再看状态码**：`5xx` / `429` / `408` / `401` ⇒ 非终态；
+3. **最后只认结构化 `invalid_grant`**（RFC 6749 §5.2 唯一标准码）。个别上游用自有
+   词汇的（AutoClaw 业务码信封回 `msg:"Invalid token"`）在**调用点显式声明**词表。
+
+⚠️ **方向性取舍**：漏判 = 每 30 分钟白撞一次；误判 = **账号报废**。两者不对称 ⇒
+一律偏向「不标死」。
+
+### ⚠️ 续期的「单飞」必须是**去重**，不是「串行化」
+
+```ts
+// ❌ 等完在飞任务后，照样再发一份 —— 并发 N 条 ⇒ N 份 grant，都用同一把一次性 RT
+const existing = this.renewInFlight.get(refName)
+if (existing !== undefined) await existing.catch(() => undefined)
+const task = (async () => { … grant … })()
+```
+
+实测并发 5 次 ⇒ 5 份 grant、峰值 4 在飞 ⇒ 2 份起必然 `invalid_grant`，
+输家还会把「别人刚续成功」误读成「RT 已死」⇒ **把好号标死**。
+
+⇒ 正确形态：命中在飞任务就 `await` 并**直接返回它的结果**（`minimax` 与 `autoclaw`
+现在逐字同形）。⚠️ 同时注意**契约兼容**：`JetHubAuthLike.refreshAccountCredential`
+返回 `void` —— 需要把新凭据交给调用方时**另开一个方法**（如
+`autoclaw-auth` 的 `renewCredentialForRef`），两者共用同一张在飞表，别改签名。
+
+### ⚠️ 自建定时器**必须**挂 `ctx.effect` 回收（`unref()` 不算回收）
+
+`unref()` 只解决「不阻止进程退出」，**不解决「fiber 卸载后仍在跑」**。
+实测 `fiber.dispose()` 后推进 130s ⇒ 定时器 tick 照跑，而旧实例读的是**共享的**
+credentials 后端（不是快照）⇒ 它会继续对**新池**发 grant；插件热重载 ⇒
+新旧两个实例**并发轮换同一批一次性 RT**。
+
+⇒ 自建定时器的类必须提供幂等的 `stop()`，接线层写
+`ctx.effect(() => () => auth.stop())`；且**在飞的那一轮**也要能被叫停
+（循环内每个条目之前再查一次停止标志，否则它醒来后会继续把剩余全部做完）。
+
 ⚠️ 边界（别夸大这类缺陷）：**功能一直是好的** —— 适配器发现凭据过期会按需
 `refresh()` 再发请求；定时器跑过一轮后 UI 也会自愈。受影响的是「启动到首轮之间」
 的界面与积分行，以及窗口内点「刷新」看不到变化。

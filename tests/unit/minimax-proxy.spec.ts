@@ -115,11 +115,12 @@ describe('② 接线：每个消费点都必须接上按账号的 fetcher（源�
    * 本组只负责「别把腿删了还不响」。
    */
   it('⚠️ MinimaxAuth 登录 / 续期 / 目录 / 身份四条腿都接了 fetcherFor（精确计数）', () => {
-    // 4 处调用点：183（设备码）、212（轮询）、451（续期）、534（目录）、670（身份）
+    // 6 处调用点：183（设备码）、212（轮询）、451（续期，经 grantOnce）、534（目录）、
+    // 670（身份自愈）、persistLogin 身份查询
     // —— 逐条点名而不是只数总数，删掉任意一条都能立刻看出是哪条。
     expect(authSource).toContain('startMinimaxDeviceAuthorization(this.fetcherFor(accountId ?? \'\')')
     expect(authSource).toContain('fetcher: this.fetcherFor(options.accountId ?? \'\')')
-    expect(authSource).toContain('this.fetcherFor(accountId ?? \'\')')      // refreshCredentialFor
+    expect(authSource).toContain('this.fetcherFor(accountId ?? \'\')')      // grantOnce（续期）
     expect(authSource).toContain('fetcher: this.fetcherFor(accountId ?? \'\')') // fetchRawModels
     expect(authSource).toContain('this.fetcherFor(entry.id)')              // 自愈身份
     // 总数兜底（防止有人用别的写法绕开上面的锚点后总数却变少）。
@@ -163,8 +164,18 @@ describe('② 接线：每个消费点都必须接上按账号的 fetcher（源�
   })
 
   it('⚠️ index.ts：中国站实例**刻意不注入**（直连才是最优）', () => {
-    // minimax = new MinimaxAuth(ctx) 必须不带 fetchFor。
-    expect(indexSource).toMatch(/new MinimaxAuth\(ctx\)/)
+    // ⚠️ 2026-10-24 本地试验版改：构造带了 `journalHome`（journal 落盘根目录），
+    //    文本形态从 `new MinimaxAuth(ctx)` 变为 `new MinimaxAuth(ctx, {…})`。
+    //    「刻意不注入 fetchFor」的判定改为**片段断言**：从 minimax 构造起点到
+    //    minimaxIntl 构造起点之间不得出现 `fetchFor`（片段足够窄，不会误伤
+    //    国际站那条；国际站的 `fetchFor` 在其自身构造块里，不落在本片段内）。
+    const code = stripComments(indexSource)
+    const block = code.slice(
+      code.indexOf('const minimax = new MinimaxAuth(ctx,'),
+      code.indexOf('const minimaxIntl = new MinimaxAuth(ctx,'),
+    )
+    expect(block.length, '找不到 minimax 构造块（文本形态又变了）').toBeGreaterThan(0)
+    expect(block, '中国站实例必须直连（fetchFor 会把国内站引到国际站）').not.toContain('fetchFor')
   })
 
   it('⚠️ 探测适配器把**池条目 id** 显式传进去（探测路径反查不存在）', () => {

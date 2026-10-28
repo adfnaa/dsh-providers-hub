@@ -403,12 +403,13 @@ CodeArts 的 `snap-access/api/v2/chat/completions` 上有**两套模型注册**�
 集合**硬编码**为 `new Set(['glm-5.3-flash'])` —— `deepseek-v4.1-flash` 是
 2026-09 新增的 benefit 模型，因此从不带该头，后端按非 benefit 通道处理它。
 
-实证矩阵（2026-09-23，对齐 deveco-code-rust `fb1b4a2`）：
+实证矩阵（2026-09-23，对齐 deveco-code-rust `fb1b4a2`；⚠️ `deepseek-v4.1-flash`
+那一行**已于 2026-10 失效**，见下方复测）：
 
 | 模型 id | 来源 | 不带 maas_type | 带 maas_type |
 |---|---|---|---|
 | `glm-5.3-flash` | gateway/config | 404 未注册 | ✓ 成功 |
-| `deepseek-v4.1-flash` | gateway/config | 404 未注册 | ✓ 成功 |
+| `deepseek-v4.1-flash` | gateway/config | 404 未注册 | ✓ 成功（**2026-10 已反转**） |
 | `deepseek-v4-flash-0731` | gateway/config | 404 未注册 | ✓ 成功 |
 | `deepseek-v4-pro-0813` | gateway/config | 404 未注册 | ✓ 成功 |
 | `deepseek-v4-flash`（无后缀） | 静态表 / 归一化结果 | ✓ 成功 | ✗ unsupported |
@@ -417,26 +418,35 @@ CodeArts 的 `snap-access/api/v2/chat/completions` 上有**两套模型注册**�
 
 结论：**`gateway/config` 返回的模型即 benefit 集合**，无需靠模型名硬编码。
 
+⚠️ **2026-10-26 复测（本机真实账号，逐模型两态直连）**：`deepseek-v4.1-flash`
+已按常规 `0.18x` 模型下发 —— 不带该头正常出流，**带上即 `4004.200 benefit not found`**。
+这正是「静态表会过时」的实锤，也是本轮删除兜底表的依据（见下一小节）。
+
 要点：
 
-- 判定 `isCodeArtsBenefitModel`（`src/models.ts`）：远端拉取并缓存的集合
-  （`~/.cache/deveco/codearts_benefit_models.json`）∪ 静态兜底
-  `CODEARTS_BENEFIT_FALLBACK`（`glm-5.3-flash` / `deepseek-v4.1-flash`）。
-  远端集合优先，后端新增 benefit 模型**无需改代码**
+- 判定 `isCodeArtsBenefitModelKnown`（`src/models.ts`）：**只看**远端拉取并缓存的
+  集合（`~/.cache/deveco/codearts_benefit_models.json`）。已删除静态兜底表
+  `CODEARTS_BENEFIT_FALLBACK` 与 `isCodeArtsBenefitModel`：它两次成为缺陷根源
+  （表过时 ⇒ 首条消息必报 4004.200）。后端再变由**双向自愈**兜住
+  （404 → 补头一次；4004.200 → 先领福利、再去头一次）
 - ⚠️ **只记录「归一化未改写」的 id**：gateway 下发的是
   `deepseek-v4-flash-0731`，而 `normalizeModelId` 会把它改写成
   `deepseek-v4-flash` —— 两者在后端是**不同模型、benefit 属性相反**，
   记录改写后的 id 会让无后缀模型多带 `maas_type` 而失败
 - ⚠️ **判定必须在 `stream()` 的重试循环外算一次**（要读缓存文件，不宜每轮 IO）
+- ⚠️ **去头自愈的门禁是「本轮真的带了该头」**（`benefitHeaderSent`），
+  不是「该模型是 benefit 模型」：没带过却收到 4004.200 说明是**别人**补的头，
+  去头等于逐字节重发
 - ⚠️ **缓存读写必须用顶层 `import { … } from 'node:fs'`，不能用 `require`** ——
   本包是 ESM（`package.json` 的 `"type": "module"`），`require` 未定义、抛
   ReferenceError 后被 `catch` 静默吞掉，表现为「写不进也读不回」（`loadModelsCache`
   的模型列表磁盘缓存曾因此长期失效）
 - `deepseek-v4.1-flash` 的上下文窗口按 IDE 下发的 inferhub-provider 配置声明为
   **1000000**（与无后缀 v4-flash/pro 的 1048576 不同）
-- 回归用例：`tests/unit/models.spec.ts`（集合判定 / 落盘不含改写 id / 缓存往返）、
-  `tests/unit/llm-adapter.spec.ts`（v4.1 带 `maas_type` 且参与签名、无后缀
-  v4-flash 不带）、`tests/e2e/v4-models.e2e.spec.ts`（真实收发，需闸门）
+- 回归用例：`tests/unit/models.spec.ts`（远端集合唯一权威 / 未确认不带头 /
+  落盘不含改写 id / 缓存往返）、`tests/unit/llm-adapter.spec.ts`（远端确认 ⇒
+  带 `maas_type` 且参与签名；未确认 ⇒ 404 才补头；没带头时的 4004.200 不得重试）、
+  `tests/e2e/v4-models.e2e.spec.ts`（真实收发，需闸门）
 
 ### ⚠️⚠️ `InferHub.4004.200` 有**两条下发通道**，只接一条 = 两套判据（Issue IKLBSH A6）
 
@@ -471,6 +481,51 @@ benefit 那条必须排在**限流之前**（否则被 `isRateLimited` 截走当
 回归用例：`tests/unit/llm-adapter.spec.ts` 的
 「★ benefit 去头重试必须接上 4xx 通道」（4 条：主用例 + 非 benefit 模型对照 +
 报文不含该码对照 + SSE 通道既有行为不变）。
+
+### ⚠️⚠️ 本机装了会**重签** CodeArts 请求的压缩插件时，`maas_type` 由它说了算（2026-10-26）
+
+**用户报障**：`deepseek-v4.1-flash` 发消息即 `本轮运行失败 codearts: benefit not found`，
+而官方 CodeArts Agent 用同一账号同一模型正常。
+
+**实测（本机真实账号，直连 `chat/completions`，`max_tokens=4`，逐模型两态）**：
+
+| 模型 | 不带 `maas_type` | 带 `maas_type: benefit` |
+|---|---|---|
+| `deepseek-v4.1-flash` | ✅ 正常出流 | ❌ `InferHub.4004.200 benefit not found` |
+| `glm-5.3-flash` | ❌ `InferHub.002002009.404` 未注册 | ❌ `4004.200`（该账号没有 benefit 包） |
+| `deepseek-v4-flash` / `GLM-5.2` / `openpangu-2.0-flash/pro` / `kimi-k2.6-vl` | ✅ 正常出流 | —（未测） |
+
+**根因**：`billion-context`（bili）作为同进程 DSH 插件拦截全局 `fetch`，把带
+`SDK-HMAC-SHA256` 签名的请求交给自己的代理**重签**。它的 `signApigHeaders()` 会
+`deleteSignedHeaders(target)` 删掉 `authorization / x-sdk-date / x-sdk-content-sha256 /
+x-security-token / maas_type`，再按**它自己的**判据补 `maas_type`：
+
+```js
+apigBenefitFor(model, route) = route.models[model].benefit ?? DEFAULT_BENEFIT_MODELS.includes(model)
+DEFAULT_BENEFIT_MODELS = ["glm-5.3-flash", "deepseek-v4.1-flash"]   // ← 第二项已过时
+```
+
+于是**插件自己的判定被完全覆盖**：本轮没带头，bili 补上 ⇒ 上游 `4004.200` ⇒
+插件去头重试**仍是同一个出站请求**（bili 又补上）⇒ 如实抛错。
+路由键按前缀匹配（`upstreamUrl === key || upstreamUrl.startsWith(key + "/")`），
+故配置键写 `https://snap-access.cn-north-4.myhuaweicloud.com/api/v2` 即命中
+`/api/v2/chat/completions`。
+
+**必须同时满足三件事，缺一不可**：
+
+1. 插件按**远端 `gateway/config` 集合**判定（本仓库已删掉静态兜底表；官方内核
+   也是 `if (model_id ∈ gatewayConfig.models) headers.maas_type = "benefit"`）。
+2. bili 的逐模型开关与同一份集合一致：
+   `providers."<base>".models."glm-5.3-flash".benefit = true`，其余（尤其
+   `deepseek-v4.1-flash`）`false`。⚠️ 改的是**配置文件**，bili 在**启动时**读取
+   （`/__bili/config/reload` 有管理面鉴权，外部脚本调不通）⇒ **改完要重启客户端**。
+3. 去头自愈只能以「本轮**真的带了**该头」为前提（`benefitHeaderSent`）：
+   没带过头却收到 `4004.200`，那是别的组件补的，去头是**逐字节重发**，只会
+   白烧唯一一次自愈名额并同时锁死补头方向。
+
+⚠️ 别走进的反向坑：把**所有**模型都设成 `benefit:false` 会让 `glm-5.3-flash`
+在 bili 重签时丢掉必需的头（我们的「补头自愈」同样会被它删掉）⇒ 该模型坏。
+开关必须逐模型、按远端集合来。
 
 ## ⚠⚠️ 腾讯系内容级风控：system 里的客户端模板句会被**整轮拦死**（Issue IKJNA1）
 
@@ -1942,12 +1997,13 @@ CodeArts 的 `snap-access/api/v2/chat/completions` 上有**两套模型注册**�
 集合**硬编码**为 `new Set(['glm-5.3-flash'])` —— `deepseek-v4.1-flash` 是
 2026-09 新增的 benefit 模型，因此从不带该头，后端按非 benefit 通道处理它。
 
-实证矩阵（2026-09-23，对齐 deveco-code-rust `fb1b4a2`）：
+实证矩阵（2026-09-23，对齐 deveco-code-rust `fb1b4a2`；⚠️ `deepseek-v4.1-flash`
+那一行**已于 2026-10 失效**，见下方复测）：
 
 | 模型 id | 来源 | 不带 maas_type | 带 maas_type |
 |---|---|---|---|
 | `glm-5.3-flash` | gateway/config | 404 未注册 | ✓ 成功 |
-| `deepseek-v4.1-flash` | gateway/config | 404 未注册 | ✓ 成功 |
+| `deepseek-v4.1-flash` | gateway/config | 404 未注册 | ✓ 成功（**2026-10 已反转**） |
 | `deepseek-v4-flash-0731` | gateway/config | 404 未注册 | ✓ 成功 |
 | `deepseek-v4-pro-0813` | gateway/config | 404 未注册 | ✓ 成功 |
 | `deepseek-v4-flash`（无后缀） | 静态表 / 归一化结果 | ✓ 成功 | ✗ unsupported |
@@ -1956,26 +2012,35 @@ CodeArts 的 `snap-access/api/v2/chat/completions` 上有**两套模型注册**�
 
 结论：**`gateway/config` 返回的模型即 benefit 集合**，无需靠模型名硬编码。
 
+⚠️ **2026-10-26 复测（本机真实账号，逐模型两态直连）**：`deepseek-v4.1-flash`
+已按常规 `0.18x` 模型下发 —— 不带该头正常出流，**带上即 `4004.200 benefit not found`**。
+这正是「静态表会过时」的实锤，也是本轮删除兜底表的依据（见下一小节）。
+
 要点：
 
-- 判定 `isCodeArtsBenefitModel`（`src/models.ts`）：远端拉取并缓存的集合
-  （`~/.cache/deveco/codearts_benefit_models.json`）∪ 静态兜底
-  `CODEARTS_BENEFIT_FALLBACK`（`glm-5.3-flash` / `deepseek-v4.1-flash`）。
-  远端集合优先，后端新增 benefit 模型**无需改代码**
+- 判定 `isCodeArtsBenefitModelKnown`（`src/models.ts`）：**只看**远端拉取并缓存的
+  集合（`~/.cache/deveco/codearts_benefit_models.json`）。已删除静态兜底表
+  `CODEARTS_BENEFIT_FALLBACK` 与 `isCodeArtsBenefitModel`：它两次成为缺陷根源
+  （表过时 ⇒ 首条消息必报 4004.200）。后端再变由**双向自愈**兜住
+  （404 → 补头一次；4004.200 → 先领福利、再去头一次）
 - ⚠️ **只记录「归一化未改写」的 id**：gateway 下发的是
   `deepseek-v4-flash-0731`，而 `normalizeModelId` 会把它改写成
   `deepseek-v4-flash` —— 两者在后端是**不同模型、benefit 属性相反**，
   记录改写后的 id 会让无后缀模型多带 `maas_type` 而失败
 - ⚠️ **判定必须在 `stream()` 的重试循环外算一次**（要读缓存文件，不宜每轮 IO）
+- ⚠️ **去头自愈的门禁是「本轮真的带了该头」**（`benefitHeaderSent`），
+  不是「该模型是 benefit 模型」：没带过却收到 4004.200 说明是**别人**补的头，
+  去头等于逐字节重发
 - ⚠️ **缓存读写必须用顶层 `import { … } from 'node:fs'`，不能用 `require`** ——
   本包是 ESM（`package.json` 的 `"type": "module"`），`require` 未定义、抛
   ReferenceError 后被 `catch` 静默吞掉，表现为「写不进也读不回」（`loadModelsCache`
   的模型列表磁盘缓存曾因此长期失效）
 - `deepseek-v4.1-flash` 的上下文窗口按 IDE 下发的 inferhub-provider 配置声明为
   **1000000**（与无后缀 v4-flash/pro 的 1048576 不同）
-- 回归用例：`tests/unit/models.spec.ts`（集合判定 / 落盘不含改写 id / 缓存往返）、
-  `tests/unit/llm-adapter.spec.ts`（v4.1 带 `maas_type` 且参与签名、无后缀
-  v4-flash 不带）、`tests/e2e/v4-models.e2e.spec.ts`（真实收发，需闸门）
+- 回归用例：`tests/unit/models.spec.ts`（远端集合唯一权威 / 未确认不带头 /
+  落盘不含改写 id / 缓存往返）、`tests/unit/llm-adapter.spec.ts`（远端确认 ⇒
+  带 `maas_type` 且参与签名；未确认 ⇒ 404 才补头；没带头时的 4004.200 不得重试）、
+  `tests/e2e/v4-models.e2e.spec.ts`（真实收发，需闸门）
 
 ## ⚠️⚠️ 更正：腾讯风控**也拦 `assistant` 正文**，且直连路径必须一起改（2026-10-12）
 
