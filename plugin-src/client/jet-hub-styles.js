@@ -1418,10 +1418,13 @@ const STYLES = `
    自动下限**失效**，能被一路压到 0 高。
    ⇒ 约束高度 + 子项不收缩 + overflow-y: auto，三者齐备才是「内容保持原高、
      超出就滚动」。
-   ⚠️ **不得用通配符 .dim-jh-aggPanel > * **：那会把工具栏里的
-   .dim-jh-aggCount 一起钉死，而它靠 flex-basis: 100% 强制换行
-   （flex: none 即 flex: 0 0 auto，会把 basis 覆盖成 auto，换行失效）。
-   ⇒ 逐类名列出，不碰 toolbar 的子项。 */
+   ⚠️ **不得用通配符 .dim-jh-aggPanel > * **。
+   ⚠️ 2026-10-28 审计更正：原先这里写的理由是「会把 .dim-jh-aggCount 一起钉死」——
+   那是**错的**：aggCount 是 .dim-jh-aggToolbar 的**孙节点**，子代组合器 > *
+   根本选不到它（flex-basis: 100% 的换行不受影响）。
+   真实理由两条：① 逐类名让「本面板有哪些直接子项」在 CSS 里**可读、可与渲染树对照**；
+   ② 通配符会把**将来**新增的直接子项也一并钉成 flex: none —— 若新子项需要收缩
+   （例如一条可压缩的提示条），它会静默失去弹性。 */
 .dim-jh-aggPanel > .dim-jh-aggIntro,
 .dim-jh-aggPanel > .dim-jh-aggToolbar,
 .dim-jh-aggPanel > .dim-jh-aggNotice,
@@ -1472,7 +1475,13 @@ const STYLES = `
    ① 边框用 brand 而不是更深的灰 —— 22 个块里只有一个展开，
       要让它在滚动的长列表里**一眼能定位**（用户滚到中间时不至于找不到自己在看哪块）。
    ② 头部底色与边框同源（brand 6%）：单独染边、不染头会显得「框是框、内容是内容」。
-   ③ 展开态优先于悬停（顺序在后）：正展开的块不该因为鼠标划过而换色。 */
+   ③ 展开态优先于悬停，但两条腿的**取胜机制不同**（2026-10-28 审计更正）：
+      · 边框 / 阴影：与 :hover **同特异性**（都是 (0,2,0)），靠**顺序在后**取胜；
+      · 模型头底色：展开态那条写在 :hover **之前**，靠**特异性**取胜
+        （[data-open=true] > .dim-jh-aggModelHead = (0,3,0)
+        > .dim-jh-aggModelHead:hover = (0,2,0)）。
+      ⇒ 别把「顺序在后」当成这两条的共同前提：底色那条挪到 hover 之后结果**不变**；
+        它真正不能动的是**特异性**（少一个类名就会输给 hover）。 */
 .dim-jh-aggModel[data-open='true'] { border-color: color-mix(in srgb, var(--dsw-alias-brand-primary, #1677ff) 45%, var(--dsw-alias-border-secondary)); box-shadow: 0 2px 8px rgb(22 119 255 / 10%); }
 .dim-jh-aggModel[data-open='true'] > .dim-jh-aggModelHead { background: color-mix(in srgb, var(--dsw-alias-brand-primary, #1677ff) 6%, transparent); }
 /* 模型平铺后的行间距：原先由 .dim-jh-aggGroup 的 gap: 4px 提供，分组去掉后
@@ -1522,7 +1531,7 @@ const STYLES = `
 .dim-jh-aggCandidate:hover { background: var(--dsw-alias-bg-secondary, rgba(0, 0, 0, 0.03)); }
 .dim-jh-aggCandidateRejected { opacity: 0.55; }
 /* 候选行里的供应商图标（2026-10-26）。
-   ⚠️ 基类 30px 是给左栏 48px 按钮的；这一行 padding 只有 5px、字号 12px，
+   ⚠️ 基类 30px 是给左栏 48px 按钮的；这一行 padding 只有 6px、字号 12px，
    照搬会把行高从 28px 撑到 40px，14 个模型的候选列表当场变长一倍。
    ⚠️ 这里**不需要**额外的淡出规则：未参与的候选整行走 .dim-jh-aggCandidateRejected
    的 opacity，图标作为子节点自然一起淡（与模型列表那处不同 —— 那边只淡了文字格）。 */
@@ -1545,7 +1554,10 @@ const STYLES = `
    ⚠️ flex: none + max-width 28%：渠道名长度差异极大（「buddy」 5 字符、
    「workbuddy」 9、「astudio」 7），若允许它参与压缩，同一页里每行的
    「模型 id 起始位置」就会错落 —— 对比渠道时眼睛要来回找起点了。
-   钉住它、把弹性全给模型 id，才能让整列对齐。 */
+   钉住它、把弹性全给模型 id。
+   ⚠️ 2026-10-28 审计更正：这**不产生跨行对齐** —— 实测各行「模型 id 起始位置」随
+   渠道名长度错落，最多差 **38px**（flex: none 让渠道格 = 内容宽，本来就各不相同）。
+   真要跨行对齐，得给渠道格一个**固定宽度**（不是 max-width）。 */
 .dim-jh-aggCandidateProvider { flex: none; max-width: 28%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; color: var(--dsw-alias-label-tertiary); }
 /* 模型 id：本行**唯一**吃剩余宽度的一格。
    ⚠️ font-variant-numeric: tabular-nums 与字号 12px：模型 id 里数字很多

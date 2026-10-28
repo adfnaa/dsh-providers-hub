@@ -309,20 +309,28 @@ export function permanentLockCopy(provider, windowDays) {
      * ⚠️ 必须保留字面 `N 天内到期` 与 `每日赠送额度`：它们是
      *    `tests/unit/credits-capabilities.spec.ts`、`permanent-lock-execution.spec.ts`、
      *    `permanent-lock-trae-lobsterai.spec.ts` 的锚点，换说法会假红。
+     *
+     * ⚠️⚠️ `lockTitle` 必须保留「**锁定后**」这个条件标记（2026-10-28 审计修回）：
+     *    它只在**未锁定**时渲染（`jet-hub.js` 的按钮 `title` 三元），删掉「锁定后」就变成
+     *    直陈现状 —— 而未锁定时永久积分**正被消耗**，于是 tooltip 宣称「永久积分留着不动」，
+     *    与同面板「刚解锁」的提示（`unlockedNotice`：会继续使用永久积分）**同屏互相打脸**。
+     *    `lockedTitle` 相反：它只在**已锁定**时渲染，那句话正是现状 ⇒ **不要**给它加「锁定后」。
+     *    （`lockedNotice` 用「已锁定：」而不是「已锁定永久积分：」，否则与紧随其后的
+     *    「永久积分留着不动」连读成「永久积分：永久积分」的叠词。）
      */
     return Object.freeze({
       days,
-      lockTitle: `永久积分留着不动，只消耗 ${days} 天内到期的积分。这类积分用完即无可用账号。点此锁定。`,
+      lockTitle: `锁定后永久积分留着不动，只消耗 ${days} 天内到期的积分。这类积分用完即无可用账号。点此锁定。`,
       lockedTitle: `永久积分留着不动，只消耗 ${days} 天内到期的积分。这类积分用完即无可用账号。点此解锁。`,
-      lockedNotice: `已锁定永久积分：永久积分留着不动，只消耗 ${days} 天内到期的积分。这类积分用完即无可用账号。`,
+      lockedNotice: `已锁定：永久积分留着不动，只消耗 ${days} 天内到期的积分。这类积分用完即无可用账号。`,
       unlockedNotice: `已解锁永久积分：${days} 天内到期的积分用完后，会继续使用更晚到期的积分。`,
     });
   }
   return Object.freeze({
     days: null,
-    lockTitle: '永久积分留着不动，只消耗每日赠送额度。今日额度用完即无可用账号。点此锁定。',
+    lockTitle: '锁定后永久积分留着不动，只消耗每日赠送额度。今日额度用完即无可用账号。点此锁定。',
     lockedTitle: '永久积分留着不动，只消耗每日赠送额度。今日额度用完即无可用账号。点此解锁。',
-    lockedNotice: '已锁定永久积分：永久积分留着不动，只消耗每日赠送额度。今日额度用完即无可用账号。',
+    lockedNotice: '已锁定：永久积分留着不动，只消耗每日赠送额度。今日额度用完即无可用账号。',
     unlockedNotice: '已解锁永久积分：今日额度用完后，会继续使用永久积分。',
   });
 }
