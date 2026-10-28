@@ -923,6 +923,178 @@ describe('供应商开关的样式约束（源码级回归）', () => {
       expect(rule).toMatch(/overflow-y: auto/)
       expect(rule, 'min-height: 0 缺了会被内容撑开，滚动条回退到 .dim-jh-panel').toMatch(/min-height: 0/)
     })
+
+    /**
+     * ⚠️⚠️ 真实缺陷（用户 2026-10-27 报障「聚合页模型列表显示异常」）：
+     * 22 个聚合模型的每一行都被压成几像素高的细线，右侧只剩一片横线。
+     *
+     * 根因链：本容器同时是「高度受限」（flex: 1 1 auto + min-height: 0）
+     * 与「纵向 flex」（display: flex / flex-direction: column）⇒ 内容超高时
+     * 子项按 flex-shrink: 1 **被压缩**，而不是溢出滚动。.dim-jh-aggModel
+     * 又带 overflow: hidden ⇒ 它的 min-height: auto 下限失效，可被压到 0 高。
+     *
+     * ⇒ 必须给每个直接内容子项 flex: none。**这条用例就是防线**：
+     * 少了它，任何人只要再给本容器加一次高度约束，列表就会静默塌成横线
+     * （单测不渲染，肉眼之外没人会发现）。
+     */
+    it('★★★ 聚合面板的直接内容子项必须 flex: none（否则模型行被压扁）', () => {
+      // 断言「选择器里确实把这几类子项都列了」
+      const rule = styles.match(/\.dim-jh-aggPanel > \.dim-jh-aggIntro[\s\S]*?\{[^}]*flex: none[^}]*\}/)?.[0]
+      expect(rule, '缺少「聚合面板子项 flex: none」规则 —— 模型行会被压扁').toBeDefined()
+      // 逐个子项点名：漏掉任何一个，它就会成为新的塌陷点
+      for (const cls of [
+        'dim-jh-aggIntro',
+        'dim-jh-aggToolbar',
+        'dim-jh-aggNotice',
+        'dim-jh-aggEmpty',
+        'dim-jh-aggModel',
+        'dim-jh-aggFooter',
+      ]) {
+        expect(rule, `子项 .${cls} 未列入 flex: none`).toContain(`.dim-jh-aggPanel > .${cls}`)
+      }
+      // 反向钉子：不许用通配符 —— 它会连 aggCount 一起钉死，破坏 flex-basis: 100% 换行
+      expect(rule, '不得用通配符：会把 .dim-jh-aggCount 的 flex-basis: 100% 换行一起干掉')
+        .not.toContain('.dim-jh-aggPanel > *')
+      // 反向钉子：不许省成 flex: 0 1 auto（收缩因子仍是 1，白改）
+      expect(rule).toMatch(/flex: none/)
+    })
+
+    /**
+     * ⚠️⚠️ 用户 2026-10-27 报障「美化聚合页模型列表」的落地判据。
+     *
+     * 改造前：候选行里只有一个 `.dim-jh-aggCandidateLabel`，内容是
+     * `渠道名 · 模型 id · 倍率` 一整串 —— 三者同色同字号同权重。
+     * 而这一页的**唯一用途**就是逐条比较渠道（同一模型在 12 家渠道各有一条候选），
+     * 最该被一眼分辨的恰恰是「哪家渠道」「哪个模型」，倍率只是附注。
+     * ⇒ 必须拆成四格、四种视觉层级。
+     *
+     * ⚠️ 本用例守的是**拆分本身**（少一格就退回同权渲染）；
+     * 颜色与字号的具体值不在断言范围（那是设计细节，会随主题调）。
+     */
+    it('★★★ 聚合候选行必须拆成四格（渠道 / 模型 id / 倍率 / 补丁），不得退回单串渲染', () => {
+      // ── 分母：四格的样式必须各自存在 ──
+      for (const cls of [
+        'dim-jh-aggCandidateProvider',
+        'dim-jh-aggCandidateId',
+        'dim-jh-aggCandidatePrice',
+        'dim-jh-aggCandidatePatch',
+      ]) {
+        expect(styles, `缺少 .${cls} 的样式 —— 该格会退回继承父级的同一种字色`).toMatch(
+          new RegExp(`\\.${cls} \\{[^}]*\\}`),
+        )
+      }
+      // ── 层级：渠道名必须比模型 id 弱（否则「哪家渠道」和「哪个模型」又同权了）──
+      const providerRule = styles.match(/\.dim-jh-aggCandidateProvider \{[^}]*\}/)?.[0] ?? ''
+      const idRule = styles.match(/\.dim-jh-aggCandidateId \{[^}]*\}/)?.[0] ?? ''
+      expect(providerRule, '渠道名必须用 tertiary 色（三档里最弱的一档）')
+        .toContain('--dsw-alias-label-tertiary')
+      expect(idRule, '模型 id 必须用 primary 色（本行唯一的强调格）')
+        .toContain('--dsw-alias-label-primary')
+      // ── 弹性：只有模型 id 吃剩余宽度 ──
+      // ⚠️ 若渠道名也参与压缩，同一页里每行的「模型 id 起始位置」会错落，
+      //    对比渠道时眼睛要来回找起点 —— 这正是用户说的「不好看」的机制之一。
+      expect(providerRule, '渠道名必须 flex: none（否则各行的模型 id 起始位置错落）')
+        .toMatch(/flex: none/)
+      expect(idRule, '模型 id 必须吃掉剩余宽度').toMatch(/flex: 1/)
+      // ── 倍率为 0 必须另走一套配色（「免费」与「x0.15」不是同一类信息）──
+      expect(styles, '「免费」必须用 data-free 单独上色，否则会被当成折扣读')
+        .toMatch(/\.dim-jh-aggCandidatePrice\[data-free='true'\]/)
+    })
+
+    it('★ 展开箭头必须是 svg 且随 data-open 旋转（字符版没有过渡）', () => {
+      // ⚠️ 字符「▸ / ▾」在 React 里是**换字符**，浏览器没有中间态 ——
+      //    22 行的高频列表里每次都「跳」一下，观感廉价。
+      //    svg + transform: rotate 才有过渡（全站图标化口径也一致）。
+      expect(styles, '箭头容器必须有 transform 过渡').toMatch(
+        /\.dim-jh-aggChevron \{[^}]*transition: transform/,
+      )
+      expect(styles, '展开态必须把箭头转 90 度').toMatch(
+        /\.dim-jh-aggModel\[data-open='true'\][^{]*\.dim-jh-aggChevron \{[^}]*transform: rotate\(90deg\)/,
+      )
+      // ── 源码侧：模型块必须把 open 状态暴露给样式 ──
+      // ⚠️ 这是「样式能拿到 React 状态」的唯一出口。少了它，上面两条样式
+      //    规则永远不会命中 —— 而纯样式断言照样全绿（假绿陷阱）。
+      expect(source, '模型块必须落 data-open，否则展开态样式永不命中').toMatch(
+        /className: 'dim-jh-aggModel',\s*\n\s*'data-open': open \? 'true' : undefined,/,
+      )
+
+      // ── 渲染侧：箭头必须**真的是** svg + path ──
+      // ⚠️ 上面的样式断言只证明「有 rotate 规则」。把 svg 退回字符 `▸`、或把 path
+      //    删空，样式规则照样在、本文件照样全绿（2026-10-28 审计实测：path → null
+      //    仍是 **115 passed**）⇒ 必须再从渲染侧钉一遍。
+      const modelAt = source.indexOf('const renderModel = (model)')
+      expect(modelAt, 'renderModel 不见了').toBeGreaterThan(-1)
+      const modelBody = source.slice(modelAt, source.indexOf('const renderCandidate = (model', modelAt))
+      expect(modelBody.length, 'renderModel 切片为空 —— 本用例的判据失效').toBeGreaterThan(200)
+      expect(modelBody, '箭头容器不见了').toContain("className: 'dim-jh-aggChevron'")
+      expect(modelBody, '箭头必须 aria-hidden（可访问名不该被装饰图形污染）')
+        .toMatch(/className: 'dim-jh-aggChevron', 'aria-hidden': 'true'/)
+      expect(modelBody, '箭头必须真的是 svg（退回字符 ▸ 会丢掉过渡）')
+        .toMatch(/className: 'dim-jh-aggChevron'[\s\S]{0,600}React\.createElement\('svg'/)
+      // 方向也要钉：朝右的折线，靠 CSS rotate(90deg) 转成朝下 ——
+      // 把 d 换成朝左/朝下的折线，「展开时转 90°」就变成侧向或倒过来了。
+      expect(modelBody, '箭头路径必须是朝右的折线（d 换向会让 rotate 90° 的方向错）')
+        .toContain("d: 'M9 6l6 6-6 6'")
+    })
+
+    /**
+     * ⚠️ 反向钉子：**不得**把展开态的 `data-open` 写成布尔值。
+     * React 对自定义属性的布尔 `false` 会渲染成字符串 "false"（不是移除属性），
+     * 于是未展开的块也带 `data-open="false"` —— 而样式是按 `[data-open='true']`
+     * 写的，一旦有人改成 `=== 'true'` 之外的判据（或写成 `[data-open]`），
+     * 22 个块会**全部**呈现展开态。用 `undefined` 让属性彻底缺席才是稳的。
+     */
+    it('★ data-open 必须是「真时给 true、假时省略」，不得写成布尔值', () => {
+      expect(source).toMatch(/'data-open': open \? 'true' : undefined,/)
+      expect(source, '不得写 data-open: open（布尔 false 会渲染成 "false" 属性）')
+        .not.toMatch(/'data-open': open,/)
+    })
+
+    /**
+     * ★★ 四格必须**在 renderCandidate 里真的被渲染**，且各自喂对应字段。
+     *
+     * ⚠️ 前一条用例只断言「样式存在」。样式在、但 JSX 里没渲染那一格 ——
+     * 是完全可能的回退形态（改样式时手滑删掉一个 createElement，或者
+     * 有人嫌多格麻烦把四格又合并回 `candidateRowLabel` 一串）。
+     * 那时样式断言**全绿**，界面上却退回同权渲染。⇒ 必须再从**渲染侧**钉一遍。
+     */
+    it('★★★ renderCandidate 必须真的渲染这四格，且各喂对应字段', () => {
+      const at = source.indexOf('const renderCandidate = (model, candidate')
+      expect(at, 'renderCandidate 不见了').toBeGreaterThan(-1)
+      const body = source.slice(at, source.indexOf('const renderModel = (model)', at))
+      expect(body.length, 'renderCandidate 切片为空 —— 本用例的判据失效').toBeGreaterThan(200)
+
+      // 渠道格喂 parts.provider
+      expect(body, '渠道格必须渲染 parts.provider')
+        .toMatch(/className: 'dim-jh-aggCandidateProvider' \}, parts\.provider\)/)
+      // 模型 id 格喂 parts.realId
+      expect(body, '模型 id 格必须渲染 parts.realId')
+        .toMatch(/className: 'dim-jh-aggCandidateId' \}, parts\.realId\)/)
+      // 倍率格：必须存在，且**按 price 判空**（不是无条件渲染）
+      expect(body, '倍率格不见了 —— 倍率信息丢失').toContain("className: 'dim-jh-aggCandidatePrice'")
+      expect(body, '倍率格必须由 parts.price 判空后才渲染')
+        .toMatch(/parts\.price === null/)
+      // 补丁角标：必须由 parts.patched 控制
+      expect(body, '补丁角标不见了 —— 规格 §7.1 的人工核查标记丢失')
+        .toContain("className: 'dim-jh-aggCandidatePatch'")
+      expect(body, '补丁角标必须由 parts.patched 控制').toMatch(/parts\.patched/)
+
+      // ── 「免费」必须由 price === 0 触发 data-free（不是无条件、也不是恒 undefined）──
+      // ⚠️ 只断言「样式里有 [data-free='true'] 规则」是**假绿**：把这里的接线删掉，
+      //    样式规则依然在，而界面上的「免费」会悄悄退回普通灰（2026-10-28 审计实测：
+      //    把接线改成 `undefined` 后，本文件 **115 条全绿**）。
+      expect(body, '「免费」必须由 parts.price === 0 触发 data-free')
+        .toMatch(/'data-free':\s*parts\.price === 0 \? 'true' : undefined/)
+
+      // ── 反向钉子：不得退回「整串直接塞进 span」──
+      // ⚠️ 这正是改造前的形态：`React.createElement('span', { className: '...CandidateLabel' }, candidateRowLabel(candidate))`
+      //    三等号后面紧跟 `candidateRowLabel(` 说明那一整串又被当成**文本子节点**了。
+      expect(body, '不得把 candidateRowLabel 整串当文本渲染（那就是改造前的同权形态）')
+        .not.toMatch(/CandidateLabel'[^)]*?\},\s*\n?\s*candidateRowLabel\(/)
+      // 但**允许**它出现在 title 上（悬停读全文）：那是刻意保留的
+      expect(body, '整串文案必须保留在 title 上（长 id 被省略号截断后要能悬停读全文）')
+        .toMatch(/title: candidateRowLabel\(candidate\)/)
+    })
   })
 
   /**

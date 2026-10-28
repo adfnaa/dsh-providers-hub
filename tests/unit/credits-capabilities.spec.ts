@@ -824,12 +824,86 @@ describe('永久积分锁定能力', () => {
       expect(copy.lockTitle).not.toContain('天内到期')
     })
 
+    /**
+     * ⚠️⚠️ `lockTitle` 与 `lockedTitle` **必须可区分**，且只有**前者**带条件标记。
+     *
+     * 2026-10-28 审计实测：把两者改成**逐字相同**之后，`credits-capabilities` 47 条 +
+     * 两条 permanent-lock 的 31 条**全绿** —— 没有任何判据守这一点。
+     *
+     * 为什么这是缺陷而不是措辞洁癖：`lockTitle` 渲染在**未锁定**状态的按钮上，
+     * 那一刻「永久积分留着不动」是**假的**（永久积分正被消耗）；只有 `lockedTitle`
+     * 才能直陈现状。两者同文 ⇒ 说明与实际计费口径相反。
+     * 另一侧同样要钉住：同面板「刚解锁」的 `unlockedNotice` 说「会继续使用永久积分」，
+     * 若未锁定的 `lockTitle` 也说「留着不动」，两句话在同一屏上自相矛盾。
+     */
+    it('★★ 未锁定的 lockTitle 必须带「锁定后」条件标记，且不得与 lockedTitle 同文', () => {
+      for (const id of [...SUPPORTED, 'codearts']) {
+        const copy = permanentLockCopy(id)
+        expect(copy.lockTitle, `${id}：未锁定的按钮文案丢了「锁定后」⇒ 直陈现状，与体感相反`)
+          .toContain('锁定后')
+        expect(copy.lockTitle, `${id}：lockTitle 与 lockedTitle 同文 ⇒ 锁定/未锁定两种状态分不清`)
+          .not.toBe(copy.lockedTitle)
+        expect(copy.lockedTitle, `${id}：已锁定的文案不该带「锁定后」（那句本来就是现状）`)
+          .not.toContain('锁定后')
+      }
+    })
+
     it('四个文案位都齐（面板直接取用，缺一个就渲染出 undefined）', () => {
       for (const id of [...SUPPORTED, 'codearts']) {
         const copy = permanentLockCopy(id)
         for (const key of ['lockTitle', 'lockedTitle', 'lockedNotice', 'unlockedNotice']) {
           expect(typeof copy[key], `${id}.${key}`).toBe('string')
           expect(copy[key].length, `${id}.${key} 不能为空`).toBeGreaterThan(0)
+        }
+      }
+    })
+
+    /**
+     * ★ 句式结构守卫（用户 2026-10-27：「改成直白句式，说明『锁住永久积分 →
+     *   只烧 15 天内会作废的 → 这类烧完就没有可用账号了』」，随后「折中一下」）。
+     *
+     * ⚠️ 为什么要单独钉**顺序**：这三件事的因果链是「留着什么 → 烧什么 → 烧完怎样」，
+     *    顺序一乱读者就要自己重新拼接。而旧文案的毛病正是**句式绕** ——
+     *    「只消耗「15 天内到期」的积分包」一句里套三层引号，读起来要拆括号。
+     * ⚠️ 只断言「包含某关键词」是不够的：把三句话倒过来排、或把「无可用账号」
+     *    提到最前面，关键词照样都在、语义却散了。故用 `indexOf` 比较先后。
+     *
+     * ⚠️ 「没有可用账号」的判据必须写成**正则**，不能是固定字面量：
+     *    折中版把措辞收紧成「用完即无可用账号」（书面语），字面量与口语版的
+     *    「用完就没有可用账号了」不同。钉死某一种写法会让**改文案时假红**
+     *    —— 而本用例真正要守的是「说了这件事」+「顺序对」，不是措辞本身。
+     */
+    it('★★ 锁定文案必须按「留着永久 → 只烧临期 → 烧完没号」的顺序说清三件事', () => {
+      for (const id of [...SUPPORTED]) {
+        const copy = permanentLockCopy(id)
+        for (const key of ['lockTitle', 'lockedTitle', 'lockedNotice']) {
+          const text: string = copy[key]
+          const keepIdx = text.indexOf('永久积分留着不动')
+          const burnIdx = text.search(/只消耗 \d+ 天内到期的积分|只消耗每日赠送额度/)
+          // 「没有可用账号」/「无可用账号」两种措辞都认（见上方注释）。
+          const emptyIdx = text.search(/没有可用账号|无可用账号/)
+          expect(keepIdx, `${id}.${key} 没说「永久积分留着不动」`).toBeGreaterThan(-1)
+          expect(burnIdx, `${id}.${key} 没说「只消耗什么」`).toBeGreaterThan(-1)
+          expect(emptyIdx, `${id}.${key} 没说「用完就没有可用账号」`).toBeGreaterThan(-1)
+          // 顺序：留着什么 → 烧什么 → 烧完怎样
+          expect(keepIdx, `${id}.${key} 顺序错了（「留着不动」应在「只消耗」之前）`)
+            .toBeLessThan(burnIdx)
+          expect(burnIdx, `${id}.${key} 顺序错了（「只消耗」应在「无可用账号」之前）`)
+            .toBeLessThan(emptyIdx)
+        }
+      }
+    })
+
+    it('★★ 不再出现嵌套引号的绕口句式（旧文案的形态）', () => {
+      for (const id of [...SUPPORTED]) {
+        const copy = permanentLockCopy(id)
+        for (const key of ['lockTitle', 'lockedTitle', 'lockedNotice']) {
+          // 旧文案：只消耗「15 天内到期」的积分包 —— 引号套在数字外面。
+          expect(copy[key], `${id}.${key} 又变回嵌套引号的绕口句式`)
+            .not.toMatch(/只消耗「/)
+          // 「这类积分用尽后将没有可用账号」——「将」字句比直陈句绕。
+          expect(copy[key], `${id}.${key} 又用回了「用尽后将」句式`)
+            .not.toContain('用尽后将')
         }
       }
     })
