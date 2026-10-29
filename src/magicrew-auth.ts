@@ -741,6 +741,46 @@ export class MagicrewAuth extends Service {
     return { ...credential, nickname: profile.nickname }
   }
 
+  /**
+   * 读本账号的**展示昵称** —— `account.list` 的自愈回填用（2026-10-30）。
+   *
+   * ## 为什么要有这个公开入口（而不是让 RPC 层直接调 `fetchMagicrewProfile`）
+   *
+   * ⚠️ 必须与登录走**同一个注入点**（{@link MagicrewAuthOptions.profileFetcher}）：
+   *    ① 单测要能注入假取数器（否则「回填」那条腿只能真发网络 ⇒ 不可测）；
+   *    ② 超时与告警纪律只有这一份 —— 另起一条调用链必然与登录那条分叉
+   *      （本仓库「一语义一套判据」的红线）。
+   *
+   * ⚠️ 读不到 ⇒ `undefined`，**不抛**：回填是尽力而为，调用方（`account.list`）
+   *    不该因为一个展示名取不到而让整个列表失败。
+   * ⚠️ 但仍然**留痕**（与 {@link withProfileNickname} 同一条纪律：不许静默 ——
+   *    本仓库记过「静默停摆、功能上线起一次都没成功过」的教训）。
+   */
+  async readProfileNickname(credential: {
+    jwt: string
+    organizationCode: string
+  }): Promise<string | undefined> {
+    if (credential.jwt.length === 0) return undefined
+    try {
+      const profile = await this.profileFetcher({
+        jwt: credential.jwt,
+        organizationCode: credential.organizationCode,
+        product: this.product,
+      })
+      const nickname = profile.nickname.trim()
+      if (nickname.length === 0) {
+        this.warn('[magicrew] 账号资料里没有昵称（卡片昵称回落为脱敏手机号 / 渠道名）')
+        return undefined
+      }
+      return nickname
+    } catch (error) {
+      this.warn(
+        '[magicrew] 读取账号资料失败（卡片昵称回落为脱敏手机号 / 渠道名）：' + String(error),
+      )
+      return undefined
+    }
+  }
+
   /** 告警出口（`warnImpl` 优先，否则宿主 logger）。 */
   private warn(message: string): void {
     if (this.warnImpl !== undefined) this.warnImpl(message)

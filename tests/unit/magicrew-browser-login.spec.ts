@@ -1406,6 +1406,73 @@ describe("★ account.create({ provider: 'magicrew', mode: 'browser' }) 三步�
 // ⑧ 占位条目收口（宿主重启后的残留）
 // ════════════════════════════════════════════════════════════════════════
 
+// ════════════════════════════════════════════════════════════════════════
+// ⑦b `account.list` 的**昵称自愈回填**（2026-10-30）
+// ════════════════════════════════════════════════════════════════════════
+
+describe('★ account.list 的昵称自愈回填', () => {
+  /**
+   * ⚠️⚠️ 为什么必须有这条腿：昵称**只在登录那一刻**取一次。修复上线**之前**登录的
+   * 账号，凭据里没有 `nickname` ⇒ 卡片恒显示「超级麦吉」（那是
+   * `magicrewDisplayNickname` 在无 phone 时回落到 `product.displayName` 的结果）
+   * ⇒ 用户必须**重新登录一次**才能看到自己的名字（真机报障 2026-10-30）。
+   */
+  it('★★ 登录时没取到昵称 ⇒ 下次 `account.list` 自愈回填（凭据 + 池都写），且不重复打上游', async () => {
+    let mode: 'fail' | 'ok' = 'fail'
+    let calls = 0
+    const { callCreate, callPoll, callList, pool, store } = await setupRpc({
+      results: [{ jwt: JWT_LIVE, organizationCode: 'org-cn' }],
+      profileFetcher: async () => {
+        if (mode === 'fail') throw new Error('HTTP 502')
+        calls++
+        return { nickname: 'Nick', realName: 'Nick', phone: '1380000000' }
+      },
+    })
+
+    // ① 走**真实登录路径**，但资料取数失败 ⇒ 登录成功、凭据里没有 nickname
+    const created = await callCreate()
+    const accountId = (created.value as { accountId: string }).accountId
+    await callPoll(accountId)
+    const ref = pool.findAccount(accountId)!.credentialRef
+    expect(store.saved(ref)?.nickname, '前提：这次登录确实没取到昵称').toBeUndefined()
+    expect(pool.findAccount(accountId)?.nickname).toBe('超级麦吉')
+
+    // ② 上游恢复 ⇒ 列表触发回填
+    mode = 'ok'
+    const first = await callList()
+    const entry = (first.value as { accounts: { id: string, nickname?: string }[] }).accounts
+      .find((a) => a.id === accountId)
+    expect(entry?.nickname, '列表返回的昵称必须已是真实昵称').toBe('Nick')
+    expect(store.saved(ref)?.nickname, '凭据也要写回（否则每次列表都得再取一次）').toBe('Nick')
+    expect(pool.findAccount(accountId)?.nickname).toBe('Nick')
+    expect(calls).toBe(1)
+
+    // ③ 再列一次：凭据已有昵称 ⇒ 零请求
+    await callList()
+    expect(calls, '凭据已有昵称 ⇒ 不该再发请求').toBe(1)
+  })
+
+  it('★ 资料取数一直失败 ⇒ 列表照常 + 留痕，且每账号每进程只试一次（不每秒打上游）', async () => {
+    let calls = 0
+    const { callCreate, callPoll, callList, pool, warnings } = await setupRpc({
+      results: [{ jwt: JWT_LIVE, organizationCode: 'org-cn' }],
+      profileFetcher: async () => { calls++; throw new Error('HTTP 502') },
+    })
+    const created = await callCreate()
+    const accountId = (created.value as { accountId: string }).accountId
+    await callPoll(accountId)
+    expect(calls, '登录那次已经试过').toBeGreaterThan(0)
+
+    await callList()
+    expect(warnings.join('\n')).toMatch(/读取账号资料失败/)
+    const afterFirstList = calls
+    await callList()
+    await callList()
+    expect(calls, '每账号每进程只试一次：列表再多也不该重试').toBe(afterFirstList)
+    expect(pool.findAccount(accountId), '回填失败不得影响列表').toBeDefined()
+  })
+})
+
 describe('sweepAbandonedMagicrewBrowserLogins（经 account.list 触发）', () => {
   it('★ 有凭据的账号**绝不**被收口（`local-browser` 建的账号也恒有凭据）', async () => {
     const { callCreate, callPoll, callList, pool } = await setupRpc({

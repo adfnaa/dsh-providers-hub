@@ -3244,6 +3244,17 @@ function registerJetHubEndpoints(
   const magicrewBrowserLoginPendingAt = new Map<string, number>()
 
   /**
+   * 已尝试过**昵称回填**的账号 id（`account.list` 的自愈路径用）。
+   *
+   * ⚠️ 为什么需要这个闸门：回填昵称要**发一次上游资料请求**。若不记，每次
+   * `account.list`（客户端 1 秒一拍、且每个面板挂载都会拉）都会对**同一个**
+   * 取不到昵称的账号重试一次 —— 那是一条稳定的、每秒一次的无用上游流量。
+   * ⇒ 每账号**每进程只试一次**；失败留给下次启动（进程重启即清空）。
+   * ⚠️ 只对**成功**也记：成功后再进这里也没有意义（`credential.nickname` 已存在）。
+   */
+  const magicrewProfileTried = new Set<string>()
+
+  /**
    * 网页版登录占位条目的**最短保留时长**（收口阈值）。
    *
    * 客户端自己的轮询上限是 5 分钟、宿主侧等待上限 4 分钟（
@@ -4372,20 +4383,62 @@ function registerJetHubEndpoints(
          * ⚠️ **逐账号按它自己的 ref resolve**（多账号广播 = 拿 A 的有效期写给 B，
          * 本仓库已复发 7 次的那类错位）。
          */
-        if (req.provider === 'magicrew' && accounts.some((a) => a.expiresAt === undefined)) {
+        /**
+         * ⚠️ **超级麦吉自愈回填**（2026-10-30）：`expiresAt` + `nickname`。
+         *
+         * 「修复前登录的账号」凭据里既没有 `nickname`（卡片恒显示「超级麦吉」
+         * —— 那是 `magicrewDisplayNickname` 在无 phone 时回落到 `product.displayName`
+         * 的结果），也可能没有 `apiKeyExpiresAt`（卡片恒显示「有效期未知」）。
+         *
+         * ⚠️⚠️ **两者都只在「登录那一刻」才取** ⇒ 不在这里补算的话，用户必须
+         * **重新登录一次**才能看到自己的名字（真机报障 2026-10-30：昵称修复已上线，
+         * 但那张**已存在**的卡仍是「超级麦吉」）。
+         *
+         * ⚠️ 昵称要**发一次上游请求**（资料端点）⇒ 用 `magicrewProfileTried` 做
+         * **每账号每进程只试一次**的闸门：失败不重试（否则每次 `account.list` 都
+         * 打一次上游），下次进程启动再来。
+         * ⚠️ 逐账号按**自己的 ref** resolve（多账号广播 = A 的名字显示成 B 的，
+         * 本仓库已复发过 7 次的那类错位）。
+         * ⚠️ 回填**只写 `nickname`**，不写 `phone`：上游给的 phone 是 **10 位本地号**，
+         * 与 `magicrewDisplayNickname` 的 11 位脱敏判据**不同形**，写进去会得到错位掩码。
+         */
+        if (req.provider === 'magicrew') {
           for (const account of accounts) {
-            if (account.expiresAt !== undefined) continue
             const resolved = await ctx.credentials.resolve(credentialRef(account.credentialRef))
               .catch(() => undefined)
             if (resolved === undefined) continue
-            let expiresAt: number | undefined
+            let credential: MagicrewCredential | undefined
             try {
-              const credential = parseMagicrewCredential(JSON.parse(resolved.value))
-              if (credential !== undefined) expiresAt = magicrewExpiresAtMs(credential)
+              credential = parseMagicrewCredential(JSON.parse(resolved.value))
             } catch { /* 凭据不是合法 JSON ⇒ 跳过该账号 */ }
-            if (expiresAt === undefined) continue
-            account.expiresAt = expiresAt
-            void pool.updateAccount(account.id, { expiresAt }).catch(() => undefined)
+            if (credential === undefined) continue
+            // ① 有效期：纯本地解码，无网络，可以每轮都补
+            if (account.expiresAt === undefined) {
+              const expiresAt = magicrewExpiresAtMs(credential)
+              if (expiresAt !== undefined) {
+                account.expiresAt = expiresAt
+                void pool.updateAccount(account.id, { expiresAt }).catch(() => undefined)
+              }
+            }
+            // ② 昵称：要发请求 ⇒ 每账号每进程只试一次
+            if (credential.nickname === undefined && !magicrewProfileTried.has(account.id)) {
+              magicrewProfileTried.add(account.id)
+              // ⚠️ 走 **auth 的注入点**（`readProfileNickname`）而不是直接调
+              //    `fetchMagicrewProfile`：单测要能注入假取数器，且超时/告警纪律
+              //    与登录那条腿只有**一份**（本仓库「一语义一套判据」的红线）。
+              // ⚠️ 它自己不抛（读不到 ⇒ `undefined`），并已留痕 ⇒ 这里不需要 catch。
+              const got = await auths.magicrew.readProfileNickname({
+                jwt: credential.jwt,
+                organizationCode: credential.organizationCode,
+              })
+              if (got !== undefined) {
+                const enriched = { ...credential, nickname: got }
+                await ctx.credentials.set(credentialRef(account.credentialRef), JSON.stringify(enriched))
+                const nickname = magicrewDisplayNickname(enriched)
+                account.nickname = nickname
+                void pool.updateAccount(account.id, { nickname }).catch(() => undefined)
+              }
+            }
           }
         }
         return { ok: true, value: { accounts: await enrichAccountIdentity(accounts, req.provider) } }
