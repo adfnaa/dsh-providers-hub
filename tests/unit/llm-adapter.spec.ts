@@ -229,10 +229,12 @@ describe('CodeArtsAdapter', () => {
   })
 
   it('resolveModel discloses contextWindow for every model in the catalog', async () => {
-    // ⚠️ 2026-10-21 重取证（本机 42 份 IDE 内核日志，2026-09-11~10-21）：
+    // ⚠️ 2026-10-29 重取证（IDE 0.2.6 抓包 record 38 + AgentCenter 双源一致）：
     //    权威来源是 IDE 自己下发的 `provider["inferhub-provider"].models[*].limit.context`。
-    //    - GLM-5.2：**1_048_576**（09-11~10-20 是 202_752，**10-21 上游改成 1M**）
-    //    - glm-5.3：1_048_576（本次报障模型，原先**完全没有**条目）
+    //    - GLM-5.2：**202_752**（09-11~10-20 是 202_752；10-21 改 1M；
+    //      **10-29 又改回 202_752** —— 三次漂移史见 CONTEXT_WINDOWS 注释，
+    //      运行时权威已由 AgentCenter 动态下发，本表只是冷缓存兜底）
+    //    - glm-5.3：1_048_576（2026-10-21 报障模型，原先**完全没有**条目）
     //    - openpangu-2.0-flash / -pro：524_288（原先没有条目 ⇒ 用户没有占用条）
     //    - deepseek-v4.1-flash：1_048_576（本表原先写 1_000_000，按 IDE 权威值改正）
     // ⚠️ **本家不再有「context 为 undefined」的目录条目** —— 表里查不到时走
@@ -241,7 +243,7 @@ describe('CodeArtsAdapter', () => {
     //    `codearts-context-window.spec.ts`。
     const adapter = makeAdapter()
     const glm52 = await adapter.resolveModel('codearts', 'GLM-5.2')
-    expect(glm52.context).toEqual({ contextWindow: 1_048_576 })
+    expect(glm52.context).toEqual({ contextWindow: 202_752 })
     const glm53flash = await adapter.resolveModel('codearts', 'glm-5.3-flash')
     expect(glm53flash.context).toEqual({ contextWindow: 1_048_576 })
     const glm53 = await adapter.resolveModel('codearts', 'glm-5.3')
@@ -270,7 +272,8 @@ describe('CodeArtsAdapter', () => {
     expect(call.model).toMatchObject({
       provider: 'codearts',
       id: 'GLM-5.2',
-      context: { contextWindow: 1_048_576 },
+      // 2026-10-29 双源取证：GLM-5.2 = 202_752（漂移史见 CONTEXT_WINDOWS）。
+      context: { contextWindow: 202_752 },
       inputModalities: ['text'],
     })
     expect(typeof call.stream).toBe('function')
@@ -1517,7 +1520,8 @@ describe('CodeArtsAdapter', () => {
     // DSH 契约：listModels 的结果仅供参考，缺省不构成请求拒绝。
     const resolved = await adapter.resolveModel('codearts', 'GLM-5.2')
     expect(resolved.id).toBe('GLM-5.2')
-    expect(resolved.context?.contextWindow).toBe(1_048_576)
+    // 2026-10-29 双源取证：GLM-5.2 = 202_752（漂移史见 CONTEXT_WINDOWS）。
+    expect(resolved.context?.contextWindow).toBe(202_752)
   })
 
   // ── 目录门控：没有已登录账号就不显示该 provider 的模型 ──
