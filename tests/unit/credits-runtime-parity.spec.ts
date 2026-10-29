@@ -597,6 +597,8 @@ const BALANCE_PATH_OF: Readonly<Record<string, string>> = {
   //    （主机由 `AUTOCLAW_INTL.apiBase` 决定）。实测 2026-10-20：
   //    国际站该路径返回 `code=0`、`total_balance=13000`。
   autoclawintl: '/agent-assetmgr/api/v2/wallets',
+  // ⚠️ 超级麦吉（Magicrew，2026-10-29）：`GET /api/v1/model-gateway/tokens`（`MAGICREW_POINTS_PATH`）。
+  magicrew: '/api/v1/quota/points/total',
   // ⚠️ **本 fork 独有**（魔搭，2026-10-17）：魔粒余额端点。
   //    ⚠️ 只写**路径片段**（与本表其余项同口径）：域名在 product 的 `balanceUrl`
   //    里，而它**刻意不是** `baseUrl` 那个 host（见 modelscope-product.ts 的字段注释）。
@@ -628,6 +630,11 @@ describe('★★ 逐家余额都走自己的上游端点（源码文本断言的
     zcode_jwt: 'jwt', device_mid: 'mid', app_version: '3.14.4',
     uid: 'uid-spec', user_id: 'uid-spec', machine_id: 'm-1',
     expires_at: '2099-01-01T00:00:00.000Z',
+    // ⚠️ 超级麦吉（Magicrew，2026-10-29）只认 `jwt` + `organizationCode` 两个字段
+    //    （其 `credits` 条目的 `fetchBalance` 在 jwt 缺失时会**早退不发请求**，
+    //    那是刻意的不浪费 —— 故共享 fixture 必须带上它们，否则本表那条
+    //    「余额请求打到自己端点」会对 magicrew 恒读过）。
+    jwt: 'j.w.t', organization_code: 'org1',
   })
 
   it('手写端点清单与 registry 逐项对齐（漏一家即红并点名）', () => {
@@ -693,7 +700,7 @@ describe('★★ 生产积分表的内容（源码文本断言的行为替代）
     // ⚠️ 2026-10-19 **本 fork** 并入 codely（Unity，usage/summary）⇒ 15 → 16。
     //    它是全仓首例 balance:true + channel:false（登录/余额均为自由函数，
     //    无 auth 服务；runtime 守卫只查已注册 runtime，codely 被跳过）。
-    expect(expected.length).toBe(18)
+    expect(expected.length).toBe(19)
     // ⚠️ **关键集合判据必须对「生产真正调用的那种形态」也成立**（2026-10-08 复审 C1）：
     //    上面那次是 `createProviderCredits()`（无 deps），而端点与 `index.ts` 调的
     //    都是 `createProviderCredits({ loomy, raccoon, zcode })`。deps 只应影响**实现**，

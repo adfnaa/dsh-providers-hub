@@ -98,6 +98,8 @@ const AUTH_SERVICE_OF: ReadonlyArray<readonly [string, string]> = [
   //    派生 ⇒ `modelscopeAuth`。同款坑：本表由**真跑 apply() 的探针**验证过，
   //    不凭注释推断。
   ['modelscope', 'modelscopeAuth'],
+  // ⚠️ 超级麦吉（Magicrew，2026-10-29）：服务名由 `${product.id}Auth` 派生 ⇒ `magicrewAuth`。
+  ['magicrew', 'magicrewAuth'],
 ]
 
 /**
@@ -413,7 +415,7 @@ describe('★ index.ts 的能力注册表接线（行为断言，替代源码文
     //    减去 AUTH_EXEMPT 两项（opencode / aggregate）⇒ 19 个 auth 键。
     // ⚠️ 2026-10-20 加 autoclawintl（AutoClaw 国际版）：19 → 20 个 auth 键。
     // ⚠️ 2026-10-22（A6）：codely 翻 `channel: true`：20 → 21。
-    expect(shouldRegister, 'channel 集合变了，请复核 opencode 豁免是否仍成立').toHaveLength(21)
+    expect(shouldRegister, 'channel 集合变了，请复核 opencode 豁免是否仍成立').toHaveLength(22)
     expect(
       registeredRuntimeIds().sort(),
       'registry 里有账号的 provider 必须都注册进能力注册表（左侧多出 = 清单里多了僵尸项，' +
@@ -507,6 +509,10 @@ describe('★ index.ts 的 probe 域接线（Task 8 复审补齐：此前零守�
     //    「登记为不写标记的确实没有写点」用例**红**出来的，与 minimax 2026-10-11、
     //    accio 2026-10-18 两次同型。用户报障「用完积分怎么不自动切账号」即由此而来。
     ['codely-adapter.ts', ['codely']],
+    // ⚠️ 超级麦吉（Magicrew，2026-10-29）**不写** `modelRateLimits`：
+    //    本家没有请求级换号/冷却（单账号直连，key 由 `MagicrewAuth` 续期管理）
+    //    ⇒ 留空是**被验证的声明**（下面那条「登记为不写的确实没有写点」会真跑）。
+    ['magicrew-adapter.ts', []],
   ]
 
   /**

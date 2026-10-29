@@ -98,6 +98,10 @@ export const REFRESH_PROVIDERS = [
   //    ⚠️ 它之前不在本表里，理由是当时 `CodelyAuth.refreshAll` **2 参、对不上契约**
   //    （TS2322）⇒ 接不上。现已改成单参并真接（见 A5）。
   'codely',
+  // ⚠️ 超级麦吉（Magicrew，2026-10-29）：有真实 refresh 端点
+  //    （`PUT /api/v1/model-gateway/tokens`，`refreshMagicrewKey` 是 refresh_token 的唯一出口），
+  //    `refreshAccountCredential` 续期并回写池内 `expiresAt` ⇒ 不属 loomy / zcode 那类豁免。
+  'magicrew',
 ] as const
 
 /**

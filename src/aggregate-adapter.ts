@@ -1394,6 +1394,10 @@ export class AggregateAdapter extends LlmAdapter {
     //    ⇒ 目录层有它、轮换候选层没它；上游一旦开始下发到期时间，
     //    补一个折算原语 + 两处登记即可。
     'codely',
+    // ⚠️ Magicrew（超级麦吉，2026-10-29）：与 accio / officeace / autoclaw 同款，
+    //    **只加本数组不够** —— 决定候选表可见性的是 `aggregate-expiry.ts` 的
+    //    `WIRED_EXPIRY_PROVIDERS`，漏了它 ⇒ 折算恒 UNUSABLE ⇒ 该渠道静默消失。
+    'magicrew',
   ])
 
   /**

@@ -204,6 +204,9 @@ describe('★★ 接线的**透传**腿（`provider-expiry.ts` 的 `context.cach
     //    那是 PR131 把本表从「四家硬编码」改成「整表比对」的直接收益
     //    （旧形态下这三家零守卫）。
     'astudio', 'minimax', 'minimaxintl',
+    // ⚠️ 2026-10-29：magicrew 的 `provider-expiry.ts` 条目也接了 `context.cachedBalance`
+    //    透传（`magicrewExpiry` 的取数腿契约要求它）。漏登记 ⇒ 本表与生产漂移。
+    'magicrew',
   ] as const
 
   it('★★ 所有接了 `cachedBalance` 透传的渠道都必须真的透传（本表即清单）', async () => {

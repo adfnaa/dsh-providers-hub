@@ -116,7 +116,7 @@ describe('account.refresh 分派（T7 回归）', () => {
       EXPECTED_REFRESH_PROVIDER_IDS,
       'channel 集合变了，请复核 opencode 豁免是否仍成立（见 AUTH_EXEMPT）',
     // ⚠️ 2026-10-22（A6）：codely 翻 `channel: true`：20 → 21。
-    ).toHaveLength(21)
+    ).toHaveLength(22)
   })
 
   it('buddy 账号刷新**自己的** credentialRef，而不是默认单凭据 ref', async () => {

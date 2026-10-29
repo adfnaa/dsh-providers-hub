@@ -73,6 +73,8 @@ import { fetchRaccoonCreditBalance } from './raccoon-credits.js'
 import { fetchModelscopeBalanceDetailed } from './modelscope-credits.js'
 import type { ModelscopeCredential } from './modelscope.js'
 import { MODELSCOPE } from './modelscope-product.js'
+// ⚠️ **本 fork 独有**（超级麦吉 Magicrew，2026-10-29）：积分余额原语。
+import { fetchMagicrewBalance } from './magicrew-credits.js'
 // ⚠️ **本 fork 独有**（Codely/Unity，2026-10-19）：积分余额原语。
 // 2026-10-20 起接每日签到（`/api/points/check-in`，实测 200）。
 import { claimCodelyDailyCheckIn, fetchCodelyBalanceDetailed } from './codely-credits.js'
@@ -953,6 +955,30 @@ export function createProviderCredits(
        * 它就会真去发一轮必然失败的请求。
        */
       claimUnavailableReason: 'WorkBuddy 国际版不支持每日签到（其后端没有签到接口）',
+    },
+
+    /**
+     * 超级麦吉（Magicrew，2026-10-29）。
+     *
+     * ⚠️ 用 `fetchBalance` 而不是 `fetchBalanceDetailed`：本家的失败面只有「读不到」
+     * 一种（网络 / 业务码非 1000 / 缺 `total_points`），没有需要让用户做**不同动作**
+     * 的子原因 —— 而 `fetchBalanceDetailed` 的存在理由正是「三种失败的出路不同」
+     * （见 {@link ProviderCredits.fetchBalanceDetailed} 的注释）。
+     * ⚠️ `?? null`：原语用 `undefined` 表达「读不到」，而本接口契约是 `null`
+     * —— 两者**同义**，但 `undefined` 会被上层当成「没实现」。
+     * ⚠️ 没有 `claim`：本家**有**签到端点，但刻意不接（会消耗真实积分，用户未要求）。
+     */
+    magicrew: {
+      fetchBalance: async (credential) => {
+        const parsed = credential as { jwt?: unknown, organizationCode?: unknown } | null | undefined
+        if (typeof parsed?.jwt !== 'string' || parsed.jwt.length === 0) return null
+        return await fetchMagicrewBalance({
+          jwt: parsed.jwt,
+          organizationCode: typeof parsed.organizationCode === 'string' ? parsed.organizationCode : '',
+        }) ?? null
+      },
+      precheckStatus: false,
+      claimUnavailableReason: '超级麦吉暂不支持每日签到（本插件未接该端点）',
     },
   }
 }

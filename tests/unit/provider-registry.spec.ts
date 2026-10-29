@@ -27,7 +27,7 @@ describe('ProviderDescriptor：与既有产物的逐条一致性', () => {
     }
   })
 
-it('共 23 条（21 个真渠道 + aggregate；codely 2026-10-22 已翻 channel:true）', () => {
+it('共 24 条（23 个真渠道 + aggregate；codely 2026-10-22 已翻 channel:true）', () => {
     // ⚠️ 2026-10-13 合并：officeace（第 15）与 accio（第 16）**同一次**并入，
     //    故从 15/14 直接跳到 17/16 —— 不是漏了一格。
     // ⚠️ 2026-10-15 加 minimaxintl（MiniMax Code 国际版，第 17 个真渠道）：
@@ -43,10 +43,12 @@ it('共 23 条（21 个真渠道 + aggregate；codely 2026-10-22 已翻 channel:
     // ⚠️ 2026-10-20 合并 remote master 时 astudio 随上游并入（21 → 22 条），而本条
     //    期望值当时仍是上游的 21 ⇒ 变红。按**注册表事实**更正为 22（这条断言是
     //    「注册表没被误删」的唯一防线，数字必须跟着注册表走，不能反向改注册表凑数）。
-    expect(PROVIDER_REGISTRY).toHaveLength(23)
+    // ⚠️ 2026-10-29 加 magicrew（超级麦吉国内站，第 23 个真渠道）：位置有硬要求
+    //    （**紧邻 aggregate 之前 = 倒数第二**），由下面「声明序在 aggregate 之前」那条守着。
+    expect(PROVIDER_REGISTRY).toHaveLength(24)
     // ⚠️ 2026-10-22（A6）：codely **已翻 `channel: true`** —— 它的推理 / 目录 / 余额 / 签到 / 续期全部已接线，
     //    而 `channel` 在生产代码里**零个读取点** ⇒ 原来那个 `false` 只是为了让守卫不变红而选的，它同时把 codely 挡在聚合目录之外。现在真实接线已完成，翻正。
-    expect(PROVIDER_REGISTRY.filter((d) => d.channel).length).toBe(22)
+    expect(PROVIDER_REGISTRY.filter((d) => d.channel).length).toBe(23)
     expect(
       PROVIDER_REGISTRY.find((d) => d.id === 'codely')?.channel,
       'codely 已接线完成，必须是 channel: true（否则它的模型永不进聚合目录）',
@@ -73,6 +75,23 @@ it('共 23 条（21 个真渠道 + aggregate；codely 2026-10-22 已翻 channel:
     expect(ia, 'registry 里找不到 aggregate').toBeGreaterThan(-1)
     expect(im, 'ModelScope 必须排在聚合之上，否则它在左栏会被排到聚合下面')
       .toBeLessThan(ia)
+  })
+
+  /**
+   * ⚠️ 需求：magicrew 的设置标签应排在**聚合之上**（= 倒数第二）。
+   *
+   * 与 modelscope 那条同因同形（未自定义 `providerOrder` 时，左栏完全按
+   * `PROVIDER_REGISTRY` 的**声明序**渲染）。守相对位置而非绝对下标。
+   */
+  it('★ magicrew 的声明序在 aggregate 之前（= 倒数第二）', () => {
+    const ids = PROVIDER_REGISTRY.map((d) => d.id)
+    const im = ids.indexOf('magicrew')
+    const ia = ids.indexOf('aggregate')
+    expect(im, 'registry 里找不到 magicrew').toBeGreaterThan(-1)
+    expect(ia, 'registry 里找不到 aggregate').toBeGreaterThan(-1)
+    expect(im, 'Magicrew 必须排在聚合之上，否则它在左栏会被排到聚合下面').toBeLessThan(ia)
+    // 反面：它必须是**紧邻**的倒数第二（不是「排在前面某处」）
+    expect(ia - im).toBe(1)
   })
 
   it('★ 真实排出的左栏顺序与声明序一致（复刻客户端排序口径，非源码断言）', async () => {
@@ -208,7 +227,7 @@ describe('从 registry 派生的能力表与既有断言逐条相等', () => {
     ])
   })
 
-  it('rateLimit === false 恰好是 7 家（codely 2026-10-20 接线后退出；astudio 2026-10-18 加入）', () => {
+  it('rateLimit === false 恰好是 8 家（magicrew 2026-10-29 加入；codely 2026-10-20 接线后退出）', () => {
     const off = PROVIDER_REGISTRY.filter((d) => d.rateLimit === false)
       .map((d) => d.id).sort()
     // ⚠️ **理由各不相同**（见 registry 里各自的字段注释）：
@@ -245,7 +264,10 @@ describe('从 registry 派生的能力表与既有断言逐条相等', () => {
     //「这个按钮点下去，能不能让用户少受限一次？」——
     // ⚠️ 而 modelscope 打破的正是这条问法的前提（它**能**，只是不要）。
     //    ⇒ 所以「能」不再是必要条件，「用户是否要这个按钮」才是。
-    expect(off).toEqual(['astudio', 'autoclaw', 'autoclawintl', 'gemini', 'loomy', 'modelscope', 'officeace'])
+    // - magicrew（2026-10-29）：**与 astudio 同族** —— 零 `updateModelRateLimit` 写点、
+  //   也不在 `probeById` 里 ⇒「重测 / 重置」两个按钮点下去是**零请求、零清除**
+  //   （`account.retest` 走 `adapterForProbe` 会抛「magicrew 没有探测适配器」）。
+  expect(off).toEqual(['astudio', 'autoclaw', 'autoclawintl', 'gemini', 'loomy', 'magicrew', 'modelscope', 'officeace'])
   })
 
   it('accountTest === true 恰好是 gemini', () => {

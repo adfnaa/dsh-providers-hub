@@ -1170,6 +1170,36 @@ export class ChromiumSession {
   }
 
   /**
+   * 本次会话的临时 profile 目录（即传给 chromium 的 `--user-data-dir`）。
+   *
+   * ⚠️ 存在的唯一用途：**从**这个目录里读登录态。`magicrew` 的网页版登录
+   * （`magicrew-browser-login.ts`）必须把 `readMagicrewLocalCreds` 的 `roots`
+   * 指到这里 —— 它缺省扫**用户真实浏览器**的目录，而本会话用的是
+   * `mkdtempSync` 出来的一次性目录，不去指就是「恒读不到 + 完全静默」。
+   *
+   * ⚠️ `undefined` = 还没启动（或已被 {@link dispose} 收掉）。本 getter **只读**：
+   * 目录的创建与删除仍由 {@link launch} / {@link dispose} 独占，
+   * 别在外部 `rmSync` 它（`dispose()` 里那套退避重试是真实缺陷换来的）。
+   */
+  get userDataDir(): string | undefined {
+    return this.profileDir
+  }
+
+  /**
+   * 浏览器进程是否**已经退出**（含用户自己关掉了窗口）。
+   *
+   * ⚠️ 判据是「`child` 已置空**且** `spawnFailure` 已就位」——`launch()` 的 `'exit'`
+   * 监听只在**它自己**退出时同时满足这两条（主动 `kill()` 会先把 `child` 置空，
+   * 那一刻 `spawnFailure` 仍是 `undefined`；启动前两者也都为空）。
+   *
+   * 用途：登录类流程（`magicrew-browser-login.ts`）据它**提前**结束等待 ——
+   * 用户关窗后若还耗满 4 分钟预算，用户看到的是「明明关掉了却还在转圈」。
+   */
+  get exited(): boolean {
+    return this.child === undefined && this.spawnFailure !== undefined
+  }
+
+  /**
    * 浏览器级 WebSocket。
    *
    * ⚠️ 与 {@link cdp} 同理：公开可写，供既有用例注入桩。

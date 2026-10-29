@@ -336,7 +336,9 @@ describe('模型限流按钮门控（重测 / 重置）', () => {
     //    而 **astudio** 是本 fork 独有、且确实登记了 `rateLimit: false`。
     //    ⇒ 按**注册表事实**更正（不是改注册表去凑这条断言）。
     //    ⚠️ codely 同日退出：它的换号 + 探测已接线（见 provider-registry.spec 同源注释）。
-    expect(disabled).toEqual(['astudio', 'autoclaw', 'autoclawintl', 'gemini', 'loomy', 'officeace'])
+    // - magicrew（2026-10-29）：**与 astudio 同族** —— 零 `updateModelRateLimit`
+    //   写点、不在 `probeById` 里 ⇒ 两个按钮恒为惰性（点了零请求、零清除）。
+    expect(disabled).toEqual(['astudio', 'autoclaw', 'autoclawintl', 'gemini', 'loomy', 'magicrew', 'officeace'])
   })
 
   it('★ 「产品取舍」那一类也必须被点名（不得悄悄混进「管辖不到」里）', () => {

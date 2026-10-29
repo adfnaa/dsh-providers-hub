@@ -130,6 +130,14 @@ import { ACCIO } from './accio-product.js'
 //    `isAstudioRefreshable` 与凭据类型在 `astudio.ts`（产品常量在 `astudio-product.ts`）。
 import { ASTUDIO } from './astudio-product.js'
 import { astudioAccountNickname, type AstudioAuth } from './astudio-auth.js'
+import {
+  magicrewCredentialFingerprint,
+  magicrewDisplayNickname,
+  magicrewExpiresAtMs,
+  parseMagicrewCredential,
+  type MagicrewAuth,
+  type MagicrewCredential,
+} from './magicrew-auth.js'
 import { isAstudioRefreshable, type AstudioCredential } from './astudio.js'
 import { loginNeedsExternalAction } from './login-failure.js'
 import {
@@ -1605,6 +1613,14 @@ export interface JetHubAuths {
    * —— 一次做完的同步路径 ⇒ 返回体靠 `reused: true` 走前端的成功出口。
    */
   readonly astudio: AstudioAuth
+  /**
+   * 超级麦吉（Magicrew，2026-10-29）。
+   *
+   * ⚠️ 值必须是 `index.ts` 里 `registerProviderRuntime` 那个 `registry` 数组中
+   * `['magicrew', magicrewAuth]` 的**同一个对象**，否则守卫用例布在该实例上的
+   * spy 收不到注册循环的调用（本仓库复发过 6 次）。
+   */
+  readonly magicrew: MagicrewAuth
   readonly autoclaw: AutoclawAuth
   /**
    * **AutoClaw 国际版**（`autoclawintl`）。
@@ -1643,6 +1659,74 @@ export function authOf(auths: JetHubAuths, provider: string): JetHubAuthLike | u
 }
 
 /**
+ * 账号卡片的 `expiresAt` 补丁（**唯一一份判据**，见 `magicrewExpiresAtMs`）。
+ *
+ * ⚠️ 拿不到时刻时返回**空对象**（不是 `{ expiresAt: undefined }`）：后者会在内存
+ * 池条目上留下一个「值为 undefined 的键」—— 与「从来没有过这个键」在展示上等价，
+ * 却让「读不到就**不写**」这条纪律在数据里看不出区别。空对象最诚实。
+ */
+function magicrewExpiresAtPatch(credential: MagicrewCredential): { expiresAt?: number } {
+  const expiresAt = magicrewExpiresAtMs(credential)
+  return expiresAt === undefined ? {} : { expiresAt }
+}
+
+/**
+ * 在账号池里找「**同一个超级麦吉账号**」的既有条目 —— **唯一一份判重实现**。
+ *
+ * ## 判据：凭据指纹（`magicrewCredentialFingerprint` = `sha256(jwt)` 前 16 位）
+ *
+ * ⚠️ 账户身份必须按**凭据**判，不能按 ref 名 / 账号 id：`account.create` 每次生成
+ * 新的 `${provider}-${shortId()}` 与 `MAGICREW_ACCOUNT_${suffix}`，而**同一个上游账号**
+ * 反复导入（本机浏览器 → 网页登录 → 再导入）拿到的是同一份 jwt ⇒ 指纹相同。
+ * 这也是**新建之前**判重的意义：不判就会攒出多张指向同一个号的卡片
+ *（用户看到重复卡片 + 积分重复显示），而「读取侧去重 / UI 过滤」是治标。
+ *
+ * ## 三条边界（都在真实数据上踩过）
+ *
+ * 1. **读不到凭据的账号要跳过**（`resolved === undefined`、或值不是合法 JSON、
+ *    或没有 `jwt`）。这是本仓库的既定口径：**无法判定 ≠ 失配** —— 判成「不重复」
+ *    会造出重复卡片，判成「重复」会**覆盖掉别人的凭据**（后者更不可逆）。
+ *    ⚠️ 逐账号按**它自己的** `credentialRef` resolve：多账号广播（拿 A 的凭据判 B）
+ *    在本仓库已复发多次。
+ * 2. **ref 名不参与判据**：`importFromLocalBrowser` 会把凭据写到默认 ref
+ *    （`MAGICREW_ACCESS_TOKEN`），若池里恰好有一条账号用的就是那个 ref / 那份凭据，
+ *    它**照样是命中** —— 因为本函数遍历的是**全部** `provider === 'magicrew'` 的条目
+ *    并各自 resolve，而不是只看 `MAGICREW_ACCOUNT_*` 形态的 ref。
+ * 3. `skipAccountId` 只给**网页版登录**腿用：那条腿先登记了自己的占位条目
+ *    （`login.poll` 要靠它知道这个 id 存在），判重时必须把它自己排除，
+ *    否则「新建的占位条目」会被判成「已存在的同账号」。
+ *
+ * ⚠️ 判据是 **jwt 指纹**，而同一账号**重新登录会拿到新的 jwt**（实测同一账号
+ * 两把 jwt：`iat` 差 56 秒、`jti` 不同）⇒ 这种情形**拦不住**，会各成一张卡。
+ * 这是已知边界，见本次报障报告（要真正闭合需要上游的稳定账号标识）。
+ */
+async function findMagicrewAccountByFingerprint(params: {
+  ctx: Context
+  pool: AccountPool
+  fingerprint: string
+  /** 网页版登录腿：跳过**本次自己**的占位条目（见上面边界 ③）。 */
+  skipAccountId?: string
+}): Promise<ProviderAccountEntry | undefined> {
+  const { ctx, pool, fingerprint, skipAccountId } = params
+  if (fingerprint.length === 0) return undefined
+  for (const existing of pool.listAccountsByProvider('magicrew')) {
+    if (existing.id === skipAccountId) continue
+    const resolved = await ctx.credentials.resolve(credentialRef(existing.credentialRef))
+      .catch(() => undefined)
+    // ⚠️ 边界 ①：读不到 ⇒ 跳过（既不判「重复」也不判「不重复」）。
+    if (resolved === undefined) continue
+    let same = false
+    try {
+      const parsed = JSON.parse(resolved.value) as { jwt?: unknown }
+      same = typeof parsed.jwt === 'string'
+        && magicrewCredentialFingerprint(parsed.jwt) === fingerprint
+    } catch { /* 凭据不是合法 JSON ⇒ 跳过该账号（同上） */ }
+    if (same) return existing
+  }
+  return undefined
+}
+
+/**
  * ⚠️ 2026-10-08 改：各 provider 形参从**位置传参**改为**命名对象**（`auths`）。
  *
  * 原注释记录「历史上已因少传/插队错位复发 **6 次**」—— 位置参数天生有这个缺陷
@@ -1678,6 +1762,7 @@ export function authOf(auths: JetHubAuths, provider: string): JetHubAuthLike | u
  *（`tests/unit/credits-runtime-parity.spec.ts` 的 `vi.mock('provider-credits')`）——
  * 断言仍打在**端点响应**上，判别力与原形参方案逐条等价。
  */
+
 export function registerJetHubRpc(
   ctx: Context,
   pool: AccountPool,
@@ -2538,6 +2623,13 @@ function registerJetHubEndpoints(
     //    ⚠️ 它之前不在本表里的**真正**原因不是「不需要」，而是「`CodelyAuth` 当时连
     //    契约都没对上（`refreshAll` 是 2 参）」—— 见 A5 的修。
     CODERLY.id,
+    // ⚠️ 超级麦吉（Magicrew，2026-10-29）：`mgw_` api_key 寿命 **2 小时**，
+    //    正落在「睡眠/挂起恢复后到定时器补触发那一轮之间」这个窗口内。
+    //    漏登记的后果与 issue IKKHL5 逐字相同：积分行报「未登录」而上游其实
+    //    只需一次 refresh（本家有 `PUT /api/v1/model-gateway/tokens` 端点），且**日志零字**。
+    //    ⚠️ 与 `JetHubAuths.magicrew` 必须**同时**到位（`credits-balance-self-heal.spec.ts`
+    //    有正反两条守卫，只做一个会红另一条）。
+    'magicrew',
     // ⚠️ **本 fork 独有**（modelscope，2026-10-17 改判）**仍刻意不在本表里**：
     //    ⚠️ 原注释写「它是 `balance: false`（魔搭没有额度 API）⇒ 积分端点压根不会
     //    为它走这条链」——**那条已被证伪**：魔搭**有**魔粒余额端点
@@ -2966,6 +3058,85 @@ function registerJetHubEndpoints(
   }
 
   /**
+   * 收口「网页版登录用户已放弃」留下的 magicrew 占位条目。
+   *
+   * ## 为什么需要（与 OfficeAce 收口同因，但判据**不同**）
+   *
+   * 用户在宿主起的窗口里登到一半直接关掉窗口时：`login.poll` 会收到那一轮任务的
+   * 终态（`waitForCredential` 看到浏览器已退出 ⇒ `undefined` ⇒ `failLogin` 删条目），
+   * 所以**正常路径不需要本收口**。
+   *
+   * 本函数只兜**一种**残留：**宿主进程重启/崩溃**。那时
+   * `magicrewBrowserLoginInFlight` / `magicrewBrowserLoginPendingAt` 是内存表、
+   * 一起消失了，而池里的占位条目还在盘上 ⇒ 它会变成一张「凭据未配置」的幽灵卡片，
+   * 没有任何入口会被清理（与 OfficeAce 那个 issue 的观感逐字相同）。
+   *
+   * ## 判据三条**必须同时**
+   *
+   * | # | 判据 | 漏掉的后果 |
+   * |---|---|---|
+   * | 1 | provider 是 `magicrew` 且**没有在途任务** | 把正在等用户的登录删掉（用户正常登录反而失败） |
+   * | 2 | 中间态缺失**或**已超过 {@link MAGICREW_BROWSER_PENDING_TTL_MS} | 把刚开始的登录删掉（同 1） |
+   * | 3 | 凭据**确实未落库** | 把刚登好的账号连凭据一起删掉（不可逆） |
+   *
+   * ⚠️ 判据 3 复用 `loginCredentialLanded`（**不另写一份**）：`'unknown'` 时同样
+   * **不删** —— 不可逆的删除必须建立在**确证**上（这条取向在 OfficeAce 处有红队取证）。
+   *
+   * @param now 「现在」的注入点（**只供测试**；生产不传即 `Date.now()`）。
+   *   边界用例必须能确定地驱动时刻，不能靠跨毫秒的运气（本仓库记过同型事故）。
+   * @returns 被收口的账号 id 列表（供日志与用例观测）。
+   */
+  async function sweepAbandonedMagicrewBrowserLogins(now: () => number = Date.now): Promise<string[]> {
+    const swept: string[] = []
+    let accounts: readonly ProviderAccountEntry[]
+    try {
+      accounts = await pool.listAllAccounts()
+    } catch {
+      // 读不到池 ⇒ **什么都不做**（不可逆的删除不该建立在一次失败的读上）。
+      return swept
+    }
+    const at = now()
+    for (const entry of accounts) {
+      if (entry.provider !== 'magicrew') continue
+      // 判据 1：有在途任务 ⇒ 用户可能正在窗口里登录，绝不碰。
+      if (magicrewBrowserLoginInFlight.has(entry.id)) continue
+      const pendingAt = magicrewBrowserLoginPendingAt.get(entry.id)
+      /**
+       * 判据 2：**从未登记过中间态**（本进程从没起过它 ⇒ 重启残留）也走这里；
+       * 登记过但还年轻 ⇒ 跳过（同进程里正在登录的那一轮）。
+       *
+       * ⚠️ 但「从未登记过」**不能**单独当成「已中止」的充分条件：`local-browser`
+       * 分支建的账号同样不在表里。⇒ 必须靠判据 3 兜底（凭据在就不删）。
+       * 而 `local-browser` 建的账号**恒有凭据**（它读到才建）⇒ 判据 3 会放行它。
+       */
+      if (pendingAt !== undefined && at - pendingAt <= MAGICREW_BROWSER_PENDING_TTL_MS) continue
+      const landed = await loginCredentialLanded(entry.id)
+      if (landed === 'yes' || landed === 'unknown') {
+        if (landed === 'unknown') {
+          ctx.logger?.warn?.(
+            `[jet-hub] magicrew 收口跳过 ${entry.id}：读凭据失败（无法确证「没有凭据」）`
+            + ' ⇒ 不做不可逆的删除（宁可留一张卡片）',
+          )
+        }
+        continue
+      }
+      try {
+        await pool.removeAccount(entry.id)
+        magicrewBrowserLoginPendingAt.delete(entry.id)
+        swept.push(entry.id)
+      } catch (error) {
+        ctx.logger?.warn?.(`[jet-hub] magicrew 收口 ${entry.id} 失败：${String(error)}`)
+      }
+    }
+    if (swept.length > 0) {
+      ctx.logger?.info?.(
+        `[jet-hub] 已收口 ${swept.length} 个超级麦吉网页登录中止留下的占位账号：`
+        + `${swept.join(', ')}（用户未完成登录即关闭窗口 / 宿主重启残留；这些条目没有凭据）`,
+      )
+    }
+    return swept
+  }
+  /**
    * OfficeAce 交换的**单飞表**（accountId → 正在进行的交换结果）。
    *
    * ## 为什么必须有（2026-10-14 独立审计查出的净回归）
@@ -3032,6 +3203,58 @@ function registerJetHubEndpoints(
    * `LOGIN_FAILURE_TTL_MS` / `LOGIN_FAILURE_LIMIT` 兜住。
    */
   const loginFailures = new Map<string, { message: string; at: number }>()
+
+  /**
+   * **超级麦吉网页版登录**的在途表（`accountId` → 那一轮等待的后台任务）。
+   *
+   * ## ⚠️⚠️ 为什么网页版登录必须走**两步式**（`account.create` 只开窗，`login.poll` 收尾）
+   *
+   * 它是全仓**唯一**「用户在**宿主起的那个**浏览器窗口里操作」的登录（其余各家的
+   * 授权页在用户自己的浏览器里，所以宿主能在拿到 URL 后立刻返回）。而用户在窗口里
+   * 扫码 / 输密码要 **2–5 分钟** —— 若在 `account.create` 里同步等：
+   *
+   * | # | 同步等的后果 |
+   * |---|---|
+   * | 1 | `account.create` 是**一条 RPC**，客户端与宿主各有超时/重试语义 ⇒ 分钟级挂住会被判成「网络失败」，用户看到「新建账号失败」而窗口还开着 —— **两边状态彻底错开** |
+   * | 2 | 客户端 `createAccount` 的 `finally` 无条件释放 `creating` 闸门 ⇒ 按钮变可点 ⇒ 再点一次 = **两个浏览器窗口** + 两条登录腿抢同一个派生语义 |
+   * | 3 | 与其余十余家的既有契约（先返回 `accountId` → `login.poll` 三态）不同形 ⇒ 前端要为它写第二套流程（而 `login.poll` 的三态修法 IKLI7J 刚刚才全部收口） |
+   *
+   * ⇒ 走既有两步式：本表存「那一轮等待的后台任务」，`login.poll` **单飞**地
+   * `await` 它（与 `officeAceExchangeInFlight` **同一条纪律**：客户端 `setInterval`
+   * 没有 in-flight 闸门，两拍重叠若各开一轮就会抢同一个 id / 各起一个浏览器）。
+   *
+   * ⚠️ **只在本进程内存里**（不落盘）：宿主重启后这张表空了 ⇒ `login.poll` 退化成
+   * `{done:false}`、由客户端自己的 5 分钟表收口。可接受 —— 那时浏览器窗口也已随
+   * 宿主进程树一起没了（`ChromiumSession` 的 `detached: false` / 进程组语义），
+   * 而占位条目由 {@link sweepAbandonedMagicrewBrowserLogins} 按时间收口。
+   */
+  const magicrewBrowserLoginInFlight = new Map<
+    string,
+    Promise<{ done: boolean, success?: boolean, error?: string }>
+  >()
+
+  /**
+   * 网页版登录**等待中**的中间态（`accountId` → 开始时刻）。
+   *
+   * ⚠️ 与 `magicrewBrowserLoginInFlight` 分开存是刻意的：后者是「那一轮任务」、
+   * 任务一结束就要 `delete`（否则表无界增长），而「这个账号是一个正在等用户的
+   * 占位条目」这个**事实**必须比任务活得久一点 —— 任务结束（成功/失败）时两者
+   * 一起清；只有 `account.list` 的收口需要它来判断「够老了吗」。
+   */
+  const magicrewBrowserLoginPendingAt = new Map<string, number>()
+
+  /**
+   * 网页版登录占位条目的**最短保留时长**（收口阈值）。
+   *
+   * 客户端自己的轮询上限是 5 分钟、宿主侧等待上限 4 分钟（
+   * `MAGICREW_BROWSER_LOGIN_TIMEOUT_MS`）⇒ 取 **10 分钟**（2 倍余量）：
+   * 只有「明显超过任何正常等待」的占位条目才收口。
+   *
+   * ⚠️ 与 OfficeAce 的 20 分钟刻意不同：本家没有「交换 code」那一步（凭据不需要
+   * 再换一次），失败是立刻可见的（后台任务自己 `failLogin`），故收口只需要兜
+   * 「宿主崩溃/重启」这一种残留。
+   */
+  const MAGICREW_BROWSER_PENDING_TTL_MS = 10 * 60_000
 
   /** 终态失败记录的保留时长。客户端轮询上限是 5 分钟，留 6 倍余量。 */
   const LOGIN_FAILURE_TTL_MS = 30 * 60_000
@@ -4054,6 +4277,16 @@ function registerJetHubEndpoints(
         if (req.provider === OFFICEACE.id) {
           await sweepAbandonedOfficeAceLogins()
         }
+        /**
+         * ⚠️ **超级麦吉网页版登录的占位条目收口**（与上面 OfficeAce 那条同因，
+         * 判据见 `sweepAbandonedMagicrewBrowserLogins`）。
+         *
+         * ⚠️ 同样放在 `pool.listAccounts` **之前**：用户刷新一次就该看到收口后的列表。
+         * ⚠️ 只在查 magicrew 时跑（别的面板不该付代价）。
+         */
+        if (req.provider === 'magicrew') {
+          await sweepAbandonedMagicrewBrowserLogins()
+        }
         const accounts = await pool.listAccounts(req.provider)
         // ⚠️ OfficeAce 自愈回填（2026-10-13 修正）：`expiresAt` 回填是后加的
         //    （`6fb110f`），修复前登录留下的池条目缺这个字段 ⇒ 卡片恒显示
@@ -4124,6 +4357,37 @@ function registerJetHubEndpoints(
             void pool.updateAccount(account.id, { expiresAt }).catch(() => undefined)
           }
         }
+        /**
+         * ⚠️⚠️ **超级麦吉的 `expiresAt` 自愈回填**（2026-10-29 真机报障：卡片「有效期 未知」）。
+         *
+         * 与上面 OfficeAce / Codely 两条**同因同形**：回填是后加的，修复前（以及
+         * `api_key_expires_at` 缺失时）落下的池条目没有这个字段 ⇒ 卡片**恒**显示
+         * 「未知」，而且不会自己补上。列表时发现缺失就从**凭据**算出真实时刻并写回池
+         * （一次性自愈，之后走正常的登录 / 续期回填）。
+         *
+         * 判据是 {@link magicrewExpiresAtMs}（**唯一一份**）：`apiKeyExpiresAt` 优先、
+         * 否则解 JWT 的 `exp`（30 天的**登录会话**寿命）、都拿不到就**跳过**
+         * —— 绝不写 0/NaN（那会让卡片显示成「已过期」）。
+         *
+         * ⚠️ **逐账号按它自己的 ref resolve**（多账号广播 = 拿 A 的有效期写给 B，
+         * 本仓库已复发 7 次的那类错位）。
+         */
+        if (req.provider === 'magicrew' && accounts.some((a) => a.expiresAt === undefined)) {
+          for (const account of accounts) {
+            if (account.expiresAt !== undefined) continue
+            const resolved = await ctx.credentials.resolve(credentialRef(account.credentialRef))
+              .catch(() => undefined)
+            if (resolved === undefined) continue
+            let expiresAt: number | undefined
+            try {
+              const credential = parseMagicrewCredential(JSON.parse(resolved.value))
+              if (credential !== undefined) expiresAt = magicrewExpiresAtMs(credential)
+            } catch { /* 凭据不是合法 JSON ⇒ 跳过该账号 */ }
+            if (expiresAt === undefined) continue
+            account.expiresAt = expiresAt
+            void pool.updateAccount(account.id, { expiresAt }).catch(() => undefined)
+          }
+        }
         return { ok: true, value: { accounts: await enrichAccountIdentity(accounts, req.provider) } }
       }
 
@@ -4133,6 +4397,245 @@ function registerJetHubEndpoints(
         const id = `${provider}-${shortId()}`
         const suffix = shortId().toUpperCase()
         const refName = `${provider.toUpperCase()}_ACCOUNT_${suffix}`
+
+        /**
+         * ⚠️⚠️ **超级麦吉：从本机浏览器导入已登录态**（`mode: 'local-browser'`）。
+         *
+         * 这是本家三条登录路径里**零门槛**的一条：用户只要在自己的 Edge / Chrome 里
+         * 登录过 `www.letsmagic.cn`，凭据就已经明文躺在浏览器的 localStorage
+         * （leveldb）里 ⇒ 不开窗口、不收手机号密码。依据与读法见
+         * `magicrew-local-browser.ts`（只读，不碰 cookie、不改浏览器数据）。
+         *
+         * 与下面那条「手机号 + 密码」分支的关系：**两条独立的入口**，本分支刻意写在
+         * 它**之前**且只按 `req.mode` 分流 —— 既有分支一行未动。
+         *
+         * ⚠️ 读不到 ⇒ **不建账号**、返回可读错误（绝不留占位条目：本家没有「等用户去
+         * 浏览器完成」那一步，占位条目只会变成幽灵账号）。
+         * ⚠️ **幂等**：同一份凭据反复导入不得造出多个账号 ⇒ 按 **jwt 指纹**判重
+         * （`magicrewCredentialFingerprint`，不能用 `apiKey`：它 2 小时一换，
+         * 会把同一个账号认成新账号）。命中既有账号时把新凭据写回**它自己的 ref**
+         * 并回填昵称 / 有效期，返回**原来的** `accountId`。
+         */
+        if (provider === 'magicrew' && req.mode === 'local-browser') {
+          let credential: MagicrewCredential | undefined
+          try {
+            credential = await auths.magicrew.importFromLocalBrowser()
+          } catch (error) {
+            const reason = error instanceof Error ? error.message : String(error)
+            // ⚠️ 读盘 / 签发失败与「本机没有登录态」是两件事，文案必须分开
+            //    （否则用户被引导去重新登录一个其实已经登录过的站点）。
+            throw new Error(`超级麦吉：读取本机浏览器登录态失败：${reason}`)
+          }
+          if (credential === undefined) {
+            return {
+              ok: false,
+              error: {
+                code: 'bad-request',
+                message: '未在本机浏览器里找到超级麦吉的登录态'
+                  + '（请先在 Edge/Chrome 里登录 www.letsmagic.cn 后重试）',
+              },
+            }
+          }
+          /**
+           * ⚠️⚠️ **新建之前先判重**（用户 2026-10-29 明确要求）：判据是**凭据指纹**
+           * （同一个超级麦吉账号），命中就**只刷新那一条**（同一个 id、同一个 ref），
+           * 不再新建 —— 而不是先造一张卡、再靠读取侧或 UI 去滤重。
+           *
+           * ⚠️ 判重实现只此一份（`findMagicrewAccountByFingerprint`），网页版登录腿
+           * 走同一个函数：两份拷贝必然漂移（本仓库已记过「一文件两套同义判据」的事故）。
+           */
+          const existing = await findMagicrewAccountByFingerprint({
+            ctx,
+            pool,
+            fingerprint: magicrewCredentialFingerprint(credential.jwt),
+          })
+          if (existing !== undefined) {
+            // 同一个账号 ⇒ 只刷新它的凭据与展示字段，**不新增条目**。
+            await ctx.credentials.set(
+              credentialRef(existing.credentialRef),
+              JSON.stringify(credential),
+            )
+            await pool.updateAccount(existing.id, {
+              nickname: magicrewDisplayNickname(credential),
+              ...magicrewExpiresAtPatch(credential),
+            })
+            return { ok: true, value: { accountId: existing.id, loginUrl: '' } }
+          }
+          // 新账号：凭据写到它**自己的** ref（与下面那条手机号密码分支同形），
+          // 池条目也照它的写法（`refreshable: true`：本家有真实续期端点）。
+          await ctx.credentials.set(credentialRef(refName), JSON.stringify(credential))
+          await pool.addAccount({
+            id,
+            provider: 'magicrew',
+            nickname: magicrewDisplayNickname(credential),
+            enabled: true,
+            credentialRef: refName,
+            refreshable: true,
+            createdAt: Date.now(),
+            ...magicrewExpiresAtPatch(credential),
+          })
+          return { ok: true, value: { accountId: id, loginUrl: '' } }
+        }
+
+        /**
+         * ⚠️⚠️ **超级麦吉：网页版登录**（`mode: 'browser'`）—— 三步式的**第一步**。
+         *
+         * ## 这个分支只做三件事，**不 await 用户**
+         *
+         * 1. 先登记一条**占位条目**（无凭据）—— `login.poll` 靠它知道「这个 id 存在」；
+         * 2. 起一个**后台任务**去开窗 + 等用户 + 签发 + 落库（`loginViaBrowser` 那一条
+         *    完整的腿，含它在 `finally` 里的收窗）；
+         * 3. **立刻**返回 `{ accountId, loginUrl: '' }`。
+         *
+         * ⚠️⚠️ 为什么不能同步等（2–5 分钟的阻塞 RPC）：完整理由见
+         * `magicrewBrowserLoginInFlight` 上方那张表 —— 一句话是「客户端的按钮闸门
+         * 会提前释放 ⇒ 用户再点一次就开第二个窗口」。
+         *
+         * ## 与 `mode: 'local-browser'` 的区别（两者都是「读登录态」）
+         *
+         * | | `local-browser` | `browser` |
+         * |---|---|---|
+         * | 开窗 | 否 | **是**（独立 profile，可见） |
+         * | 时长 | 毫秒级 | **分钟级**（等用户） |
+         * | 失败形态 | 立刻回错误、不建账号 | 先建占位条目，`login.poll` 报终态并**删掉**它 |
+         *
+         * ⚠️ 失败收尾**必须走 `failLogin`**（不自己 `removeAccount`）：它先判
+         * 「凭据是否其实已落库」（登录成功后的记账失败不得删号），再记终态供
+         * `login.poll` 报出原因。十余家 provider 走同一条，别在这里手写第二份。
+         *
+         * ⚠️ **单飞**：同一 `accountId` 只会有一轮（`account.create` 每次新生成 id，
+         * 故这里防的是「同一 id 被重复创建」这种异常路径 —— 幂等保护，不是正常流）。
+         */
+        if (provider === 'magicrew' && req.mode === 'browser') {
+          // ① 占位条目：**先登记再开窗**。顺序不可颠倒 —— `login.poll` 在这之后
+          //    任何一刻到达都必须能查到它（客户端 1 秒一拍，而开浏览器要几百毫秒）。
+          await pool.addAccount({
+            id,
+            provider: 'magicrew',
+            nickname: id,
+            enabled: true,
+            credentialRef: refName,
+            refreshable: true,
+            createdAt: Date.now(),
+          })
+          magicrewBrowserLoginPendingAt.set(id, Date.now())
+          /**
+           * ② 后台任务。**不 await**（见上）。
+           *
+           * ⚠️ 三段式（与 `exchangeOfficeAceLogin` 同一条纪律）：`loginViaBrowser`
+           * 内部已经把「等用户 → 签发 → 落库」串完，但它**不写账号池**
+           *（凭据只落 `defaultCredentialRef`，账号 id/ref 是 RPC 层的事）⇒ 回填这一步
+           * 在本函数里做，且**必须在落库之后**。
+           */
+          const task = (async (): Promise<{ done: boolean, success?: boolean, error?: string }> => {
+            let credential: MagicrewCredential | undefined
+            try {
+              credential = await auths.magicrew.loginViaBrowser()
+            } catch (error) {
+              /**
+               * ⚠️ 抛错 = **真失败**（浏览器起不来 / 签发网络异常）。文案要可读：
+               * `browserNotFoundMessage` 那段多行提示就是这个 try 带出来的。
+               */
+              const message = await failLogin(id, error)
+              return message === undefined
+                ? { done: true, success: true }
+                : { done: true, success: false, error: message }
+            }
+            if (credential === undefined) {
+              /**
+               * ⚠️ `undefined` = **用户没登完**（超时 / 自己关了窗口）。这不是
+               * 异常路径，但仍是一条**终态**：占位条目留着就是幽灵卡片，
+               * 而「静默转圈到客户端 5 分钟超时」正是 IKLI7J 要根治的那个形态。
+               * ⇒ 同样走 `failLogin`（记终态 + 删占位条目）。
+               */
+              const message = await failLogin(
+                id,
+                new Error('网页登录未完成（超时或窗口已关闭）'),
+              )
+              return message === undefined
+                ? { done: true, success: true }
+                : { done: true, success: false, error: message }
+            }
+            // 这一步之后凭据已在库里 ⇒ 任何失败都**不得**再删号（`failLogin` 自己会判）。
+            /**
+             * ⚠️⚠️ **判重与 `mode: 'local-browser'` 走同一个函数**（唯一一份实现）：
+             * 「同一个超级麦吉账号已经有一张卡」⇒ 把新凭据写到**它**的 ref，并删掉
+             * 自己那张占位条目（否则用户看到两张卡指向同一个号）。
+             *
+             * ⚠️ `skipAccountId: id` 不可省：本条腿的占位条目已经在池里，不排除自己
+             * 就会把「我刚建的占位」判成「已存在的同账号」（若它恰好已带上凭据）。
+             */
+            const existing = await findMagicrewAccountByFingerprint({
+              ctx,
+              pool,
+              fingerprint: magicrewCredentialFingerprint(credential.jwt),
+              skipAccountId: id,
+            })
+            if (existing !== undefined) {
+              /**
+               * ⚠️ 顺序：先写凭据、再删条目。反过来的话删条目（连带 `unset`）
+               * 会把唯一那份刚写好的凭据一起清掉。
+               *
+               * ⚠️ 占用位条目自己的 ref 上的凭据也要清掉（`loginViaBrowser` 只写
+               * `defaultCredentialRef`，但占位 ref 上本来就没有值 —— 这里显式
+               * `unset` 是为了万一将来那条腿改了写入位置时不留孤儿凭据）。
+               */
+              await ctx.credentials.set(credentialRef(existing.credentialRef), JSON.stringify(credential))
+              await pool.updateAccount(existing.id, {
+                nickname: magicrewDisplayNickname(credential),
+                ...magicrewExpiresAtPatch(credential),
+              })
+              await ctx.credentials.unset(credentialRef(refName)).catch(() => undefined)
+              await pool.removeAccount(id).catch(() => undefined)
+              return { done: true, success: true }
+            }
+            // 新账号：凭据写到它**自己的** ref（与 `local-browser` 分支同形）。
+            await ctx.credentials.set(credentialRef(refName), JSON.stringify(credential))
+            await pool.updateAccount(id, {
+              nickname: magicrewDisplayNickname(credential),
+              ...magicrewExpiresAtPatch(credential),
+            })
+            return { done: true, success: true }
+          })()
+          magicrewBrowserLoginInFlight.set(id, task)
+          /**
+           * ⚠️ 任务结束后**必须**清两张表（`finally` 而不是 `.then`）：否则一次失败
+           * 就把这个 id 永久钉在表里（`login.poll` 会对它一直 `await` 一个已结束的
+           * promise —— 那本身无害，但表会无界增长、且同一 id 再也开不了新一轮）。
+           */
+          void (async () => {
+            try {
+              await task
+            } catch {
+              // 不该发生：上面两个分支都把异常收成了返回值。仍要兜住 ——
+              // 一次未捕获拒绝会跳过下面的清理。
+            }
+            magicrewBrowserLoginInFlight.delete(id)
+            magicrewBrowserLoginPendingAt.delete(id)
+          })()
+          return { ok: true, value: { accountId: id, loginUrl: '' } }
+        }
+
+        /**
+         * ⚠️ 超级麦吉（Magicrew）**没有「手机号 + 密码」登录**（2026-10-29 删除）。
+         *
+         * 上游 `phone_password` 端点确实存在（magpie 的 `api.mjs` 实测过 200），但
+         * 参考实现里那个 `login()` **零调用者** —— 它是未被采用的探索代码；
+         * 真实入口是短信验证码，而短信必须先解「旋转验证码」⇒ 要识图模型。
+         * ⇒ 本家只走两条**无门槛**的路（都在上面/下面各一个 `mode` 分支）：
+         *    · `mode: 'local-browser'` —— 读本机 Edge/Chrome 的登录态（免开窗）
+         *    · `mode: 'browser'` —— 开窗让用户在网页里登录，再读回来
+         * 不带 `mode` 落到这里 ⇒ 明确报错，不要静默降级成别的登录方式。
+         */
+        if (provider === 'magicrew') {
+          return {
+            ok: false,
+            error: {
+              code: 'bad-request',
+              message: '超级麦吉请用「从本机浏览器导入」或「网页登录」，不支持手机号密码登录',
+            },
+          }
+        }
 
         // CodeBuddy 系（buddy / workbuddy）共用两步登录流程：
         // 只获取 loginUrl 和 state 立即返回，后台用同一个 state 异步执行
@@ -5744,6 +6247,38 @@ function registerJetHubEndpoints(
               })()
               return { ok: true, value: await task }
             }
+          }
+          /**
+           * ⚠️⚠️ **超级麦吉网页版登录：把「等用户」交给后台任务**（`mode: 'browser'`）。
+           *
+           * ## 为什么这一格是「占位条目在、凭据还没有」的**正常形态**
+           *
+           * 其余十几家走到这里意味着「拿不到凭据 ⇒ 还没授权完」，而本家是**真的**
+           * 在等一个可见浏览器窗口里的用户操作（分钟级）。⇒ 不能像别家那样干等，
+           * 必须去 `await` `account.create` 里起的那一轮任务（**单飞**：
+           * 客户端 1 秒一拍、`setInterval` 没有 in-flight 闸门，两拍重叠若各起一轮
+           * 就会抢同一个账号 —— 与 OfficeAce 的 `officeAceExchangeInFlight` 同因）。
+           *
+           * ⚠️ 任务结束后**它自己会从表里删掉**（`account.create` 那段 `finally`）；
+           * 这里 `return await task` 拿到的是已经算好的三态，不会再起第二次。
+           *
+           * ⚠️ 顺序：本格必须在「凭据缺失 ⇒ 直接 `{done:false}`」那行**之前**判，
+           * 否则它永远轮不到（占位条目按定义就没有凭据）。
+           */
+          if (entry.provider === 'magicrew') {
+            const shared = magicrewBrowserLoginInFlight.get(req.accountId)
+            if (shared !== undefined) return { ok: true, value: await shared }
+            /**
+             * ⚠️ 表里没有这一轮（宿主重启过 / 兜底轮询到了别人的 id）⇒ 回
+             * `{done:false}` 交给客户端自己的 5 分钟表收口，**不要**在这里猜成功或失败：
+             * 猜成功会把一张没有凭据的卡片报成「已添加」，猜失败会删掉一张可能
+             * 正在登录的卡（`magicrewBrowserLoginInFlight` 只在**成功或失败落定后**
+             * 才删自己，故走到这里一定意味着没有在途任务）。
+             *
+             * ⚠️ 但**不能**无限挂着：占位条目由 `account.list` 的
+             * `sweepAbandonedMagicrewBrowserLogins` 按 TTL 收口。
+             */
+            return { ok: true, value: { done: false } }
           }
           return { ok: true, value: { done: false } }
         }

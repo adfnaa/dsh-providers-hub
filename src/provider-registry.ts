@@ -950,6 +950,42 @@ export const PROVIDER_REGISTRY: readonly ProviderDescriptor[] = Object.freeze([
     credits: { balance: true, dailyCheckin: true },
   },
   {
+    // Magicrew（超级麦吉国内站，2026-10-29 接入）。
+    // ⚠️ 位置要求（用户明确）：**排在 aggregate 之前 = 倒数第二**。
+    //    守因为未自定义 `providerOrder` 时，左栏完全按本表的**声明序**渲染
+    //    （`sortOpenProvidersByOrder` 对空序是恒等函数），排在 aggregate 之后
+    //    会让它在左栏落到聚合下面。守卫见 `provider-registry.spec.ts` 的
+    //    「★ magicrew 的声明序在 aggregate 之前（= 倒数第二）」那条（还锁了 `ia - im === 1`）。
+    id: 'magicrew',
+    label: '超级麦吉',
+    displayName: '超级麦吉',
+    logoClass: 'magicrew',
+    // 余额来自 `quota/points/total`；签到端点**存在**但本轮刻意不接
+    //（会消耗真实积分，且用户未要求）。
+    credits: { balance: true },
+    /**
+     * ⚠️ `creditPackages: true`（2026-10-29，I3）：本家余额**确实**由多个包构成、
+     * 且临期批次带 `deductionEndTime` ⇒ 账号卡片 hover 该列包。
+     * `fetchMagicrewBalance` 会**合成一个「长期积分」包**让 `sum(remaining) === total`
+     * （上游只下发临期批次，实测 total 1093 / 批次和 93），否则 hover 会显示
+     * 「只列 93、合计 1093」让用户以为丢了积分。
+     * ⚠️ **刻意不登记**另外两项：
+     *   · `usesExpiryWindow` —— 判据是「是否走 `splitBuddyCreditsByExpiry`」，
+     *     本家不走那个函数（用自己的 `packages`），登记了会让锁定路径读到错误的 `windowDays`；
+     *   · `permanentLock` —— 本家**没有**「锁定永久积分」这个能力
+     *     （上游端点里没有对应概念），登记了等于凭空给用户一个点了会失败的操作。
+     */
+    // ⚠️⚠️ **`rateLimit: false` 必须显式写**（2026-10-29 最终审查 I1）：本家
+    //    **零 `updateModelRateLimit` 写点**、也不在 `probeById` 里 ⇒「重测 / 重置」
+    //    两个按钮点下去是**零请求、零清除**（`account.retest` 走 `adapterForProbe`
+    //    会抛「magicrew 没有探测适配器」）。与 `accio` 那一格逐字同因。
+    //    ⚠️ 原先省略它的理由是「默认关闭会让老用户失去按钮」—— 那条**对全新
+    //    provider 不成立**（无存量用户、无功能回退可言，见 providers-accio 笔记）。
+    rateLimit: false,
+    // ⚠️ 不登记 `onboardingTasks`：新手奖励是 magpie 侧功能，本轮不做。
+    channel: true,
+  },
+  {
     id: 'aggregate',
     label: '聚合 (跨渠道)',
     displayName: '聚合 (跨渠道)',

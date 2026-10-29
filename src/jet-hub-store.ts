@@ -1302,6 +1302,10 @@ const REF_PREFIX_TO_PROVIDER: ReadonlyArray<readonly [string, string]> = [
   //    —— 漏加会让 `jet-hub-store.spec.ts` 的派生用例变红）。账号 ref 形态沿用
   //    统一规则 `CODELY_ACCOUNT_${suffix}`（`account.create` 的前缀规则）。
   ['CODELY', 'codely'],
+  // ⚠️ 超级麦吉（Magicrew，2026-10-29）—— 同款坑第 **八** 次。
+  // 漏加 = `MAGICREW_ACCOUNT_*` 的账号在 `state.json` 缺失时**静默消失**
+  //（凭据还在 `.credentials.yaml` 里，只是索引建不出来，用户只能重新导入）。
+  ['MAGICREW', 'magicrew'],
   // ⚠️ 第 19 个 provider（autoclawintl，2026-10-20）—— 同款坑第 **七** 次。
   // 漏加 = `AUTOCLAWINTL_ACCOUNT_*` 的账号在 `state.json` 缺失时**静默消失**
   //（凭据还在 `.credentials.yaml` 里，只是索引建不出来，用户只能重新导入）。

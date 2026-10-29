@@ -757,6 +757,7 @@ describe('AStudio Provider Credits & Jet Hub RPC 接线验证', () => {
       //    `JetHubAuths` 因此各占一个键 —— 漏掉同样报 TS2741。
       autoclawintl: blank(),
       modelscope: blank(),
+      magicrew: blank(),
       astudio: astudioAuth,
     }
 

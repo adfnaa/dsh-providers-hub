@@ -3154,6 +3154,31 @@ function ProviderPanel({ provider, rpcCall }) {
   // 与添加弹窗共用一个的话，打开编辑弹窗时若添加弹窗还挂着（理论上互斥，
   // 但 ref 是 DOM 级的），两个 input 会指向同一个节点。
   const keyEditInputRef = React.useRef(null);
+  // 「登录超级麦吉（Magicrew）」弹窗：null（关闭）或 `{ provider, error }`。
+  //
+  // ## ⚠️ 为什么**不复用** `keyModal`
+  //
+  // `keyModal` 的语义是「粘**一个** API key」（单输入框、password 类型，
+  // 成功收起时还按 provider 分派 OpencodeKeyModal / ModelscopeKeyModal）。
+  // 超级麦吉是**手机号 + 密码两个字段**、且**没有浏览器授权页**（唯一一家）——
+  // 两套语义挤进同一个槽，会出现「一个字段 vs 两个字段」的渲染期分叉，
+  // 正是本仓库记过的「语义不同的状态共用一个槽，开一个把另一个顶掉」
+  //（`proxyModal` × `loginUrlForManual`、`keyEditModal` × `keyModal` 两次教训）。
+  //
+  // ## ⚠️ state 里只留 `{ provider, error }`
+  //
+  // 本弹窗**不收任何输入**（从本机浏览器读登录态，用户不输密码），
+  // 故没有 `keyModal` 那种「凭据不进 state」的问题。
+  const [credentialModal, setCredentialModal] = React.useState(null);
+  /**
+   * 超级麦吉登录的**在途闸门**（防双击建出两个账号）。
+   *
+   * ⚠️ 不能用 `creating`（useState）当守卫：`setCreating(true)` 是异步的，
+   * 同一 tick 内连点两次时第二次读到的仍是 `false`，而按钮的 `disabled`
+   * 也要等 re-render 才生效 —— 于是两轮 `account.create` 并发跑，
+   * 池里凭空多出一条账号（与 `claimInFlightRef` 同款理由：**用 ref 做同步闸门**）。
+   */
+  const magicrewInFlightRef = React.useRef(false);
 
   /**
    * 拖拽排序状态：正在拖的账号 id 与当前悬停的目标账号 id。
@@ -3930,6 +3955,99 @@ function ProviderPanel({ provider, rpcCall }) {
     }
   };
 
+  /**
+   * 提交超级麦吉（Magicrew）登录：**手机号 + 密码**一起送
+   *（**本 fork 独有**，2026-10-29，K1）。
+   *
+   * ## 它为什么和 `submitOpencodeEntry` 不是一个流程
+   *
+   * 超级麦吉是十个渠道里**唯一「手机号 + 密码」**的：没有 OAuth、没有授权页，
+   * 上游只有 `POST /api/v1/sessions`（`type: 'phone_password'`）。宿主侧的
+   * `account.create` 对它因此是**同步 RPC** —— 登录与签发两跳都在服务端完成，
+   * 于是：
+   * - **成功时契约里没有 `loginUrl`**（空串 / 缺字段都正常）⇒ 这里**绝不**
+   *   `window.open`、**绝不**起 `login.poll`（它是两步式流程才需要的东西）；
+   * - **失败时抛错**，`message` 是可读中文（如「超级麦吉需要密码」/ 上游原文）
+   *   ⇒ **原样放回弹窗**，不替换成「登录失败」这种通用文案（否则用户不知道该改哪一格）。
+   *
+   * ⚠️ 这里**不要**加「失败后等 N 秒再重试」之类的节流：那是一条发错对话的
+   *    产物（把别处需求当成这里的），与本流程无关，写进来只会让用户在一次
+   *    拼错密码之后盯着一个不动的按钮。
+   *
+   * @param {string} phone 手机号（用户输入原文，允许带空格 / `+86` / `-`）
+   * @param {string} password 密码（明文，仅在此函数体内与 RPC 参数中出现）
+   * @returns {Promise<void>}
+   */
+  /**
+   * 从**本机浏览器**导入超级麦吉的登录态（免开窗、免输密码）。
+   *
+   * ⚠️⚠️ **为什么不是「手机号 + 密码」**（2026-10-29 用户纠正）：
+   * 上游 `phone_password` 端点确实存在，但 magpie 参考实现里那条 `login()`
+   * **零调用者**（是未被采用的探索代码）；真实入口是短信验证码，而短信必须先解
+   * 「旋转验证码」⇒ 要识图模型。本机凭据这条路**没有任何门槛**：
+   * 用户在任意 Edge/Chrome 里登录过 www.letsmagic.cn，凭据就在 leveldb 里。
+   *
+   * ⚠️ 闸门必须在**第一个 await 之前**同步生效（理由见 `magicrewInFlightRef`）。
+   *
+   * @returns {Promise<void>}
+   */
+  const submitMagicrewLocalImport = async (mode = 'local-browser') => {
+    if (magicrewInFlightRef.current) return;
+    magicrewInFlightRef.current = true;
+    setCreating(true);
+    setError(null);
+    try {
+      // ⚠️ 响应里只有 accountId —— 不打日志（同「凭据不进 console」口径）。
+      const created = await rpcCall('account.create', { provider: 'magicrew', mode });
+      if (mounted.current) setCredentialModal(null);
+      /**
+       * ⚠️⚠️ **两条腿的等待语义完全不同**（别合并成一次 `loadAccounts`）：
+       *
+       * - `local-browser`：**毫秒级**，RPC 返回时凭据已落库 ⇒ 直接刷新列表即可；
+       * - `browser`：宿主只是**开了窗口**，用户还要在窗口里登 **2–5 分钟**
+       *  （后端刻意把这段等待留在后台，理由见 `mode: 'browser'` 分支那张表）
+       *  ⇒ 必须走**既有的那一个**轮询（`pollRef` + `login.poll`），
+       *  不能在这里自己再写一个 `while` 循环：
+       *  ① 本文件只允许**一个**轮询实现（`login-poll-terminal-failure.spec.ts`
+       *    的守卫锁着 —— 三态判据、超时文案、`lastPollError` 痕迹都在那份里）；
+       *  ② 第二个循环就是第二份「先判 done 还是先判 success」的判据，
+       *    必然漂移回 IKLI7J 的静默转圈。
+       */
+      if (mode === 'browser') {
+        const accountId = created && created.accountId ? created.accountId : '';
+        if (!accountId) {
+          if (mounted.current) {
+            setCredentialModal((m) => (m ? { ...m, error: '宿主未返回账号 id，请重试' } : m));
+          }
+          return;
+        }
+        setProbeNotice({
+          tone: 'ok',
+          text: '浏览器窗口已打开，请在窗口里完成登录（完成后会自动读取登录态）。',
+          details: [],
+        });
+        startLoginPoll({ accountId, provider: 'magicrew' });
+        return;
+      }
+      await loadAccounts();
+      setProbeNotice({ tone: 'ok', text: '已从本机浏览器导入超级麦吉账号。', details: [] });
+    } catch (caught) {
+      // ⚠️ 错误**留在弹窗内**（同 submitOpencodeEntry）：把整个账号列表切成
+      //    错误态会让用户刚看的说明与失败原因一起消失，只能刷新重试。
+      if (mounted.current) {
+        setCredentialModal((m) => (m
+          ? { ...m, error: caught && caught.message ? caught.message : '导入失败' }
+          : m));
+      }
+    } finally {
+      // ⚠️ 闸门**无条件释放**（不能 `if (mounted.current)`）：它是普通 ref，与
+      //    挂载状态无关，跟着判会让卸载后闸门永久停在 true（同 `claimInFlightRef`）。
+      magicrewInFlightRef.current = false;
+      if (mounted.current) setCreating(false);
+    }
+  };
+
+
   const createAccount = async () => {
     // ⚠ 已有一轮登录在跑时**必须拦住**（真实缺陷）：`creating` 在返回 loginUrl 后
     // 会被 `finally` 无条件释放，按钮随即恢复可点，再点一次会叠加第二个轮询 +
@@ -3955,6 +4073,15 @@ function ProviderPanel({ provider, rpcCall }) {
     //    没有 OAuth 授权页 ⇒ 两步式 `account.create` 对它不适用，与 opencode 同款改道。
     if (provider === 'modelscope') {
       setKeyModal({ provider, error: '' });
+      return;
+    }
+    // ⚠️ 超级麦吉（Magicrew，2026-10-29）：**没有 OAuth 授权页**，也**不信手机号+密码**
+    //    （上游 `phone_password` 端点存在，但 magpie 参考实现里那个 login() 零调用者
+    //    —— 是未采用的探索代码；真实入口是短信，要先解旋转验证码 ⇒ 要识图模型）。
+    //    ⇒ 本弹窗提供两条**无门槛**的路：读本机浏览器登录态（`local-browser`）、
+    //    或开一个干净窗口让用户自己登（`browser`，走两步式 + login.poll）。
+    if (provider === 'magicrew') {
+      setCredentialModal({ provider, error: '' });
       return;
     }
 
@@ -4171,60 +4298,7 @@ function ProviderPanel({ provider, rpcCall }) {
         //   `catch` 完全吞掉：用户只剩 5 分钟后一句「登录超时」，真实原因永不上屏
         //   （独立审计攻击 5d 实测）。这里只记痕迹，不打断轮询（可能只是瞬时故障），
         //   超时时一并展示。
-        let lastPollError = null;
-        let pollErrorCount = 0;
-        pollRef.current = setInterval(async () => {
-          if (!mounted.current) { stopPoll(); return; }
-          if (Date.now() > deadline) {
-            // ⚠️ 超时**必须给用户一句话**（Gitee issue IKLI7J 期望 3）。
-            //   原先这里只是关窗 + 停表：用户看到「转圈 5 分钟后悄悄恢复」，
-            //   分不清是没授权、被服务端拒了、还是插件坏了。
-            // ⚠️ **文案不得把原因写死成「未完成授权」**（独立审计发现）：走到这里还有
-            //   几种与「没授权」相反的情形 —— 用户其实已授权但凭据形状不被接受（zcode
-            //   残缺凭据）、账号条目在登录途中被删掉、失败记录被 TTL/上限淘汰。
-            //   把原因写死会给排障者一个错误的第一个假设。
-            if (loginWindow && !loginWindow.closed) loginWindow.close();
-            setLoginUrlForManual(null);
-            setError('登录超时或未完成（已等待 5 分钟）：可能是授权未完成、授权被拒，'
-              + '或账号条目已被删除。请重新点击「+ 新建账号」再试一次；'
-              + '若账号其实已经添加，可点「重新读取」查看。'
-              + (pollErrorCount > 0
-                ? `（期间有 ${pollErrorCount} 次轮询请求本身失败，最后一次：${lastPollError}）`
-                : ''));
-            setPhase('error');
-            stopPoll();
-            return;
-          }
-          try {
-            const pollRes = await rpcCall('login.poll', { accountId, provider });
-            if (!mounted.current) return;
-            // ⚠️⚠️ **先判 `success === false`（终态失败），再判 `done`**
-            //   （Gitee issue IKLI7J）。后端把失败原因放在 `success:false` + `error`；
-            //   旧写法 `if (!pollRes?.done) return;` 在 `done:false` 时把 `error`
-            //   整体丢掉 —— 这正是「登录失败对用户完全不可见」的根因 1。
-            //   判据刻意**不写进 `done:true` 分支**：对 `done` 的取值保持不敏感。
-            if (pollRes?.success === false) {
-              if (loginWindow && !loginWindow.closed) loginWindow.close();
-              setLoginUrlForManual(null);
-              setError(pollRes.error || '登录失败（宿主未给出原因），请重新点击「+ 新建账号」。');
-              setPhase('error');
-              stopPoll();
-              return;
-            }
-            if (!pollRes?.done) return;
-            if (loginWindow && !loginWindow.closed) loginWindow.close();
-            setLoginUrlForManual(null);
-            await loadAccounts();
-            stopPoll();
-          } catch (caught) {
-            // ⚠️ **继续轮询**（宿主可能只是瞬时不可用），但必须留下痕迹：
-            //   原先这里是裸 `catch {}`，于是 `login.poll` 自身报错（`ok:false`，
-            //   例如宿主 handler 抛异常）时真实原因被彻底吞掉，用户只能等到
-            //   5 分钟后那句泛化的「登录超时」（独立审计攻击 5d）。
-            pollErrorCount += 1;
-            lastPollError = caught && caught.message ? caught.message : String(caught);
-          }
-        }, 1000);
+        startLoginPoll({ accountId, provider, loginWindow });
       } else {
         setError('后端未返回登录地址（loginUrl 为空）。');
         setPhase('error');
@@ -4261,6 +4335,92 @@ function ProviderPanel({ provider, rpcCall }) {
    *
    * 判定逻辑在 `./account-model-link.js`（纯函数，可单测）。
    */
+  /**
+   * **唯一的登录轮询实现**（十余家 provider + 超级麦吉网页版登录共用）。
+   *
+   * ## ⚠️⚠️ 为什么必须收成唯一一处
+   *
+   * 这份循环里有三条**互相依存**的判据，任何一条单独抄走都会退回 issue IKLI7J 的
+   * 静默转圈：
+   *
+   * 1. **先判终态失败（`success` 为假），再判 `done`** —— 反过来写的话，后端唯一那句
+   *    失败原因会被 `if (!done) return` 整体丢掉（issue 根因 1）；
+   * 2. **超时分支必须给用户一句话**（issue 期望 3），且文案**不得**把原因写死成
+   *    「未完成授权」（还有「凭据形状不被接受」「账号途中被删」等相反情形）；
+   * 3. **`catch` 必须留下 `lastPollError` / `pollErrorCount` 痕迹** —— 裸
+   *    `catch {}` 会让 `login.poll` 自身的失败彻底消失（独立审计攻击 5d）。
+   *
+   * ⇒ `login-poll-terminal-failure.spec.ts` 用**行锚定 + 计数**守着这三条，
+   * 其中一条是「那条终态判据在全文件只能出现一次」——
+   * 再写第二个循环就会变红。
+   *
+   * @param {{ accountId: string, provider: string, loginWindow?: object|null }} params
+   *   `loginWindow` = 客户端自己开的那扇窗（宿主开窗的 provider 传 `null`）。
+   */
+  const startLoginPoll = ({ accountId, provider, loginWindow = null }) => {
+    // ⚠️ 超时**不用**另起的 `setTimeout`，而是记 deadline 在轮询里判：这样全场只有
+    //   一个句柄（pollRef），卸载清理与超时都不会漏掉第二个定时器。
+    const deadline = Date.now() + 300000;
+    // ⚠️ `login.poll` **自身**失败（宿主异常 ⇒ `ok:false`）原先被下面那个裸
+    //   `catch` 完全吞掉：用户只剩 5 分钟后一句「登录超时」，真实原因永不上屏
+    //   （独立审计攻击 5d 实测）。这里只记痕迹，不打断轮询（可能只是瞬时故障），
+    //   超时时一并展示。
+    let lastPollError = null;
+    let pollErrorCount = 0;
+    pollRef.current = setInterval(async () => {
+      if (!mounted.current) { stopPoll(); return; }
+      if (Date.now() > deadline) {
+        // ⚠️ 超时**必须给用户一句话**（Gitee issue IKLI7J 期望 3）。
+        //   原先这里只是关窗 + 停表：用户看到「转圈 5 分钟后悄悄恢复」，
+        //   分不清是没授权、被服务端拒了、还是插件坏了。
+        // ⚠️ **文案不得把原因写死成「未完成授权」**（独立审计发现）：走到这里还有
+        //   几种与「没授权」相反的情形 —— 用户其实已授权但凭据形状不被接受（zcode
+        //   残缺凭据）、账号条目在登录途中被删掉、失败记录被 TTL/上限淘汰。
+        //   把原因写死会给排障者一个错误的第一个假设。
+        if (loginWindow && !loginWindow.closed) loginWindow.close();
+        setLoginUrlForManual(null);
+        setError('登录超时或未完成（已等待 5 分钟）：可能是授权未完成、授权被拒，'
+          + '或账号条目已被删除。请重新点击「+ 新建账号」再试一次；'
+          + '若账号其实已经添加，可点「重新读取」查看。'
+          + (pollErrorCount > 0
+            ? `（期间有 ${pollErrorCount} 次轮询请求本身失败，最后一次：${lastPollError}）`
+            : ''));
+        setPhase('error');
+        stopPoll();
+        return;
+      }
+      try {
+        const pollRes = await rpcCall('login.poll', { accountId, provider });
+        if (!mounted.current) return;
+        // ⚠️⚠️ **先判终态失败（`success` 为假），再判 `done`**
+        //   （Gitee issue IKLI7J）。后端把失败原因放在 `success:false` + `error`；
+        //   旧写法 `if (!pollRes?.done) return;` 在 `done:false` 时把 `error`
+        //   整体丢掉 —— 这正是「登录失败对用户完全不可见」的根因 1。
+        //   判据刻意**不写进 `done:true` 分支**：对 `done` 的取值保持不敏感。
+        if (pollRes?.success === false) {
+          if (loginWindow && !loginWindow.closed) loginWindow.close();
+          setLoginUrlForManual(null);
+          setError(pollRes.error || '登录失败（宿主未给出原因），请重新点击「+ 新建账号」。');
+          setPhase('error');
+          stopPoll();
+          return;
+        }
+        if (!pollRes?.done) return;
+        if (loginWindow && !loginWindow.closed) loginWindow.close();
+        setLoginUrlForManual(null);
+        await loadAccounts();
+        stopPoll();
+      } catch (caught) {
+        // ⚠️ **继续轮询**（宿主可能只是瞬时不可用），但必须留下痕迹：
+        //   原先这里是裸 `catch {}`，于是 `login.poll` 自身报错（`ok:false`，
+        //   例如宿主 handler 抛异常）时真实原因被彻底吞掉，用户只能等到
+        //   5 分钟后那句泛化的「登录超时」（独立审计攻击 5d）。
+        pollErrorCount += 1;
+        lastPollError = caught && caught.message ? caught.message : String(caught);
+      }
+    }, 1000);
+  };
+
   const toggleAccount = async (accountId, enabled) => {
     try {
       // 必须在提交**之前**判定：提交后列表已刷新，「是否还有启用账号」的答案
@@ -5515,9 +5675,106 @@ function ProviderPanel({ provider, rpcCall }) {
           onSubmit: (value) => void submitModelscopeKeyEdit(value),
           onClose: () => setKeyEditModal(null),
         })
+      : null,
+    // 「登录超级麦吉」弹窗（**本 fork 独有**，2026-10-29 K1）：独立 state +
+    // 两个独立 ref（手机号 / 密码）。与 `keyModal` 那两份**刻意分开**，
+    // 理由见 `credentialModal` 的声明处。
+    // ⚠️ 同样必须 `React.createElement` 而非直接调用组件函数：直接调用会把
+    // 组件的 hook 算进 ProviderPanel（该文件头记录过 hook #310 事故，整页白屏）。
+    credentialModal
+      ? React.createElement(MagicrewImportModal, {
+          error: credentialModal.error || '',
+          busy: creating,
+          onSubmit: () => void submitMagicrewLocalImport('local-browser'),
+          onBrowse: () => void submitMagicrewLocalImport('browser'),
+          onClose: () => setCredentialModal(null),
+        })
       : null);
 }
 
+/**
+ * 「导入超级麦吉（Magicrew）」弹窗：**从本机浏览器读取登录态**（本 fork 独有）。
+ *
+ * ## ⚠️⚠️ 为什么不是「手机号 + 密码」
+ *
+ * 2026-10-29 用户纠正：上游 `phone_password` 端点确实存在（`api.mjs` 实测过 200），
+ * 但 magpie 参考实现里那个 `login()` **零调用者** —— 它是未被采用的探索代码；
+ * 真实入口是**短信验证码**，而短信必须先解「旋转验证码」⇒ 要识图模型。
+ * 本机凭据这条路**没有任何门槛**：用户在任意 Edge/Chrome 里登录过
+ * `www.letsmagic.cn`，凭据就在浏览器的 leveldb 里，插件直接读。
+ *
+ * ## ⚠️⚠️ 必须是组件、不能当普通函数直接调用
+ *
+ * 调用方一律写 `React.createElement(MagicrewImportModal, props)`：本文件里的弹窗家族
+ * （`OpencodeProxyModal` / `ModelscopeKeyModal`）都记录过 2026-10-02 的真实事故
+ * —— 直接函数调用会把内部 hook 算进 `ProviderPanel`，「开 / 关」两次渲染的
+ * hook 数量不同 ⇒ React #310 ⇒ **整个设置页白屏**。
+ *
+ * ## ⚠️ 两个入口，**门槛完全不同**（别把其中一个删掉）
+ *
+ * | 按钮 | 后端 `mode` | 门槛 | 时长 |
+ * |---|---|---|---|
+ * | 「导入」 | `local-browser` | 零（用户日常浏览器里已登过） | 毫秒级 |
+ * | 「网页登录」 | `browser` | 低（宿主开一个干净窗口，用户自己登） | **2–5 分钟** |
+ *
+ * 「导入」读不到时（用户从没在本机浏览器登过这个站 / 用的是另一个 profile）不是
+ * 「没登录」而是「这个入口看不见那份凭据」⇒ 必须有一条能**自己登一次**的路，
+ * 那就是「网页登录」。
+ *
+ * @param props `{ error, busy, onSubmit(), onBrowse(), onClose() }`
+ */
+function MagicrewImportModal({ error, busy, onSubmit, onBrowse, onClose }) {
+  return React.createElement('div', {
+    className: 'dim-jh-modalOverlay',
+    onClick: (e) => { if (e.target === e.currentTarget && !busy && onClose) onClose(); },
+  },
+    React.createElement('div', {
+      className: 'dim-jh-modal',
+      role: 'dialog',
+      'aria-modal': 'true',
+      'aria-label': '导入超级麦吉',
+      style: { maxWidth: '460px' },
+    },
+      React.createElement('div', { className: 'dim-jh-modalHead' },
+        React.createElement('div', { className: 'dim-jh-modalTitle' }, '导入超级麦吉'),
+      ),
+      React.createElement('div', { className: 'dim-jh-modalBody' },
+        React.createElement('p', { className: 'dim-jh-modalHint' },
+          // ⚠️ 纯文本（不走 markdown 渲染），不要写 `**强调**`。
+          '「导入」：先用 Edge / Chrome 打开 www.letsmagic.cn 登录，然后回到这里点「导入」。'
+          + '插件会直接读取该浏览器的登录态，不需要再输一次密码。'),
+        React.createElement('p', { className: 'dim-jh-modalHint' },
+          '「网页登录」：插件会另开一个干净的浏览器窗口，你在里面完成登录即可'
+          + '（可能需要在那个窗口里重新登一次 —— 它不带你日常浏览器的登录态）。'),
+        error
+          ? React.createElement('p', { className: 'dim-jh-error', role: 'alert' }, error)
+          : null,
+      ),
+      React.createElement('div', { className: 'dim-jh-modalActions' },
+        React.createElement('button', {
+          type: 'button',
+          className: 'dim-jh-btn dim-jh-btnPrimary',
+          disabled: !!busy,
+          onClick: () => { if (onSubmit) onSubmit(); },
+        }, busy ? '处理中…' : '导入'),
+        React.createElement('button', {
+          type: 'button',
+          className: 'dim-jh-btn',
+          // ⚠️ 禁用判据必须与「导入」共用 `busy`：两条腿都会建账号，同时跑
+          //    会让池里多出两个账号指向同一个上游号。
+          disabled: !!busy,
+          onClick: () => { if (onBrowse) onBrowse(); },
+        }, '网页登录'),
+        React.createElement('button', {
+          type: 'button',
+          className: 'dim-jh-btn',
+          disabled: !!busy,
+          onClick: () => { if (onClose) onClose(); },
+        }, '取消'),
+      ),
+    ),
+  );
+}
 /**
  * 账号备份（导出 / 恢复）。
  *
@@ -7443,12 +7700,16 @@ function GatewayPanel({ status, busy, notice, onToggle, onToggleAllowLan, onRelo
  * 每条 `details[]` 带 `expire_at_ms` ⇒ 同日接入 `WIRED_EXPIRY_PROVIDERS`，
  * 这里必须同改。⚠️ **是两个渠道 id，必须各占一项**（共用一个 `MinimaxAuth`
  * 不等于共用一个 id）；漏掉国际版 ⇒ 只登国际站的用户仍看到错话。
+ * ⚠️ 超级麦吉（Magicrew，2026-10-29）：已进 `WIRED_EXPIRY_PROVIDERS` ⇒ 本名单必须同改。
+ * 说明写在这里而不是数组内部：下面那条守卫按 `split(',')` 解析数组体，
+ * 数组内的注释只要含半角逗号就会被当成名单项（我第一版就这么写红过）。
  */
 const AGG_WIRED_CHANNEL_IDS = [
   'buddy', 'workbuddy', 'loomy', 'codearts', 'zcode', 'lobsterai', 'trae',
   'accio', 'officeace', 'modelscope', 'autoclaw', 'autoclawintl',
   'qoder', 'qodercn',
   'astudio', 'minimax', 'minimaxintl',
+  'magicrew',
 ];
 
 /**

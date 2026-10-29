@@ -104,6 +104,11 @@ import type { LoomyCredential } from './loomy.js'
 import type { LobsteraiCredential } from './lobsterai.js'
 import type { TraeCredential } from './trae.js'
 import type { ZcodeCredential } from './zcode.js'
+// ⚠️ Magicrew（超级麦吉，2026-10-29 新增）：折算原语**就在取数模块里**
+//    （`magicrew-credits.ts` 的 `magicrewExpiry`）—— 本表只做「凭据 → 它要的入参」
+//    这一层映射，**绝不重算折算**（本仓库红线：折算映射只许有一份）。
+import { magicrewExpiry } from './magicrew-credits.js'
+import { parseMagicrewCredential } from './magicrew-auth.js'
 import type { ProviderRuntime } from './provider-runtime.js'
 // ⚠️ 只导入**类型**（`CreditBalance` 是取数原语的返回形状）：本表只是「选哪个原语」，
 //    不解释余额内容（那个判据在 `aggregate-expiry.ts` 的各家原语里）。
@@ -316,6 +321,30 @@ export function createProviderExpiry(deps: ProviderExpiryDeps = {}): Readonly<Re
           ? undefined
           : () => context.cachedBalance!(context.accountId) as Promise<CreditBalance | null | undefined>,
       ),
+    },
+    // ⚠️ Magicrew（2026-10-29）：折算原语是 `magicrew-credits.ts` 的 `magicrewExpiry`。
+    //    ⚠️ 它是 **async + 自带取数腿**（缓存缺席 / null / undefined 时自己发请求）——
+    //    这正是 `src/provider-runtime.ts:218-231` 要求的契约，别在这里只传值。
+    //    ⚠️ 与 ① ② 必须三处同改（`expiry-runtime-parity.spec.ts` 真跑 apply() 锁一致性）。
+    magicrew: {
+      credentialExpiry: async (c, context) => {
+        /**
+         * ⚠️ **共用 `parseMagicrewCredential`**，不要在这里手写 `c?.jwt ?? ''`
+         *（2026-10-29 最终审查 I4）：`MagicrewService.expiry` 走的是共享解析器，
+         *  两处各写一套「什么算有效凭据」就是同义判据（本仓红线）。
+         *  统一后两者的差别只剩「service 侧可注入 `now`」，那是有意的。
+         */
+        const credential = parseMagicrewCredential(c)
+        return await magicrewExpiry({
+          jwt: credential?.jwt ?? '',
+          organizationCode: credential?.organizationCode ?? '',
+          ...context?.cachedBalance === undefined
+            ? {}
+            : {
+                cachedBalance: () => context.cachedBalance!(context.accountId) as Promise<CreditBalance | null | undefined>,
+              },
+        })
+      },
     },
     /**
      * ⚠️ **Qoder**（国际版 / 中国版，2026-10-20）：与 **buddy 系同形**

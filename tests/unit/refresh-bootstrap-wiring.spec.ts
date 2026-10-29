@@ -148,7 +148,7 @@ describe('续期调度器：启动必须先跑一轮', () => {
     //    同日 **本 fork** 并入 modelscope（魔搭）：18 → 19；
     //    2026-10-20 加 autoclawintl（AutoClaw 国际版）：19 → 20。
     // ⚠️ 2026-10-22（A6）：codely 翻 `channel: true`：20 → 21。
-    expect(expected, 'channel 集合变了，请复核 opencode 豁免是否仍成立').toHaveLength(21)
+    expect(expected, 'channel 集合变了，请复核 opencode 豁免是否仍成立').toHaveLength(22)
     // ⚠️ 反方向：期望集里的每一个都必须**确实**在 registry 里有声明（防手抄漂移）。
     for (const id of expected) {
       expect(PROVIDER_REGISTRY.some((d) => d.id === id), `registry 缺少声明：${id}`).toBe(true)

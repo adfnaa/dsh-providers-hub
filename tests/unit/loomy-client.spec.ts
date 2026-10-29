@@ -37,8 +37,15 @@ describe('Loomy 客户端接线', () => {
    * 改用微信扫码后该分支已删除。
    */
   it('account.create 调用不再传 phone（顺序死锁回归）', () => {
-    const start = hubSource.indexOf("rpcCall('account.create'")
-    expect(start).toBeGreaterThan(-1)
+    /**
+     * ⚠️ 定位必须锚在 **`buildCreateAccountPayload(`**（Loomy 走的那条通用载荷），
+     * 不能用「第一次出现 `rpcCall('account.create'` 后 200 字符」——
+     * 2026-10-29 加了 Magicrew 的「手机号 + 密码」分支（它**合法地**带 `phone`），
+     * 而那条分支的文本可能落进前 200 字符 ⇒ 误报。
+     * ⚠️ 判据本身不变（通用载荷里**不得**有 phone），只是把锚点收紧。
+     */
+    const start = hubSource.indexOf('buildCreateAccountPayload(provider')
+    expect(start, '找不到 Loomy 的通用载荷调用（改写了要同步改本用例）').toBeGreaterThan(-1)
     const body = hubSource.slice(start, start + 200)
     expect(body).not.toContain('phone')
   })

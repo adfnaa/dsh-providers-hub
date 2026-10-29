@@ -267,12 +267,39 @@ export interface RpcListAccountsResponse {
 export interface RpcCreateAccountRequest {
   provider: string
   /**
+   * 登录方式（**仅 Magicrew / 超级麦吉需要**）。
+   *
+   * 超级麦吉有三条登录路径，其中「从本机浏览器读已登录态」这条**零门槛**
+   * （用户只要在 Edge / Chrome 里登录过 `www.letsmagic.cn`，凭据就已经在
+   * 本地 leveldb 里，不需要开窗口、也不需要手机号密码）：
+   *
+   * - 缺省：按 `phone` + 密码登录（见下两个字段）；
+   * - `'local-browser'`：不开窗口，直接从本机浏览器 localStorage 取登录态；
+   *   读不到 ⇒ 返回可读错误，**不建账号**。
+   * - `'browser'`：**开一个独立 profile 的浏览器窗口**让用户在网页里登录，登完
+   *   再把凭据读回来（分钟级；走 `login.poll` 三步式，不在 `account.create` 里等）。
+   *   用户没登完 ⇒ `login.poll` 报终态并**删掉**占位条目。
+   *
+   * ⚠️ 来自客户端自报的 RPC 载荷（无 schema 校验）⇒ 读取侧按字面量白名单判，
+   * 未登记的值一律当作缺省路径（**不报错、不静默改变语义**）。
+   */
+  mode?: 'local-browser' | 'browser'
+  /**
    * 手机号（**仅 Loomy 需要**）。
    *
    * 其余 7 个 provider 是「返回 loginUrl 让用户在浏览器里授权」，
    * 不需要手机号；Loomy 走**短信验证码**登录，故须由前端先收集。
    */
   phone?: string
+  /**
+   * 密码（**仅 Magicrew / 超级麦吉需要**）。
+   *
+   * ⚠️ 只用于**一次性登录请求体**，**绝不落盘**（凭据里只有 jwt / apiKey /
+   * refreshToken；`MagicrewCredential` 没有 password 字段，这是刻意的）。
+   * ⚠️ 它的存在让 `account.create` 多了一条「带密码」的分支 —— 其余 provider
+   * 仍是「返回 loginUrl 让用户在浏览器里授权」。
+   */
+  password?: string
   /**
    * 登录渠道（**仅 ZCode 需要**）。
    *

@@ -101,6 +101,10 @@ const STYLES = `
 .dim-jh-providerIcon.officeace { background: transparent; }
 /* AStudio：内联 SVG 自带不透明品牌蓝底 + 白字 A，容器白底与其它内联 SVG 家一致。 */
 .dim-jh-providerIcon.astudio { background: white; }
+/* 超级麦吉（Magicrew）：官方 favicon 自带紫蓝渐变圆底，本身即完整图形，
+   故容器保持透明（与 zcode / officeace / codely 同因：图标自己不透明，再叠白底多余）。
+   ⚠️ 本文件的样式整体是一个模板字符串 —— 注释里不能出现反引号（会提前终止）。 */
+.dim-jh-providerIcon.magicrew { background: transparent; }
 /* 聚合 provider：内联 SVG（三渠道汇聚），白底容器中显示清晰。
    ⚠️ 加这一条是必要的 —— 上面每家的 logoClass 都各自声明了背景，
       没有兜底规则，缺了会让聚合的图标容器**没有背景**（与其它行不一致）。 */

@@ -490,6 +490,11 @@ describe('全部账号被模型限流时，报限流而非「未登录」', () =
       // （`ASTUDIO.defaultCredentialRef`），Jet Hub 导入本机会话只写
       // `ASTUDIO_ACCOUNT_XXX` ⇒ 池被筛空时会误报「请先登录」。
       'ASTUDIO',
+      // ⚠️ **MAGICREW 必须在内**（2026-10-29）：与 accio 同形 —— 兜底是固定 ref
+      //    （`MAGICREW_ACCESS_TOKEN`），而 Jet Hub 登录只写 `MAGICREW_ACCOUNT_*`
+      //    ⇒ 池被筛空时会误报误导性的「请先登录」。且它的 `mgw_` key 只活 2 小时，
+      //    该误报会让用户去重登一个本来没问题的号。
+      'MAGICREW',
       // ⚠️ **刻意不含 ZCODE** —— 它是唯一「不接判定也算对」的一家，
       // 见下方「zcode 同型缺陷判定」段。
     ]

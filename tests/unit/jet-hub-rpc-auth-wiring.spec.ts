@@ -93,6 +93,9 @@ const AUTH_SERVICE: Readonly<Record<string, string>> = {
   //    ⚠️ `CodelyAuth` 已从裸类改为 `extends Service`（否则 ctx 上永远没有
   //    `codelyAuth`，本表取不到实例）—— 见 `codely-auth-service.ts` 的类注释。
   codely: 'codelyAuth',
+  // ⚠️ 超级麦吉（Magicrew，2026-10-29）：服务名由 `${product.id}Auth` 派生
+  //    ⇒ `magicrewAuth`（`MagicrewAuth` 是 `extends Service`，构造时自 provide）。
+  magicrew: 'magicrewAuth',
 }
 
 /**
@@ -301,7 +304,7 @@ function entry(provider: string, credentialRef: string): ProviderAccountEntry {
 }
 
 describe('★ registerJetHubRpc 的命名对象接线（真跑 apply + account.refresh）', () => {
-  it('registry 里占 auth 键位的恰好 17 家（opencode / aggregate 豁免）', () => {
+  it('registry 里占 auth 键位的恰好 18 家（opencode / aggregate 豁免）', () => {
     // ★ **方向性**：以 `PROVIDER_REGISTRY` 为权威，`AUTH_SERVICE` 是被测对象。
     //   「registry 里有、表里没有」⇒ 红，且 `toEqual` 的差异**点名那个 id**
     //   （而不是让下面的逐 provider 用例静默少跑一家）。
@@ -318,7 +321,7 @@ describe('★ registerJetHubRpc 的命名对象接线（真跑 apply + account.r
     //    同日 **本 fork** 并入 modelscope（魔搭）：18 → 19。
     // ⚠️ 2026-10-20 加 autoclawintl（AutoClaw 国际版）：19 → 20。
     // ⚠️ 2026-10-22（A6）：codely 已接入 auth（`CodelyAuth` 改为 Service + 接进 auths）：20 → 21。
-    expect(EXPECTED_AUTH_PROVIDER_IDS).toHaveLength(21)
+    expect(EXPECTED_AUTH_PROVIDER_IDS).toHaveLength(22)
     // 另一方向（原断言的**全部**证明力都在这条上，单独留着免得它随上面那条一起消失）：
     // 表里的每个键都必须是 registry 里真实存在的 provider id（防拼写错误造成的僵尸项）。
     for (const id of Object.keys(AUTH_SERVICE)) {
@@ -349,6 +352,14 @@ describe('★ registerJetHubRpc 的命名对象接线（真跑 apply + account.r
     // 「qodercn 的账号去刷了 qoder 的凭据」这类串接。
     const accounts = EXPECTED_AUTH_PROVIDER_IDS.map((id) => entry(id, `${id.toUpperCase()}_ACCOUNT_WIRE`))
     const { call, calledServices } = await setup(accounts)
+
+    // ⚠️ **测量前必须排空背景链**：`apply(ctx)` 的**首轮**续期是 fire-and-forget
+    //    （`src/index.ts` 里刻意不 await），它的调用会落在 `setup()` 装好 spy
+    //    **之后** ⇒ 混进下面「只有自己那个实例被调用」的测量 ⇒ 假红。
+    //    ⚠️ 这条是 2026-10-29 加 magicrew 时暴露的：每多一个 provider，背景链就多
+    //    一条，原来靠运气对齐的时序就崩了。**不要**改成放宽断言（那会连同真正的
+    //    串接一起放过）。
+    await new Promise((resolve) => setTimeout(resolve, 100))
 
     for (const id of EXPECTED_AUTH_PROVIDER_IDS) {
       const expected = AUTH_SERVICE[id]!
