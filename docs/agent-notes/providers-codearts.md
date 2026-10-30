@@ -67,6 +67,24 @@ AgentCenter 当时还没被当作目录源（codearts2api 那时也只用它取�
 
 ### ✅ AgentCenter：动态窗口权威源（2026-10-29 接入）
 
+⚠️⚠️ **2026-10-30 四路审计（2 正向 + 2 对抗，60+ 变异）后的修订** —— 本节
+记录了 3 个真缺陷与它们的修法（**代码已改、守卫已补**）：
+
+| # | 缺陷 | 修法 |
+|---|---|---|
+| **P1-1** | **`maxTokens` 出口污染宿主的上下文预留** —— `CatalogEntry.maxTokens` ⇒ `defaultMaxTokens` ⇒ 宿主 `dsh-compaction-basic` 的 `reservedCompletionTokens` 把它**从窗口里扣掉** ⇒ GLM-5.2 压缩触发点 162,201→109,772、压力预算 137,216→71,680；窗口 131,072 的模型 ⇒ **抛 `TargetPressureConfigError`** | **撤掉该落键**（照 `src/opencode-adapter.ts:392-413` 的先例：「上限 ≠ 合理默认预算」）+ 守卫⑦ |
+| **P1-2** | **AgentCenter 独有模型无倍率 ⇒ 聚合定价恒 `Infinity`** ⇒ codearts 在聚合里**永远排最后** | **`windowOnly`**：只作窗口源、**不进目录** + 守卫⑨ |
+| **P2 D1** | **`canonicalQueryOf` 往返会改字节**（`+`/裸 `%`/`=`）⇒ 可能与服务端口径分叉 ⇒ 静默 401 | 加 `isSignedQueryValueSafe` 闸门（**安全集外不发请求**） |
+| **P2 D3** | **`detail` 一步的路由头零守卫** ⇒ 上游从严则 detail 恒 400 ⇒ 核心功能静默失效 | 守卫改**普查**（两次请求都要带） |
+| **P3 D6** | **动态腿在「手填 id」场景不可达**（`unknownModelContextWindow` 只在 `entry===undefined` 时被调，而旧实现查 `remoteModels` ⇒ 二者等价） | 动态窗口收进**独立的表**（`remoteContextWindows`）+ 守卫⑧ |
+
+⚠️ **两条「结论」的更正**（审计发现原文过度归纳）：
+① 「10-21 那次不是上游永久上调而是**临时值/灰度**」—— 从 3 个数据点推出的
+**过度归纳**（按**账号**灰度同样解释得通，未验证）。⇒ 改为事实陈述 +
+登记「若上游按账号灰度 ⇒ 静态表对部分账号仍错」。
+② 「`kimi-k3` 进目录的唯一途径是 AgentCenter」—— **不成立**（它改前就在
+`DEFAULT_MODELS` 里）。
+
 两步 GET，签名与本仓 `signRequestHuawei` 兼容，**额外的两个头必须参与签名**：
 
 | 步骤 | 端点 | 关键返回 |
@@ -92,7 +110,17 @@ kimi-k3=1_048_576 / ds-v4.1-flash-1017=1_048_576`。
 ⇒ **现在的层次**：AgentCenter 动态值（`RemoteModel.contextWindow`）> 静态表 >
 具名兜底。静态表退化为**冷缓存兜底**，但每条数值仍被取证注释钉住
 （上游再漂移时不必手改表，下次目录刷新即自动跟上）。
-另：`kimi-k3` **只在 AgentCenter 出现**（builtin 漏发）⇒ 这也是它进目录的唯一途径。
+另：`kimi-k3` **只在 AgentCenter 出现**（builtin 漏发）⇒ 它**只能从 AgentCenter
+拿到窗口**。
+⚠️⚠️ **更正**（2026-10-30 四路审计 P3 D9 修）：原文写「这也是它**进目录**的
+唯一途径」——**不成立**：`kimi-k3` **改前就在 `DEFAULT_MODELS` 里**
+（`src/llm-adapter.ts` 的静态兜底目录，master 第 339 行）⇒ **冷缓存下它一直
+在目录里**，不是「可用性缺口」。
+⚠️⚠️ **且 2026-10-30 起它更不该进目录**（审计 P1-2 修）：AgentCenter
+**不下发倍率** ⇒ 它进目录就是**裸名** ⇒ `priceFactorFromName` 恒 `Infinity`
+⇒ 聚合候选**恒排最后、永不被挑中**（静默）。
+⇒ 现在它**只作窗口源**（`RemoteModel.windowOnly`）：**不进目录**，但**手填
+id 时的分母取 AgentCenter 的权威值**（动态窗口表与目录可见性解耦）。
 
 ### 权威取值：IDE 内核日志的 `limit.context`
 
@@ -101,13 +129,20 @@ kimi-k3=1_048_576 / ds-v4.1-flash-1017=1_048_576`。
 
 ```json
 "provider":{"inferhub-provider":{"models":{
-  "GLM-5.2":{"id":"GLM-5.2","limit":{"input":1044480,"output":65536,"context":1048576}},
+  "GLM-5.2":{"id":"GLM-5.2","limit":{"input":1044480,"output":65536,"context":202752}},
   "glm-5.3":{"id":"glm-5.3","limit":{"input":1044480,"output":65536,"context":1048576}},
   "glm-5.2-sft-harmony":{"id":"...","limit":{"input":196608,"output":131072,"context":202752}},
   "openpangu-2.0-pro":{"id":"...","limit":{"input":512000,"output":131072,"context":524288}},
   "deepseek-v4.1-flash":{"id":"...","limit":{"input":1044480,"output":65536,"context":1048576}}
 }}}
 ```
+
+⚠️⚠️ **上表的 `GLM-5.2` 已按 2026-10-29 双源复测改为 `202752`**（2026-10-30
+四路审计 P2-2 修）：原文此处写的是 `1048576`，而**同一文档**的漂移表
+（下一节）与代码（`src/llm-adapter.ts` 的 `CONTEXT_WINDOWS`）都是 `202752`
+⇒ 文档里**最像原始证据**的那一格停在改前的值 ⇒ 读者会拿到自相矛盾的两份
+「权威」。⚠️ 这段 JSON 是**历史内核日志的摘录**（按 2026-10-29 复测值校准），
+不是「某一天的原始日志」⇒ 已在上面标注校准来源。
 
 ⚠️ **这个值会变，而且变过**（本机 42 份日志，2026-09-11~10-21 按日期收敛；
 2026-10-29 又用 IDE 0.2.6 抓包 + AgentCenter 双源复测）：
@@ -119,7 +154,7 @@ kimi-k3=1_048_576 / ds-v4.1-flash-1017=1_048_576`。
 | `glm-5.2-sft-harmony` | 全期 `202_752` |
 | `openpangu-2.0-flash` / `-pro` | 全期 `524_288` |
 | `deepseek-v4.1-flash` | 全期 `1_048_576`（本仓曾写 `1_000_000`，**是错的**） |
-| `kimi-k3` | `1_048_576`（**只由 AgentCenter 下发**，builtin 目录里没有它） |
+| `kimi-k3` | `1_048_576`（**窗口只由 AgentCenter 下发**，builtin 目录里没有它；⚠️ 2026-10-30 起它**只作窗口源、不进目录** —— 见上节 `windowOnly`） |
 
 ⚠️⚠️ **`GLM-5.2` 的三次漂移是本条的活教材**：10-21 那次 `202_752 → 1M` 当时被当成
 「上游永久上调」（守卫文本还专门写了「不得退回 202_752」），而 10-29 双源复测证明

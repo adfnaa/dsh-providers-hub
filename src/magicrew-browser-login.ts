@@ -202,6 +202,19 @@ const CDP_CREDENTIAL_EXPRESSION = `JSON.stringify({
  */
 const CDP_CREDENTIAL_TIMEOUT_MS = 3_000
 
+/**
+ * `Page.navigate` 的上限。
+ *
+ * ⚠️ **不能**复用 {@link CDP_CREDENTIAL_TIMEOUT_MS}（3 秒）
+ * （2026-10-30 四路审计 P3-1 修）：真机实测把页面导航到**黑洞地址**时，
+ * `Page.navigate` **15 秒都没返回** ⇒ 3 秒超时会让用户看到
+ * 「CDP Page.navigate 超时（3000ms）」这种**内部超时文案**（而不是
+ * 「登录页打不开」这种能指路的文案）。
+ *
+ * ⇒ 导航是**一次性**动作（不是 500ms 一拍的轮询）⇒ 给它更宽的预算。
+ */
+const CDP_NAVIGATE_TIMEOUT_MS = 30_000
+
 /** CDP 通道（只声明本文件用到的那个方法 ⇒ 单测注入假 `send` 即可）。 */
 interface CdpChannel {
   send(
@@ -559,19 +572,62 @@ export function createMagicrewCredentialWaiter(
 }
 
 /**
+ * 「**空白/新标签页**」的 URL 形态集合。
+ *
+ * ⚠️⚠️ **`chrome://newtab/` 不算 `about:blank`**（2026-10-30 四路审计 P1 D-05 修）：
+ * 实测 `new URL('chrome://newtab/').hostname` = **`'newtab'``**（**非空**）⇒
+ * `sameSite('newtab', 'www.letsmagic.cn')` = false ⇒ 旧实现会把它当成
+ * 「一个普通页面」⇒ 兜底 `pages[0]` 被导航 ⇒ **冲掉用户正在看的标签页**。
+ *
+ * ⚠️ 真机实测（2026-10-30 正向审计）：带 URL 启动时 CDP 就绪那刻 page URL
+ * **已经是**目标 URL；不带 URL 时是 **`chrome://newtab/`**（**不是**
+ * `about:blank`）⇒ 「about:blank 竞态」这条 PR 声称的前提**真机未复现**。
+ * ⇒ 但**空白页总得处理**：本集合把三种「空白」形态一视同仁。
+ */
+const BLANK_PAGE_URLS: ReadonlySet<string> = new Set([
+  'about:blank',
+  'chrome://newtab/',
+  'chrome://new-tab-page/',
+])
+
+/**
  * 把「初始仍是空白页」的窗口导航到登录页。
  *
  * CDP 就绪早于首屏导航时，启动参数里的 URL 可能尚未落到 page target。
- * 此时不能让用户面对 about:blank；已有同站点页面则不重复导航。
+ * 此时不能让用户面对空白页；已有同站点页面则不重复导航。
+ *
+ * ⚠️⚠️ **失败不抛**（2026-10-30 四路审计 P1 D-06 修）：
+ * 旧实现抛错 ⇒ 冒泡到 `createChromiumMagicrewLogin` 的 catch ⇒
+ * `session.dispose()` ⇒ `loginViaBrowser` 抛 ⇒ RPC 层 `failLogin` ⇒
+ * **占位账号被删、整条登录腿失败** —— 而此时**窗口还开着**、用户完全可以
+ * 自己操作 ⇒ 用户看到「登录失败」却明明有个窗口在。
+ *
+ * ⇒ 现在改成：**导航失败只记一条 warn，登录流程继续**（窗口留着，用户可以
+ * 自己在里面登录；凭据等待循环照样能读到）。
+ * ⚠️ 与同文件既有纪律同口径：`attemptCredentialViaCdp` 是「任何一步失败都
+ * **返回**不抛」。
+ * ⚠️ **唯一的例外**：`cdp === undefined`（通道压根没就绪）仍然抛 —— 那时连
+ * 「窗口开着」都不成立。
+ *
+ * @param url - 登录页 URL。
+ * @param log - 诊断出口（缺省不记）。
  */
 export async function ensureMagicrewLoginPage(
   session: { cdp: CdpChannel | undefined },
   url: string,
+  log?: (message: string) => void,
 ): Promise<void> {
   const cdp = session.cdp
   if (cdp === undefined) throw new Error('超级麦吉: 浏览器调试通道未就绪，无法打开登录页')
-  const targets = await cdp.send('Target.getTargets', {}, CDP_CREDENTIAL_TIMEOUT_MS) as {
-    targetInfos?: Array<{ type?: unknown, targetId?: unknown, url?: unknown }>
+  let targets: { targetInfos?: Array<{ type?: unknown, targetId?: unknown, url?: unknown }> }
+  try {
+    targets = await cdp.send('Target.getTargets', {}, CDP_CREDENTIAL_TIMEOUT_MS) as {
+      targetInfos?: Array<{ type?: unknown, targetId?: unknown, url?: unknown }>
+    }
+  } catch (error) {
+    // ⚠️ 同上：**不抛**（窗口开着，用户可自己操作）。
+    log?.(`[magicrew] 读取浏览器页面列表失败，登录页未自动打开：${String(error)}`)
+    return
   }
   const pages = (targets.targetInfos ?? []).filter(
     (info): info is { targetId: string, url: string, type: string } => (
@@ -579,22 +635,42 @@ export async function ensureMagicrewLoginPage(
     ),
   )
   if (pages.some((page) => sameSite(hostnameOf(page.url), hostnameOf(url)))) return
-  const blank = pages.find((page) => page.url === 'about:blank') ?? pages[0]
-  if (blank === undefined) throw new Error('超级麦吉: 浏览器没有可用于登录的页面')
-  const attached = await cdp.send(
-    'Target.attachToTarget', { targetId: blank.targetId, flatten: true }, CDP_CREDENTIAL_TIMEOUT_MS,
-  ) as { sessionId?: unknown }
+  // ⚠️⚠️ **只导航「空白页」**（2026-10-30 审计 P1 D-05 修）：
+  // 旧实现是 `pages.find(about:blank) ?? pages[0]` ⇒ 兜底会**抢走用户正在看
+  // 的标签页**（实测 `chrome://newtab/` 的 hostname 是 `'newtab'`、非空 ⇒
+  // 它既不是 `about:blank`、也不是同站点 ⇒ 落到 `pages[0]` 被导航）。
+  // ⇒ 现在**只**导航三种空白形态；**没有空白页就不导航**（宁可让用户自己
+  // 切到登录页，也不冲掉他的标签页）。
+  const blank = pages.find((page) => BLANK_PAGE_URLS.has(page.url))
+  if (blank === undefined) {
+    log?.('[magicrew] 没有找到空白页，未自动打开登录页（请手动切换到登录页）')
+    return
+  }
+  let attached: { sessionId?: unknown }
+  try {
+    attached = await cdp.send(
+      'Target.attachToTarget', { targetId: blank.targetId, flatten: true }, CDP_CREDENTIAL_TIMEOUT_MS,
+    ) as { sessionId?: unknown }
+  } catch (error) {
+    log?.(`[magicrew] 连接登录页面失败，登录页未自动打开：${String(error)}`)
+    return
+  }
   if (typeof attached.sessionId !== 'string' || attached.sessionId.length === 0) {
-    throw new Error('超级麦吉: 无法连接登录页面')
+    log?.('[magicrew] 无法连接登录页面，登录页未自动打开')
+    return
   }
   const sessionId = attached.sessionId
   try {
     const navigated = await cdp.send(
-      'Page.navigate', { url }, CDP_CREDENTIAL_TIMEOUT_MS, sessionId,
+      'Page.navigate', { url }, CDP_NAVIGATE_TIMEOUT_MS, sessionId,
     ) as { errorText?: unknown }
     if (typeof navigated.errorText === 'string' && navigated.errorText.length > 0) {
-      throw new Error(`超级麦吉: 打开登录页失败（${navigated.errorText}）`)
+      // ⚠️ **不抛**（同本函数头部注释）—— 只记一条诊断。
+      log?.(`[magicrew] 打开登录页失败（${navigated.errorText}），窗口仍开着，可手动操作`)
     }
+  } catch (error) {
+    // ⚠️ **不抛**（同本函数头部注释）。
+    log?.(`[magicrew] 打开登录页失败，窗口仍开着，可手动操作：${String(error)}`)
   } finally {
     try {
       await cdp.send('Target.detachFromTarget', { sessionId }, CDP_CREDENTIAL_TIMEOUT_MS)
@@ -749,7 +825,17 @@ export async function createChromiumMagicrewLogin(
   })
   try {
     await session.start()
-    await (deps.ensureLoginPage ?? ensureMagicrewLoginPage)(session, url)
+    // ⚠️⚠️ **导航失败不阻断登录**（2026-10-30 四路审计 P1 D-06 修）：
+    // 旧实现在这里抛错 ⇒ catch ⇒ dispose ⇒ `loginViaBrowser` 抛 ⇒ RPC 层
+    // `failLogin` ⇒ **占位账号被删**；而此时**窗口还开着**、用户完全可以
+    // 自己登录 ⇒ 用户看到「登录失败」却明明有个窗口在。
+    // ⇒ `ensureMagicrewLoginPage` 现在**自己**吞掉导航失败（只记 warn），
+    //    这里只保留一个**兜底 try**（防未来实现变回抛错时又删号）。
+    try {
+      await (deps.ensureLoginPage ?? ensureMagicrewLoginPage)(session, url, deps.log)
+    } catch (error) {
+      deps.log?.(`[magicrew] 登录页未自动打开，窗口仍开着可手动操作：${String(error)}`)
+    }
   } catch (error) {
     /**
      * ⚠️ 起不来时**必须** dispose：`launch()` 失败路径只 `kill()` 进程树，

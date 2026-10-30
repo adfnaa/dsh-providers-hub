@@ -6,7 +6,7 @@ import {
   fetchCodeArtsRemoteModels, readAgentCenterWindow,
   SNAP_AGENT_CENTER_DETAIL_URL, SNAP_AGENT_CENTER_USERAGENTS_URL, SNAP_MODEL_BUILTIN_URL,
 } from '../../src/models.js'
-import { canonicalQueryOf, signRequestHuawei } from '../../src/sign.js'
+import { canonicalQueryOf, isSignedQueryValueSafe, signRequestHuawei } from '../../src/sign.js'
 import type { CodeArtsCredential } from '../../src/types.js'
 
 function makeCredential(): CodeArtsCredential {
@@ -130,7 +130,13 @@ describe('AgentCenter 动态窗口合并', () => {
     const models = await fetchCodeArtsRemoteModels(makeCredential(), fetcher)
     const glm = models.find((m) => m.id === 'GLM-5.2')
     expect(glm?.contextWindow).toBe(202752)
-    expect(glm?.maxOutputTokens).toBe(65536)
+    // ⚠️ `maxOutputTokens` **刻意不再往 `RemoteModel` 上带**（2026-10-30 审计 P1-1 修）：
+    //    上游的「单次输出上限」经 `CatalogEntry.maxTokens` ⇒ `defaultMaxTokens`
+    //    ⇒ 会被宿主 `dsh-compaction-basic` 当成「输出侧预留」**从窗口里扣掉**
+    //    ⇒ GLM-5.2 压缩触发点 162,201 → 109,772（−32%）。
+    //    ⇒ 它**只**留在 AgentCenter 的原始响应里（`readAgentCenterWindow` 仍读它），
+    //    但**不**进入目录条目、**不**影响任何出站预算。
+    expect(glm?.maxOutputTokens).toBeUndefined()
     const kimi = models.find((m) => m.id === 'kimi-k3')
     expect(kimi?.contextWindow).toBe(1048576)
     expect(kimi?.name).toBe('Kimi K3')
@@ -144,6 +150,19 @@ describe('AgentCenter 动态窗口合并', () => {
     expect(detailCall?.url).toBe(`${SNAP_AGENT_CENTER_DETAIL_URL}?agent_id=agent-primary`)
   })
 
+  it('★★ AgentCenter 独有模型**只作窗口源、不进目录**（2026-10-30 审计 P1-2 修）', async () => {
+    // ⚠️ 动机：AgentCenter **不下发倍率** ⇒ 进目录就是裸名 ⇒
+    //    `priceFactorFromName('Kimi K3')` = `Infinity` ⇒ 聚合候选恒排最后、
+    //    永远不被挑中（静默）。与 `providers-accio.md` §7 同型。
+    const { fetcher } = makeFetcher(FULL_ROUTES)
+    const models = await fetchCodeArtsRemoteModels(makeCredential(), fetcher)
+    const kimi = models.find((m) => m.id === 'kimi-k3')
+    expect(kimi, 'kimi-k3 仍要出现在拉取结果里（窗口源）').toBeDefined()
+    expect(kimi?.windowOnly, '必须标记为「只作窗口源」').toBe(true)
+    // ⚠️ **目录里已有的模型不能被标成 windowOnly**（否则它会从目录消失）
+    expect(models.find((m) => m.id === 'GLM-5.2')?.windowOnly).toBeUndefined()
+  })
+
   it('signs agent-type / x-language (routing headers) into SignedHeaders', async () => {
     const { fetcher, calls } = makeFetcher(FULL_ROUTES)
     await fetchCodeArtsRemoteModels(makeCredential(), fetcher)
@@ -155,6 +174,53 @@ describe('AgentCenter 动态窗口合并', () => {
     expect(auth).toContain('agent-type;host;x-language;')
     expect(ua?.headers.get('agent-type')).toBe('AgentCenter')
     expect(ua?.headers.get('x-language')).toBe('zh-cn')
+  })
+
+  it('★★ **两次** AgentCenter 请求都带路由头（2026-10-30 审计 P2 D3 修）', async () => {
+    // ⚠️⚠️ 旧守卫只查 `useragents` 一步 ⇒ 变异「`detail` 那一步的
+    //    `signedExtras` → undefined」或「改走 unsigned 腿」**全绿**。
+    //    ⇒ 上游若按从严口径处理 detail ⇒ detail 恒 400 ⇒ **窗口恒空**
+    //    ⇒ 整个 PR 的核心功能**静默失效**（症状与「没接 AgentCenter」同形）。
+    //    ⇒ 判据必须是**普查**：两次请求都要带。
+    const { fetcher, calls } = makeFetcher(FULL_ROUTES)
+    await fetchCodeArtsRemoteModels(makeCredential(), fetcher)
+    const acCalls = calls.filter((c) => c.url.includes('/v1/agent-center/'))
+    expect(acCalls.length, '两步都要发').toBe(2)
+    for (const call of acCalls) {
+      const auth = call.headers.get('Authorization') ?? ''
+      expect(auth, `${call.url} 缺路由头签名`).toContain('agent-type;host;x-language;')
+      expect(call.headers.get('agent-type')).toBe('AgentCenter')
+      expect(call.headers.get('x-language')).toBe('zh-cn')
+    }
+  })
+
+  it('★★ query 值不在安全集 ⇒ **不发这个请求**（避免验签分叉）', async () => {
+    // ⚠️ `canonicalQueryOf` 的往返在安全集外可能与服务端口径分叉
+    //    （`+` 在表单语义下是空格、`&`/`=` 会被重编码）⇒ 静默 401。
+    //    ⇒ 宁可不发（退化到静态兜底表），也不要静默 401。
+    //
+    // ⚠️⚠️ **判据说明**（2026-10-30 修）：本仓**自己**构造的 URL 都是安全的
+    //    （`offset=0&limit=100` 字面量；`agent_id` 走 `encodeURIComponent`
+    //    ⇒ 往返幂等）⇒ 这道闸是**纯防御**，当前不拦任何真实请求。
+    //    ⇒ 故它的牙口在**直接测闸门本身**（下面这条），而不是指望某条
+    //    目录请求被拦下（那需要一个「上游给出带 `+` 的 agent_id」的构造，
+    //    而 `encodeURIComponent` 已经把它变成了 `%2B` ⇒ 拦不到）。
+    expect(isSignedQueryValueSafe('https://x/y?offset=0&limit=100')).toBe(true)
+    // ⚠️ **已百分号编码**的字符是**安全**的（往返幂等，实测逐个核对）
+    expect(isSignedQueryValueSafe('https://x/y?agent_id=a%2Bb')).toBe(true)
+    expect(isSignedQueryValueSafe('https://x/y?q=a%20b')).toBe(true)
+    // ⚠️ 危险形态：**裸** `+`（表单语义下是空格）、裸空格、裸 `%`
+    expect(isSignedQueryValueSafe('https://x/y?q=a+b')).toBe(false)
+    expect(isSignedQueryValueSafe('https://x/y?q=a b')).toBe(false)
+    expect(isSignedQueryValueSafe('https://x/y?q=a%b')).toBe(false)
+    // ⚠️ **键**也要查（键同样参与 canonical 的编码往返）
+    expect(isSignedQueryValueSafe('https://x/y?a+b=1')).toBe(false)
+    // ⚠️ 值里的裸 `&`/`=` **不会**进 value（`&` 是分隔符、`=` 只切第一处）
+    //    ⇒ 这样的 query 反而**安全**（两侧口径一致）
+    expect(isSignedQueryValueSafe('https://x/y?q=a&b=c')).toBe(true)
+    // 无 query ⇒ 安全
+    expect(isSignedQueryValueSafe('https://x/y')).toBe(true)
+    expect(isSignedQueryValueSafe('https://x/y?')).toBe(true)
   })
 
   it('AgentCenter failure degrades to no windows without blocking the catalog', async () => {

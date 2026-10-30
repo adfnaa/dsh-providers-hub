@@ -16,9 +16,9 @@
  *   （签发 `mgw_` key 那一步，**永远不打** `i-magic-service.letsmagic.cn`）。
  */
 
-import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 
 import { Context } from '@deepseek-ai/cordis'
 import { describe, expect, it, vi } from 'vitest'
@@ -35,6 +35,7 @@ import {
 } from '../../src/magicrew-local-browser.js'
 import { MAGICREW, MAGICREW_GATEWAY_TOKENS_PATH } from '../../src/magicrew-product.js'
 import type { MagicrewProduct } from '../../src/magicrew-product.js'
+import { registeredBrowserUserDataRoots } from '../../src/chromium-session.js'
 import { MAGICREW_PROFILE_PATH, type MagicrewProfile } from '../../src/magicrew-profile.js'
 import { MagicrewService } from '../../src/magicrew.js'
 
@@ -262,6 +263,87 @@ describe('magicrewBrowserRoots / leveldbTextFor', () => {
       expect(magicrewBrowserRoots()).toContainEqual({ browser: 'Chrome 便携版', root })
     } finally {
       vi.unstubAllEnvs()
+    }
+  })
+
+  it('★ 环境变量**带空格**也要 trim（否则拼出带空格的路径 ⇒ 读不到）', () => {
+    // ⚠️ 旧实现用 `process.env.X?.trim()` 判空但**拼接时用原值**
+    //    ⇒ `MAGICREW_CHROME_USER_DATA='  D:\x  '` 会拼出带空格的路径。
+    const root = join(tmpdir(), 'portable-chrome-user-data-trim')
+    vi.stubEnv('MAGICREW_CHROME_USER_DATA', `  ${root}  `)
+    try {
+      const roots = magicrewBrowserRoots()
+      expect(roots).toContainEqual({ browser: 'Chrome 便携版', root })
+      // ⚠️ 反向对照：**不得**出现带空格的形态
+      expect(roots.map((entry) => entry.root)).not.toContain(`  ${root}  `)
+    } finally {
+      vi.unstubAllEnvs()
+    }
+  })
+
+  it('★ 环境变量**为空串/纯空格** ⇒ 不产生候选', () => {
+    for (const value of ['', '   ']) {
+      vi.stubEnv('MAGICREW_CHROME_USER_DATA', value)
+      try {
+        expect(magicrewBrowserRoots().map((e) => e.browser))
+          .not.toContain('Chrome 便携版')
+      } finally {
+        vi.unstubAllEnvs()
+      }
+    }
+  })
+
+  it('★★ 便携版的 `<install>/Data` 必须是候选根（2026-10-30 审计 P1 D-03 修）', () => {
+    // ⚠️⚠️ **这是 PR !162 的核心修复**，而旧守卫**零覆盖**
+    //    （删掉 `join(install,'Data')` ⇒ 146 条全绿）。
+    // ⇒ 这里**直接测 `registeredBrowserUserDataRoots`**：
+    //    造一个「便携版布局」的真实目录树，断言它被认出来。
+    const dir = mkdtempSync(join(tmpdir(), 'portable-layout-'))
+    try {
+      // ⚠️ 布局 A：`<install>/App/chrome.exe` + `<install>/Data/Default/...`
+      const install = join(dir, 'Chrome')
+      const exe = join(install, 'App', 'chrome.exe')
+      mkdirSync(dirname(exe), { recursive: true })
+      writeFileSync(exe, '')
+      mkdirSync(join(install, 'Data', 'Default'), { recursive: true })
+
+      const roots = registeredBrowserUserDataRoots([exe])
+      expect(roots, '便携版的 Data 根必须被认出来').toContain(join(install, 'Data'))
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('★★ 布局 B：`<install>/chrome.exe`（exe 直接在安装根）也要认出来（2026-10-30 审计 P0 D-02 修）', () => {
+    // ⚠️ 旧实现用 `dirname(dirname(exe))` **硬编码两级** ⇒ 布局 B 会**高一级**
+    //    ⇒ 拼出 `<父级>/Data` ⇒ 永远读不到。
+    const dir = mkdtempSync(join(tmpdir(), 'portable-layout-b-'))
+    try {
+      const install = join(dir, 'Chrome')
+      const exe = join(install, 'chrome.exe')
+      mkdirSync(install, { recursive: true })
+      writeFileSync(exe, '')
+      mkdirSync(join(install, 'Data', 'Default'), { recursive: true })
+
+      const roots = registeredBrowserUserDataRoots([exe])
+      expect(roots, '布局 B 的 Data 根必须被认出来').toContain(join(install, 'Data'))
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('★★ 目录**不存在** ⇒ 不产生候选（存在性过滤，2026-10-30 审计 P2-1 修）', () => {
+    // ⚠️ 标准安装会推出 `C:\Program Files\Google\Data` 这种垃圾路径 ⇒
+    //    存在性过滤把它筛掉（否则污染目录列表 + 扫无关目录的 localStorage）。
+    const dir = mkdtempSync(join(tmpdir(), 'portable-nodata-'))
+    try {
+      const exe = join(dir, 'App', 'chrome.exe')
+      mkdirSync(dirname(exe), { recursive: true })
+      writeFileSync(exe, '')
+      // ⚠️ **没有** `Data`、也没有 `User Data` ⇒ 不该有任何根
+      expect(registeredBrowserUserDataRoots([exe])).toEqual([])
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
     }
   })
 

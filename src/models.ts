@@ -1,5 +1,5 @@
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
-import { signRequestHuawei } from './sign.js'
+import { isSignedQueryValueSafe, signRequestHuawei } from './sign.js'
 import type { CodeArtsCredential } from './types.js'
 
 /**
@@ -99,6 +99,30 @@ export interface RemoteModel {
   contextWindow?: number
   /** 单次输出上限（tokens），来源与 `contextWindow` 同（AgentCenter `max_tokens`）。 */
   maxOutputTokens?: number
+  /**
+   * ⚠️⚠️ **只作窗口源、刻意不进目录**（2026-10-30 四路审计 P1-2 定案）。
+   *
+   * AgentCenter 有、而 builtin / gateway-config 目录里没有的 id（实测 `kimi-k3`）
+   * **只提供窗口**，**不作为目录条目**。理由两条：
+   *
+   * 1. **倍率必然缺失** ⇒ 违反本仓红线「倍率必须进 name」
+   *    （`src/llm-adapter.ts` 的 `toCatalogEntry` 注释逐字：「倍率**必须**拼进
+   *    `name`（与 officeace / buddy / loomy / raccoon 同款）」）。AgentCenter 的
+   *    `model_parameters` **只有** `context_window` / `max_tokens` /
+   *    `supports_images`，**没有倍率** ⇒ 进目录后 `name` 是裸名 ⇒
+   *    `src/aggregate-core.ts` 的 `priceFactorFromName('Kimi K3')` = **`Infinity`**
+   *    ⇒ `rankCandidates` 的第三判据「同临期档内倍率升序」**恒挑不到它**
+   *    ⇒ codearts 在聚合轮换列表里**永远排在最后**（静默）。
+   *    这与 `docs/agent-notes/providers-accio.md` §7 记的「`CANONICAL_OVERRIDES`
+   *    漏登记 ⇒ 拆分孤例 ⇒ 轮换列表看不到它」**完全同型**。
+   * 2. 用户可见的一致性：同一渠道其它模型显示 `GLM-5.2 · x0.7`，这一条显示裸名
+   *    ⇒ 用户会以为它免费/无倍率信息。
+   *
+   * ⇒ 这些 id **仍然能被正确解析**：`unknownModelContextWindow` 查的是
+   * **独立的窗口表**（`src/llm-adapter.ts` 的 `remoteContextWindows`），与
+   * 「目录可见性」解耦 ⇒ 手填 id 时分母仍取 AgentCenter 的权威值。
+   */
+  windowOnly?: boolean
 }
 
 /**
@@ -352,6 +376,20 @@ async function fetchSignedGet(
    */
   extraSignedHeaders?: Readonly<Record<string, string>>,
 ): Promise<string | undefined> {
+  // ⚠️⚠️ **query 值必须落在安全集内**，否则**不发这个请求**（2026-10-30 审计 P2 D1）。
+  //
+  //    `canonicalQueryOf` 的往返（decode → encode）在安全集外**可能与服务端口径
+  //    分叉**（`+` 在表单语义下是空格、`&`/`=` 会被重编码）⇒ 服务端按自己收到
+  //    的参数重算 canonical 时算出**另一个值** ⇒ `401 verify ak sk signature fail`。
+  //
+  //    ⇒ 与其静默 401（症状是「目录拿不到窗口 ⇒ 分母退化」，与「上游没这模型」
+  //    **同形**，极难定位），不如**当场不发**并留一条脱敏日志。
+  //    ⚠️ 现网全部 query 值都在安全集内（uuid、模型 id、`msg`、`DESKTOP`、数字）
+  //    ⇒ 这道闸**当前不会拦掉任何真实请求**（它只拦「上游改口径」这种情况）。
+  if (!isSignedQueryValueSafe(url)) {
+    console.warn('[codearts] 已跳过一个 query 值不在安全集内的签名请求（避免验签分叉）')
+    return undefined
+  }
   const signed = await signRequestHuawei(ak, sk, st, 'GET', url, new Uint8Array(), extraSignedHeaders)
   const headers = new Headers()
   signed.forEach((v, k) => {
@@ -578,11 +616,12 @@ export async function fetchCodeArtsRemoteModels(
    * 失败静默（fetchSignedGet 内已 catch），无日志面。
    *
    * 合并规则：
-   * - 目录已有该 id → **补** `contextWindow`/`maxOutputTokens`（目录端点不下发，
-   *   不存在冲突，无需「远端优先」判据）；
-   * - AgentCenter 有、目录没有的 id → **补进目录**（带窗口才收；同样过 VL 过滤，
-   *   与 `parseModelInfo` 同一判据）—— 实测 builtin 就漏过 `kimi-k3`（IDE 已
-   *   下发、builtin 无），AgentCenter 有它的窗口，这条腿能把它救回目录。
+   * - 目录已有该 id → **补** `contextWindow`（目录端点不下发，不存在冲突，
+   *   无需「远端优先」判据）；
+   * - AgentCenter 有、目录没有的 id → **只作窗口源**（`windowOnly: true`），
+   *   **不进目录**（2026-10-30 审计 P1-2 修：AgentCenter 不下发倍率 ⇒ 进目录
+   *   就是裸名 ⇒ `priceFactorFromName` 恒 `Infinity` ⇒ 聚合里永远排最后；
+   *   详见 `RemoteModel.windowOnly` 的注释）。
    */
   const agentCenterWindows = await fetchAgentCenterWindows(fetcher, ak, sk, st)
   if (agentCenterWindows.size > 0) {
@@ -590,19 +629,32 @@ export async function fetchCodeArtsRemoteModels(
       const w = agentCenterWindows.get(model.id)
       if (w === undefined) continue
       model.contextWindow = w.contextWindow
-      if (w.maxOutputTokens !== undefined) model.maxOutputTokens = w.maxOutputTokens
     }
     for (const [id, w] of agentCenterWindows) {
       if (seen.has(id)) continue
-      if (id.includes('-VL-') || id.endsWith('-VL')) continue
+      // ⚠️ VL 过滤与目录层同口径（**大小写不敏感**）：`src/llm-adapter.ts` 的
+      //    `catalogEntries` 用 `/-VL-/i` 与 `/-VL$/i`，而旧实现这里是
+      //    **大小写敏感**（`includes('-VL-')`）⇒ 小写 `-vl` 的 id 会被这里收下、
+      //    再被目录层滤掉 ⇒ 落进 `remoteModels` 与磁盘缓存却**永不可见**
+      //    （2026-10-30 审计 P3-1）。
+      if (/-VL-/i.test(id) || /-VL$/i.test(id)) continue
+      // ⚠️ **窗口源，不是目录条目**（见 `RemoteModel.windowOnly` 的注释）。
+      //    `name` 仍取 `model_alias`（供诊断/展示用），但它**不会**进目录
+      //    ⇒ 不会触发「倍率缺失 ⇒ Infinity」。
       models.push({
         id,
         name: w.name ?? id,
         contextWindow: w.contextWindow,
-        ...(w.maxOutputTokens !== undefined ? { maxOutputTokens: w.maxOutputTokens } : {}),
+        windowOnly: true,
       })
       seen.add(id)
     }
+  } else {
+    // ⚠️ **失败要留痕**（2026-10-30 审计 P3 D8）：静默 ⇒ 「窗口长期退化」与
+    //    「上游把窗口改小了」同形且零日志。脱敏：不含任何凭据。
+    console.warn(
+      '[codearts] AgentCenter 动态窗口不可用，窗口分母将退化到静态兜底表（目录本身不受影响）',
+    )
   }
 
   /**

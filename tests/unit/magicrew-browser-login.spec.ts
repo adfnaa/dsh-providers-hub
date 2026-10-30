@@ -259,15 +259,22 @@ describe('startMagicrewBrowserLogin', () => {
 })
 
 describe('ensureMagicrewLoginPage', () => {
-  function fakeCdp(initialUrl: string) {
+  function fakeCdp(initialUrl: string, opts?: { pages?: Array<{ type?: string, targetId: string, url: string }>, navigateError?: string }) {
     const calls: { method: string, params: Record<string, unknown>, sessionId?: string }[] = []
     const cdp = {
       send: async (method: string, params: Record<string, unknown>, _timeout?: number, sessionId?: string) => {
         calls.push({ method, params, sessionId })
         if (method === 'Target.getTargets') {
-          return { targetInfos: [{ type: 'page', targetId: 'page-1', url: initialUrl }] }
+          // ⚠️ **必须带 `type: 'page'`** —— 真实 CDP 的 `targetInfos[].type`
+          //    是必填字段（实现侧按它过滤）。
+          return {
+            targetInfos: opts?.pages ?? [{ type: 'page', targetId: 'page-1', url: initialUrl }],
+          }
         }
         if (method === 'Target.attachToTarget') return { sessionId: 'session-1' }
+        if (method === 'Page.navigate') {
+          return opts?.navigateError === undefined ? {} : { errorText: opts.navigateError }
+        }
         return {}
       },
     }
@@ -292,6 +299,87 @@ describe('ensureMagicrewLoginPage', () => {
     const { cdp, calls } = fakeCdp(`${ORIGIN_CN}/login`)
     await ensureMagicrewLoginPage({ cdp }, `${ORIGIN_CN}/login`)
     expect(calls.some((call) => call.method === 'Page.navigate')).toBe(false)
+  })
+
+  it('★★ `chrome://newtab/` 也算空白页 ⇒ 要导航（2026-10-30 审计 P1 D-05 修）', async () => {
+    // ⚠️ 实测 `new URL('chrome://newtab/').hostname` = `'newtab'`（**非空**）⇒
+    //    旧实现只认 `about:blank` ⇒ newtab 落到 `pages[0]` 兜底。
+    const { cdp, calls } = fakeCdp('chrome://newtab/')
+    await ensureMagicrewLoginPage({ cdp }, `${ORIGIN_CN}/login`)
+    expect(calls.find((call) => call.method === 'Page.navigate')).toMatchObject({
+      params: { url: `${ORIGIN_CN}/login` },
+    })
+  })
+
+  it('★★ **不得**抢走用户正在看的标签页（2026-10-30 审计 P1 D-05 修）', async () => {
+    // ⚠️ 旧实现是 `pages.find(about:blank) ?? pages[0]` ⇒ **没有空白页时**
+    //    它会导航 `pages[0]`（用户正在看的页面！）⇒ 用户的标签页被冲掉。
+    // ⇒ 现在：**只**导航空白页；没有空白页就**不导航**。
+    const { cdp, calls } = fakeCdp('https://example.com/somewhere', {
+      pages: [
+        { type: 'page', targetId: 'user-page', url: 'https://example.com/somewhere' },
+        { type: 'page', targetId: 'blank-page', url: 'about:blank' },
+      ] as Array<{ type: string, targetId: string, url: string }>,
+    })
+    await ensureMagicrewLoginPage({ cdp }, `${ORIGIN_CN}/login`)
+    // ⚠️ 导航的必须是**空白页**，不是用户的页面
+    expect(calls.find((call) => call.method === 'Target.attachToTarget')?.params.targetId)
+      .toBe('blank-page')
+  })
+
+  it('★★ 没有空白页 ⇒ **不导航**（不抢用户标签页）', async () => {
+    const { cdp, calls } = fakeCdp('https://example.com/somewhere', {
+      pages: [
+        { type: 'page', targetId: 'user-page', url: 'https://example.com/somewhere' },
+      ] as Array<{ type: string, targetId: string, url: string }>,
+    })
+    await ensureMagicrewLoginPage({ cdp }, `${ORIGIN_CN}/login`)
+    expect(calls.some((call) => call.method === 'Page.navigate')).toBe(false)
+    expect(calls.some((call) => call.method === 'Target.attachToTarget')).toBe(false)
+  })
+
+  it('★★ 导航失败**不抛**（2026-10-30 审计 P1 D-06 修：窗口还开着，用户可自己登录）', async () => {
+    // ⚠️ 旧实现抛错 ⇒ 冒泡 ⇒ `failLogin` ⇒ **占位账号被删**。
+    const { cdp } = fakeCdp('about:blank', { navigateError: 'net::ERR_NAME_NOT_RESOLVED' })
+    const logs: string[] = []
+    await expect(ensureMagicrewLoginPage({ cdp }, `${ORIGIN_CN}/login`, (m) => logs.push(m)))
+      .resolves.toBeUndefined()
+    // ⚠️ 失败要**留痕**（否则用户与下次报障都看不到线索）
+    expect(logs.join('\n')).toContain('net::ERR_NAME_NOT_RESOLVED')
+  })
+
+  it('★ `Target.getTargets` 抛错 ⇒ **不抛**（同上一条）', async () => {
+    const cdp = {
+      send: async (method: string): Promise<unknown> => {
+        if (method === 'Target.getTargets') throw new Error('CDP Target.getTargets 超时（3000ms）')
+        return {}
+      },
+    }
+    await expect(ensureMagicrewLoginPage({ cdp }, `${ORIGIN_CN}/login`)).resolves.toBeUndefined()
+  })
+
+  it('★ `cdp === undefined` 仍**抛**（通道压根没就绪 ⇒ 连窗口都不成立）', async () => {
+    await expect(ensureMagicrewLoginPage({ cdp: undefined }, `${ORIGIN_CN}/login`))
+      .rejects.toThrow(/调试通道未就绪/)
+  })
+
+  it('★★ **接线点**必须真的调用 `ensureMagicrewLoginPage`（2026-10-30 审计 M10 修）', () => {
+    // ⚠️⚠️ 旧守卫只测**函数本身**，**不测接线** ⇒ 变异「删掉
+    //    `createChromiumMagicrewLogin` 里那一行调用」⇒ **69 条全绿** ⇒
+    //    「about:blank ⇒ 主动导航」这条核心声称在**接线上零保护**。
+    // ⇒ 这里守**源码接线点**（真起浏览器不许 ⇒ 只能源码级）。
+    //
+    // ⚠️⚠️ 源码级断言的已知弱点是 `if (false)` 短路禁用 ⇒ 下面**额外**断言
+    //    「调用点不在任何假分支里」。
+    const here = dirname(fileURLToPath(import.meta.url))
+    const source = readFileSync(resolve(here, '../../src/magicrew-browser-login.ts'), 'utf8')
+    // ⚠️ 断言：**调用点**（`await (…)`）在 `session.start()` 之后的 try 块里。
+    //    ⚠️ 必须匹配「调用形态」而不是函数名 —— 匹配函数名会命中
+    //    `deps.ensureLoginPage?: typeof ensureMagicrewLoginPage` 这类**类型标注**
+    //    ⇒ 变异「删掉调用点」仍然全绿（**假绿**，本轮实测踩到）。
+    expect(source).toMatch(/await session\.start\(\)[\s\S]{0,400}?await \(deps\.ensureLoginPage/)
+    // ⚠️ 反向对照：**不得**有 `if (false)` 之类的死分支包住它。
+    expect(source).not.toMatch(/if \(false\)[\s\S]{0,200}?ensureMagicrewLoginPage/)
   })
 })
 

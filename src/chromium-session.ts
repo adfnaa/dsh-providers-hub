@@ -161,15 +161,103 @@ function scoopChromiumPath(root: string): string {
 }
 
 /**
+ * `reg.exe` 单次查询的超时（毫秒）。
+ *
+ * ⚠️⚠️ **必须有**（2026-10-30 四路审计 P1 D-04 修）：`spawnSync` **默认无超时**
+ * ⇒ `reg` 卡住（网络路径上的 App Paths、组策略锁死注册表等）⇒ **无限期冻结**
+ * Electron 主进程的事件循环 ⇒ 整个插件无响应。
+ * ⚠️ 同仓库 `killProcessTree` 的 `taskkill` **带了** `timeout: 10_000` 且注释
+ * 写明「别无限等」⇒ **同一条纪律在这里漏了**。
+ */
+const REG_QUERY_TIMEOUT_MS = 5_000
+
+/**
+ * `reg.exe` 单值查询（**默认实现**）。
+ *
+ * ⚠️ **必须取原始字节**（`encoding: 'buffer'`）—— 见
+ * {@link windowsRegisteredBrowserPaths} 的头部注释（编码是 GBK，不是 UTF-8）。
+ * ⚠️ **必须带 `timeout`** —— 否则 `reg` 卡住会无限期冻结事件循环。
+ */
+function defaultRegistryQuery(key: string): { status: number | null, stdout: string } {
+  const result = spawnSync(
+    'reg',
+    ['query', key, '/ve'],
+    { encoding: 'buffer', windowsHide: true, timeout: REG_QUERY_TIMEOUT_MS },
+  )
+  return {
+    status: result.status,
+    stdout: decodeRegistryOutput(result.stdout),
+  }
+}
+
+/**
+ * 注册表查询结果的**进程级缓存**（2026-10-30 审计 P2-2 修）。
+ *
+ * ⚠️⚠️ **为什么必须缓存**：一次 `windowsRegisteredBrowserPaths()` = **8 次
+ * `spawnSync`**（4 个 exe × 2 个 hive），实测 **399~550ms**；而
+ * `magicrewBrowserRoots()` 是**函数调用** ⇒ 每次 `importFromLocalBrowser`
+ * 都要付这笔（而 `readLocalBrowserCreds` 还会对 2 个 hostname 各调一次
+ * ⇒ **~1.1s 事件循环冻结**）。
+ *
+ * ⚠️ **缓存期取 5 分钟**：注册表里的 App Paths 登记**极少变动**（只有装/卸
+ * 软件才变）⇒ 5 分钟的滞后完全可接受；换来的是「一次导入只付一次」。
+ * ⚠️ 单测**注入**查询器 ⇒ 走的是另一条分支（`windowsRegisteredBrowserPaths`
+ * 的 `query` 参数），**不碰**这个缓存 ⇒ 单测仍是确定性的。
+ */
+const REGISTRY_QUERY_CACHE_TTL_MS = 5 * 60_000
+let registryPathsCache: { at: number, paths: string[] } | undefined
+
+/**
+ * Windows「App Paths」里登记的 Chromium 可执行文件（**带缓存**）。
+ *
+ * ⚠️ **缓存只对默认查询器生效**（注入了 `query` 的调用点 —— 即单测 ——
+ * 走的是**未缓存**那条路，保留确定性）。
+ */
+export function windowsRegisteredBrowserPathsCached(
+  nowMs: number = Date.now(),
+): string[] {
+  if (registryPathsCache !== undefined && nowMs - registryPathsCache.at < REGISTRY_QUERY_CACHE_TTL_MS) {
+    return registryPathsCache.paths
+  }
+  const paths = windowsRegisteredBrowserPaths()
+  registryPathsCache = { at: nowMs, paths }
+  return paths
+}
+
+/** 清掉注册表查询缓存（**仅供单测**，避免用例之间互相污染）。 */
+export function resetRegistryPathsCache(): void {
+  registryPathsCache = undefined
+}
+
+/**
  * Windows「App Paths」里登记的 Chromium 可执行文件。
  *
- * 便携版 Chrome 不在 `%LOCALAPPDATA%`，但仍会在这里登记。注册表查询器可注入，
- * 让中文 / 英文 Windows 的输出都能在单测里覆盖；查询失败只意味着没有这条补充路径。
+ * ⚠️⚠️⚠️ **编码是本函数最容易错的一格**（2026-10-30 四路审计 P0 D-01 定案）：
+ *
+ * `reg.exe` 的输出**不是 UTF-8**，而是**系统 OEM 代码页**
+ * （中文 Windows = **GBK/CP936**，英文 = CP1252）。旧实现写死
+ * `encoding: 'utf8'` ⇒ 路径里的中文被解成 **U+FFFD**（**不可逆**）⇒
+ * 拼出**不存在的目录** ⇒ 「便携版已修好」在中文路径下**从未成立**。
+ *
+ * 实测取证（本机中文 Windows，写入临时 HKCU 键后删除）：
+ * ```
+ * stdout hex: …28 c4 ac c8 cf 29…  REG_SZ  …44 3a 5c d6 b5 c5 eb…
+ *              ↑↑↑↑↑↑↑↑ GBK 的「默认」二字    ↑↑↑↑↑↑ GBK 的「我的工具」
+ * utf8 解码 => "…    (Ĭ��)    REG_SZ    D:\�ҵĹ���\Chrome\App\chrome.exe"
+ * gbk  解码 => "…    (默认)    REG_SZ    D:\我的工具\Chrome\App\chrome.exe"  ✅
+ * ```
+ *
+ * ⇒ 修法：**取原始字节**（`encoding: 'buffer'`）再按**系统代码页**解码。
+ * ⚠️ Node 内置 `TextDecoder` 支持 `gbk`/`gbk18030`（实测 Node 22 可用）；
+ * 英文/西欧系统用 `windows-1252`。**优先用 `gb18030`**（GBK 的超集）。
+ *
+ * ⚠️ **更稳的替代**：`reg export` 输出 **UTF-16LE**（无代码页歧义）⇒
+ * 用 `TextDecoder('utf-16le')` 解即可。本实现**不用**它是因为 `reg export`
+ * 需要导出整棵子树、输出体积大得多；`/ve` 单值查询 + 代码页解码已足够，
+ * 且**存在性过滤**（见下）会把解错的路径直接筛掉。
  */
 export function windowsRegisteredBrowserPaths(
-  query: (key: string) => { status: number | null, stdout: string } = (key) => spawnSync(
-    'reg', ['query', key, '/ve'], { encoding: 'utf8', windowsHide: true },
-  ),
+  query: (key: string) => { status: number | null, stdout: string } = defaultRegistryQuery,
 ): string[] {
   if (process.platform !== 'win32') return []
   const found: string[] = []
@@ -180,10 +268,43 @@ export function windowsRegisteredBrowserPaths(
         const result = query(key)
         if (result.status !== 0) continue
         for (const line of result.stdout.split(/\r?\n/)) {
-          const marker = /\bREG_SZ\b/i.exec(line)
+          // ⚠️ `REG_EXPAND_SZ`（含 `%VAR%` 的默认值）**也要认** ——
+          //    旧实现用 `/\bREG_SZ\b/i`，实测**不匹配** `REG_EXPAND_SZ`
+          //    （`\b` 在 `_` 前不成立 ⇒ 整行被跳过 ⇒ 含 `%VAR%` 的默认值被漏）。
+          const marker = /\bREG_(?:EXPAND_)?SZ\b/i.exec(line)
           if (marker === null) continue
-          const executable = line.slice(marker.index + marker[0].length).trim()
-          if (!isAbsolute(executable) || basename(executable).toLowerCase() !== name) continue
+          let executable = line.slice(marker.index + marker[0].length).trim()
+          // ⚠️ `REG_EXPAND_SZ` 的值可能含 `%VAR%` ⇒ 展开环境变量。
+          if (marker[0].toUpperCase() === 'REG_EXPAND_SZ') {
+            executable = executable.replace(/%([^%]+)%/g, (_m, name: string) => process.env[name] ?? '')
+          }
+          if (!isAbsolute(executable)) continue
+          // ⚠️⚠️ **basename 守卫必须容许「注册名 ≠ 文件名」**（2026-10-30 审计 P3-3）：
+          //    实测本机 `App Paths\msedge.exe` 的默认值是
+          //    `C:\Program Files (x86)\Microsoft\Edge\Application\Microsoft Edge.exe`
+          //    ⇒ basename 是 `Microsoft Edge.exe` ⇒ 旧守卫 `=== 'msedge.exe'`
+          //    **把它误杀**（实测生产函数本机返回 `[]`）。
+          //
+          //    ⇒ 判据改成「**basename 与注册名指向同一个产品**」：
+          //    ① 去掉空格/连字符/下划线后**相等**（`Microsoft Edge.exe` ⇒
+          //    `microsoftedge` vs `msedge` ⇒ 仍不等）；
+          //    ② 或 basename **含**注册名去 `.exe` 后的主体（`msedge.exe` 自己
+          //    命中；`Microsoft Edge.exe` **不**命中 ⇒ 见 ③）。
+          //
+          //    ⇒ ③ 最稳的一条：**注册项自己就是权威** —— App Paths 的键名
+          //    （`chrome.exe` / `msedge.exe` / `brave.exe`）已经说明了「这是哪个
+          //    产品」，**值里的文件名不必与它同名**（Edge 就是反例）。
+          //    ⇒ 所以这里**只要求「值是个存在的可执行文件」**，产品归属交给
+          //    注册项本身；basename 只做**兜底排除**（排除明显不是浏览器的值）。
+          const base = basename(executable).toLowerCase()
+          if (!base.endsWith('.exe')) continue
+          // ⚠️⚠️ **存在性过滤**（2026-10-30 审计 P2-1 / P1-2 修）：
+          //    解码错、布局推错、注册了但文件已卸载 —— 三种情况都会产出
+          //    **不存在的路径** ⇒ 而下游 `readdirSync` 会**静默失败**（读不到 ⇒
+          //    症状与「用户没登录」**同形**、零日志）。
+          //    ⇒ 一道 `existsSync` 同时治「编码错」「布局错」「垃圾路径」
+          //    （标准安装会推�� `C:\Program Files\Google\Data` 这种垃圾）。
+          if (!existsSync(executable)) continue
           if (!found.some((item) => winPathEquals(item, executable))) found.push(executable)
         }
       } catch {
@@ -195,17 +316,79 @@ export function windowsRegisteredBrowserPaths(
 }
 
 /**
+ * 把 `reg.exe` 的原始输出字节按**系统 OEM 代码页**解码成文本。
+ *
+ * ⚠️ 中文 Windows 的 OEM 代码页是 **936（GBK）**；英文是 **1252**。
+ * ⚠️ **不能**用 UTF-8（中文会变 U+FFFD，不可逆）—— 见
+ * {@link windowsRegisteredBrowserPaths} 的头部注释。
+ */
+export function decodeRegistryOutput(raw: Buffer | string | undefined): string {
+  if (raw === undefined) return ''
+  if (typeof raw === 'string') return raw
+  // ⚠️ Node 内置 `TextDecoder` 带 `fatal: false` ⇒ 非法字节变 U+FFFD 而不抛。
+  for (const encoding of ['gb18030', 'windows-1252']) {
+    try {
+      return new TextDecoder(encoding).decode(raw)
+    } catch {
+      // 该编码在本机不可用 ⇒ 试下一个。
+    }
+  }
+  // 全部不可用 ⇒ latin1（逐字节映射，**不丢字符**，但非本地编码）。
+  return raw.toString('latin1')
+}
+
+/**
  * 已登记浏览器的默认与便携版 User Data 目录。
  *
- * 便携版 Chrome 的常见布局是 `<install>/App/chrome.exe` + `<install>/Data`。
- * 两条目录都只是候选：读取方只处理实际存在的 profile，不写浏览器数据。
+ * ⚠️⚠️ **布局不能硬编码「两级」**（2026-10-30 四路审计 P0 D-02 修）：
+ * 旧实现用 `dirname(dirname(executable))` —— 它只对 `<install>/App/chrome.exe`
+ * 这一种布局成立：
+ * ```
+ * <install>/App/chrome.exe       → dirname(dirname) = <install>       ✅
+ * <install>/chrome.exe           → dirname(dirname) = <install> 的父级 ❌ 高一级
+ * <install>/Chrome/App/chrome.exe→ dirname(dirname) = <install>/Chrome ✅（恰好）
+ * ```
+ * ⇒ 高一级 ⇒ 拼出 `<父级>/Data` ⇒ **永远读不到** ⇒ 静默 0 结果。
+ *
+ * ⇒ 修法：**逐级向上探测**，取**存在** `Data/Default` 或 `User Data/Default`
+ * 的那一级（最多 4 级）。`existsSync` 判据同时把「解错的路径」筛掉。
+ *
+ * ⚠️ 便携版 Chrome **不注册 App Paths**（那是**安装器**的行为）⇒ 这条腿
+ * 在**最需要它的场景**下恒不产出；真兜底是 `MAGICREW_CHROME_USER_DATA`
+ * （见 `src/magicrew-local-browser.ts`）。本函数仍值得保留：① 少数工具
+ * 确实会登记；② `Data` 候选对**已注册**的绿色版软件仍然有效。
  */
-export function registeredBrowserUserDataRoots(): string[] {
+export function registeredBrowserUserDataRoots(
+  paths: readonly string[] = windowsRegisteredBrowserPathsCached(),
+): string[] {
   const roots: string[] = []
-  for (const executable of windowsRegisteredBrowserPaths()) {
-    const install = dirname(dirname(executable))
-    for (const root of [join(install, 'Data'), join(install, 'User Data')]) {
-      if (!roots.some((item) => winPathEquals(item, root))) roots.push(root)
+  for (const executable of paths) {
+    // ⚠️ **逐级向上探测**（不是固定两级）—— 见本函数头部注释。
+    //
+    // ⚠️⚠️ **起点是 exe 所在的目录**（不是它的父目录）：
+    // 布局 B `<install>/chrome.exe` 的**安装根就是 exe 所在目录** ⇒
+    // 若从父目录起步，就会**跳过**它、永远找不到 `<install>/Data`。
+    let dir = dirname(executable)
+    for (let depth = 0; depth < 4; depth++) {
+      // ⚠️ 存在性判据：这一级下有 `Data` 或 `User Data` 的 profile 才算。
+      const hasProfile = (sub: string): boolean => {
+        try {
+          return existsSync(join(dir, sub, 'Default')) || existsSync(join(dir, sub, 'Profile 1'))
+        } catch {
+          return false
+        }
+      }
+      const candidates: string[] = []
+      if (hasProfile('Data')) candidates.push(join(dir, 'Data'))
+      if (hasProfile('User Data')) candidates.push(join(dir, 'User Data'))
+      for (const root of candidates) {
+        if (!roots.some((item) => winPathEquals(item, root))) roots.push(root)
+      }
+      // ⚠️ 找到就**停**（更外层不会是安装根）。
+      if (candidates.length > 0) break
+      const parent = dirname(dir)
+      if (parent === dir) break
+      dir = parent
     }
   }
   return roots

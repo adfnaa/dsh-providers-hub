@@ -277,4 +277,93 @@ describe('上下文占用条的分母（contextWindow）', () => {
     const kimi = await adapterNoWin.resolveModel('codearts', 'kimi-k3')
     expect(kimi.context?.contextWindow).toBe(1_048_576)
   })
+
+  /**
+   * 守卫 ⑦：**刻意不声明 `defaultMaxTokens`**（2026-10-30 四路审计 P1-1 修）。
+   *
+   * ⚠️⚠️ **这条守的是一个「会导致整轮对话报废」的回归**：
+   *
+   *   DSH 的契约不是「上限」而是「**默认输出预算**」：
+   *   `dsh-llm` 把 `defaultMaxTokens` 注入 `config.maxTokens`
+   *   （`node_modules/@deepseek-ai/dsh-llm/lib/index.js:2183-2185`），
+   *   而 `dsh-compaction-basic` 的 `reservedCompletionTokens(agent,
+   *   defaultMaxTokens)`（`lib/index.js:757`）读的**正是同一个值** ——
+   *   它把该值当作「**输出侧预留**」**从上下文窗口里扣掉**。
+   *
+   *   ⇒ 落键的后果（宿主默认 thresholdRatio=0.8 / headroom=65536）：
+   *   GLM-5.2 压缩触发点 **162,201 → 109,772**、压力预算 **137,216 → 71,680**；
+   *   窗口 131,072 的模型配上 65536 的预留 ⇒ pressure=0 ⇒ 宿主**抛**
+   *   `TargetPressureConfigError`（**不是降级**）。
+   *
+   * ⚠️ `master` 的 `toCatalogEntry` **全文没有 `maxTokens` 键** ⇒ 改前
+   *   `defaultMaxTokens` 恒 undefined ⇒ 预留恒 0 ⇒ 上述回归是**新引入的**。
+   *
+   * ⚠️ 与本仓既有先例同口径：`src/opencode-adapter.ts:392-413` **刻意不声明**
+   *   `defaultMaxTokens`，理由逐字为「能力表里的 `limit.output` 是**模型单次
+   *   输出上限**，不是『合理的默认输出预算』……下发等于**我们替用户决定**
+   *   每轮按上限请求」。
+   *
+   * ⚠️ 判据要**双向**：既断言「不声明」，也断言「出站仍然发 65536」
+   *   （否则「把默认预算也删了」这种变异会全绿）。
+   */
+  it('⑦ 刻意不声明 defaultMaxTokens（否则它会变成宿主的上下文预留）', async () => {
+    const adapter = makeAdapter([
+      { id: 'GLM-5.2', name: 'GLM-5.2', contextWindow: 202_752, maxOutputTokens: 65_536 },
+    ])
+    const resolved = await adapter.resolveModel('codearts', 'GLM-5.2')
+    // ⚠️ **必须没有** `defaultMaxTokens` —— 它会被宿主当成「输出侧预留」扣掉。
+    expect((resolved as { defaultMaxTokens?: number }).defaultMaxTokens).toBeUndefined()
+  })
+
+  /**
+   * 守卫 ⑧：**动态窗口表与「目录可见性」解耦**（2026-10-30 四路审计 P3 D6 修）。
+   *
+   * ⚠️ 旧实现里动态窗口查的是 `remoteModels`，而
+   * `src/model-catalog.ts` 的 `unknownModelContextWindow` **只在
+   * `entry === undefined`（模型不在目录里）时**才被调 ⇒
+   * 「在 remoteModels 里」⟺「在目录里」⇒ **动态腿在「手填模型 id」场景
+   * 基本不可达**（实测唯一例外是 VL，而 VL 走 `analyzeImage` 那条路
+   * **根本不需要窗口** ⇒ 实际收益 ≈ 0）。
+   *
+   * ⇒ 修法：动态窗口收进**独立的表**（`remoteContextWindows`），
+   * 与目录可见性无关。
+   *
+   * ⚠️ 本用例的样本是 `windowOnly` 条目（AgentCenter 有、目录里没有的那个）⇒
+   *   它**在目录里不可见**，正是「目录外 id」这条路径的样本。
+   * ⚠️ 取值 777_777 刻意是静态表与兜底里**都不存在**的数（避免巧合相等）。
+   */
+  it('⑧ 手填「目录外但远端有窗口」的 id ⇒ 拿到动态值（动态腿真正可达）', async () => {
+    const adapter = makeAdapter([
+      { id: 'GLM-5.2', name: 'GLM-5.2', contextWindow: 202_752 },
+      { id: 'window-only-model', name: 'Window Only', contextWindow: 777_777, windowOnly: true },
+    ])
+    // ⚠️ 前置自证：它**不在目录里**（windowOnly ⇒ 只作窗口源）。
+    const listed = await adapter.listModels('codearts')
+    expect(listed.map((m) => m.id)).not.toContain('window-only-model')
+    // 但手填它时，分母必须取 AgentCenter 的动态值。
+    const resolved = await adapter.resolveModel('codearts', 'window-only-model')
+    expect(resolved.context?.contextWindow).toBe(777_777)
+  })
+
+  /**
+   * 守卫 ⑨：**窗口源条目不进目录**（2026-10-30 四路审计 P1-2 修）。
+   *
+   * ⚠️ AgentCenter **不下发倍率** ⇒ 这类条目进目录就是裸名 ⇒
+   *   `src/aggregate-core.ts` 的 `priceFactorFromName('…')` 恒 `Infinity`
+   *   ⇒ 聚合候选排序里**永远排最后、永不被挑中**（静默）。
+   *
+   * ⚠️ 判据是「目录里没有它」**且**「动态窗口仍可解析」⇒
+   *   删掉 `windowOnly` 过滤 ⇒ 前半条红；把窗口表也删了 ⇒ 后半条红。
+   */
+  it('⑨ 窗口源条目不进目录，但窗口仍可解析', async () => {
+    const adapter = makeAdapter([
+      { id: 'GLM-5.2', name: 'GLM-5.2', contextWindow: 202_752 },
+      { id: 'window-only-model', name: 'Window Only', contextWindow: 777_777, windowOnly: true },
+    ])
+    const listed = await adapter.listModels('codearts')
+    expect(listed.map((m) => m.id)).toContain('GLM-5.2')
+    expect(listed.map((m) => m.id)).not.toContain('window-only-model')
+    const resolved = await adapter.resolveModel('codearts', 'window-only-model')
+    expect(resolved.context?.contextWindow).toBe(777_777)
+  })
 })
