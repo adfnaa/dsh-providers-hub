@@ -248,8 +248,9 @@ export function resetRegistryPathsCache(): void {
  * ```
  *
  * ⇒ 修法：**取原始字节**（`encoding: 'buffer'`）再按**系统代码页**解码。
- * ⚠️ Node 内置 `TextDecoder` 支持 `gbk`/`gbk18030`（实测 Node 22 可用）；
- * 英文/西欧系统用 `windows-1252`。**优先用 `gb18030`**（GBK 的超集）。
+ * ⚠️ 代码页**必须按系统语言选**（见 {@link registryCodePage}）——
+ * **不能无条件先试 `gb18030`**（英文 Windows 上会把 1252 的字节解成别的字符）。
+ * ⚠️ Node 内置 `TextDecoder` 支持 `gb18030` / `windows-1252`（实测 Node 22 可用）。
  *
  * ⚠️ **更稳的替代**：`reg export` 输出 **UTF-16LE**（无代码页歧义）⇒
  * 用 `TextDecoder('utf-16le')` 解即可。本实现**不用**它是因为 `reg export`
@@ -316,25 +317,66 @@ export function windowsRegisteredBrowserPaths(
 }
 
 /**
+ * 本机 `reg.exe` 输出用的**代码页**（`'gb18030'` 或 `'windows-1252'`）。
+ *
+ * ⚠️⚠️⚠️ **不能无条件先试 `gb18030`**（2026-10-30 第二轮审计发现并修）：
+ * 两个解码器**都能解任何字节序列**（`fatal: false`）⇒ 「先试 gb18030」在
+ * **英文 Windows**（代码页 1252）上会把 1252 的字节解成**别的字符**：
+ * ```
+ * 路径 C:\Users\José\Chrome
+ *   gb18030    ⇒ "C:\Users\Jos閈\Chrome"   ← 错了
+ *   windows-1252 ⇒ "C:\Users\José\Chrome"  ✅
+ * ```
+ * ⇒ 在英文系统上，路径被解错 ⇒ **存在性过滤把它筛掉** ⇒ 整条注册表腿
+ * **静默失效**（比「解成 U+FFFD」更难发现，因为它至少还是有效文本）。
+ *
+ * ⇒ 修法：**按系统实际语言**选代码页。Windows 的 OEM 代码页跟随
+ * **系统 UI 语言**（中文版 = 936/GBK，英文版 = 1252），而 Node 能拿到
+ * 该语言：`Intl.DateTimeFormat().resolvedOptions().locale`。
+ *
+ * ⚠️ 判据取**语言**（`zh` / `ja` / `ko` 等 CJK 用 GBK 变体）而不是整个
+ * locale 字符串 —— `zh-CN` / `zh-TW` / `zh-HK` 的代码页不同，但它们
+ * **共用 GBK 家族**（GB18030 是 GBK/GB2312 的超集）⇒ 对路径解码够用。
+ */
+export function registryCodePage(locale?: string): 'gb18030' | 'windows-1252' {
+  let resolved = locale
+  if (resolved === undefined) {
+    try {
+      resolved = Intl.DateTimeFormat().resolvedOptions().locale ?? ''
+    } catch {
+      resolved = ''
+    }
+  }
+  // ⚠️ CJK（中文/日文/韩文）⇒ GBK 家族；其余 ⇒ 西欧 1252。
+  return /^zh|^ja|^ko/i.test(resolved) ? 'gb18030' : 'windows-1252'
+}
+
+/**
  * 把 `reg.exe` 的原始输出字节按**系统 OEM 代码页**解码成文本。
  *
  * ⚠️ 中文 Windows 的 OEM 代码页是 **936（GBK）**；英文是 **1252**。
  * ⚠️ **不能**用 UTF-8（中文会变 U+FFFD，不可逆）—— 见
  * {@link windowsRegisteredBrowserPaths} 的头部注释。
+ * ⚠️ **也不能**无条件先试 `gb18030`（英文系统上会解错）—— 见
+ * {@link registryCodePage}。
+ *
+ * @param raw - `reg.exe` 的原始输出字节（`encoding: 'buffer'` 拿到的）。
+ * @param encoding - 代码页（缺省按 {@link registryCodePage} 判定）。
  */
-export function decodeRegistryOutput(raw: Buffer | string | undefined): string {
+export function decodeRegistryOutput(
+  raw: Buffer | string | undefined,
+  encoding: 'gb18030' | 'windows-1252' = registryCodePage(),
+): string {
   if (raw === undefined) return ''
   if (typeof raw === 'string') return raw
   // ⚠️ Node 内置 `TextDecoder` 带 `fatal: false` ⇒ 非法字节变 U+FFFD 而不抛。
-  for (const encoding of ['gb18030', 'windows-1252']) {
-    try {
-      return new TextDecoder(encoding).decode(raw)
-    } catch {
-      // 该编码在本机不可用 ⇒ 试下一个。
-    }
+  try {
+    return new TextDecoder(encoding).decode(raw)
+  } catch {
+    // 该编码在本机不可用 ⇒ 退回 latin1（逐字节映射，**不丢字符**，但非本地编码）。
+    // ⚠️ 存在性过滤会把解错的路径筛掉 ⇒ 退化的表现是「找不到」，不是「乱路径」。
+    return raw.toString('latin1')
   }
-  // 全部不可用 ⇒ latin1（逐字节映射，**不丢字符**，但非本地编码）。
-  return raw.toString('latin1')
 }
 
 /**

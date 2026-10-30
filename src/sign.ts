@@ -79,7 +79,15 @@ function safeDecode(value: string): string {
  */
 export function isCanonicalQueryValueSafe(value: string): boolean {
   // 只允许：未编码的 ASCII 字母数字 + `_.-~`，或**已百分号编码**的 `%XX`。
-  return /^(?:[A-Za-z0-9_.~-]|%[0-9A-Fa-f]{2})*$/.test(value)
+  //
+  // ⚠️⚠️ **未编码字符集必须覆盖 `encodeURIComponent` 的「不编码集」**
+  // （2026-10-30 第二轮审计发现并修）：`encodeURIComponent` **不编码**
+  // `A-Z a-z 0-9 - _ . ! ~ * ' ( )` ⇒ 若安全集漏了其中任何一个 ⇒
+  // **本仓自己拼的 URL**（如 `queue/status?model=${encodeURIComponent(model)}`）
+  // 会被这道闸门**静默丢弃** ⇒ 用户手填一个带 `!` / `(` 的模型 id ⇒
+  // **排队状态查询永远失败**（而 chat 请求不走这道闸门 ⇒ 症状极隐蔽）。
+  // ⇒ 安全集 = `encodeURIComponent` 的**完整不编码集** + `%XX`。
+  return /^(?:[A-Za-z0-9_.!~*'()-]|%[0-9A-Fa-f]{2})*$/.test(value)
 }
 
 /**

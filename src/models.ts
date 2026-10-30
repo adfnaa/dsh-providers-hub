@@ -97,8 +97,22 @@ export interface RemoteModel {
    * 不看它）—— AgentCenter 失败只是窗口退化到静态表，目录本身仍完整。
    */
   contextWindow?: number
-  /** 单次输出上限（tokens），来源与 `contextWindow` 同（AgentCenter `max_tokens`）。 */
-  maxOutputTokens?: number
+  /**
+   * ⚠️⚠️ **刻意移除**（2026-10-30 第二轮审计 D-4 修）：AgentCenter 的
+   * `max_tokens`（单次输出上限）**不再**进 `RemoteModel`。
+   *
+   * 原因：它唯一的去处是 `CatalogEntry.maxTokens` ⇒ `defaultMaxTokens` ⇒
+   * 宿主 `dsh-compaction-basic` 的 `reservedCompletionTokens` 把它**从上下文
+   * 窗口里扣掉**（压缩触发点 162,201→109,772；窗口 131,072 的模型 ⇒ 宿主
+   * **抛** `TargetPressureConfigError`）⇒ 那是**错的语义**（「上限」被当成
+   * 「默认输出预算」+「上下文预留」）。
+   *
+   * ⚠️ **保留它作为死字段是有害的**：它会被 `saveModelsCache` **序列化进磁盘
+   * 缓存**（误导后来者以为它在用）⇒ 一并移除。
+   * ⚠️ 上游的 `max_tokens` 仍在 `readAgentCenterWindow` 的**原始读取**里
+   * 可见（取证用），但**不再**流向任何出站预算 —— 出站预算由
+   * `CODEARTS_MAX_OUTPUT_TOKENS`（llm-adapter.ts）**单点**决定。
+   */
   /**
    * ⚠️⚠️ **只作窗口源、刻意不进目录**（2026-10-30 四路审计 P1-2 定案）。
    *
@@ -414,21 +428,26 @@ async function fetchSignedGet(
 /**
  * AgentCenter 单模型的 `model_parameters` → 动态窗口。
  *
- * ⚠️ 只认**正整数**（上游实测形态 `202752` / `1048576` / `65536`）；浮点、0、
+ * ⚠️ 只认**正整数**（上游实测形态 `202752` / `1048576`）；浮点、0、
  * 负数、字符串一律**不落键**（绝不臆造/强转 —— 字符串数字强转是「静态表
  * 腐坏」的同型病：上游改形态时就静默喂错值）。
+ *
+ * ⚠️⚠️ **`max_tokens` 刻意不取**（2026-10-30 第二轮审计 D-4 修）：
+ * 它是「单次输出上限」，而本仓唯一的去处 `CatalogEntry.maxTokens` 会被
+ * 宿主当成「默认输出预算」+「上下文预留」⇒ **压缩阈值掉 48%**、小窗口模型
+ * 直接抛 `TargetPressureConfigError`。⇒ 上游的输出上限**不**进
+ * `RemoteModel`（见该接口 `contextWindow` 旁的注释）；出站预算由
+ * `CODEARTS_MAX_OUTPUT_TOKENS` 单点决定。
  */
 export function readAgentCenterWindow(
   m: Record<string, unknown>,
-): { contextWindow?: number; maxOutputTokens?: number } {
+): { contextWindow?: number } {
   const params = m['model_parameters']
   if (typeof params !== 'object' || params === null) return {}
   const p = params as Record<string, unknown>
-  const out: { contextWindow?: number; maxOutputTokens?: number } = {}
+  const out: { contextWindow?: number } = {}
   const ctx = p['context_window']
   if (typeof ctx === 'number' && Number.isInteger(ctx) && ctx > 0) out.contextWindow = ctx
-  const max = p['max_tokens']
-  if (typeof max === 'number' && Number.isInteger(max) && max > 0) out.maxOutputTokens = max
   return out
 }
 
@@ -438,7 +457,7 @@ export function readAgentCenterWindow(
  *
  * 流程：`useragents` 选 primary agent（`is_primary_agent`，无标记取第一条）
  * → `detail?agent_id=` → `gpts.models[]` 按 `model_id` 收
- * `{ contextWindow, maxOutputTokens, name }`（name = `model_alias`）。
+ * `{ contextWindow, name }`（name = `model_alias`）。
  * 只有带窗口的条目才收（无窗口的条目对调用方无信息量）。
  */
 export async function fetchAgentCenterWindows(
@@ -446,8 +465,8 @@ export async function fetchAgentCenterWindows(
   ak: string,
   sk: string,
   st: string,
-): Promise<Map<string, { contextWindow: number; maxOutputTokens?: number; name?: string }>> {
-  const out = new Map<string, { contextWindow: number; maxOutputTokens?: number; name?: string }>()
+): Promise<Map<string, { contextWindow: number; name?: string }>> {
+  const out = new Map<string, { contextWindow: number; name?: string }>()
   // 路由判据头必须**参与签名**（去掉 x-language ⇒ 400 TM.00001001，
   // 真机判别 2026-10-29；accept 实测非必需）。
   const signedExtras = { 'agent-type': 'AgentCenter', 'x-language': 'zh-cn' } as const
@@ -496,7 +515,6 @@ export async function fetchAgentCenterWindows(
       const alias = m['model_alias']
       out.set(id, {
         contextWindow: w.contextWindow,
-        ...(w.maxOutputTokens !== undefined ? { maxOutputTokens: w.maxOutputTokens } : {}),
         ...(typeof alias === 'string' && alias.length > 0 ? { name: alias } : {}),
       })
     }

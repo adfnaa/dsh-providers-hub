@@ -34,6 +34,7 @@ import {
   browserCandidates,
   browserNotFoundMessage,
   decodeRegistryOutput,
+  registryCodePage,
   windowsRegisteredBrowserPaths,
   findBrowserExecutable,
   isBrowserDeploymentError,
@@ -186,12 +187,32 @@ describe('Windows App Paths 浏览器发现', () => {
     expect(new TextDecoder('gb18030').decode(raw)).toContain('我的工具')
 
     // ⚠️ 判据：解码后中文**完整**、**没有 U+FFFD**。
-    const decoded = decodeRegistryOutput(raw)
+    const decoded = decodeRegistryOutput(raw, 'gb18030')
     expect(decoded).toContain('我的工具')
     expect(decoded).not.toContain('\uFFFD')
     expect(decoded).toContain('D:\\我的工具\\Chrome\\App\\chrome.exe')
     // ⚠️ 反向对照：旧的 utf8 口径**确实**会坏（证明这条用例有判别力）。
     expect(raw.toString('utf8')).toContain('\uFFFD')
+  })
+
+  it('★★ 英文代码页（windows-1252）**不得**被 `gb18030` 解坏（2026-10-30 第二轮审计修）', () => {
+    // ⚠️⚠️ **两个解码器都能解任何字节序列**（`fatal: false`）⇒ 「先试 gb18030」
+    //    在**英文 Windows**上会把 1252 的字节解成**别的字符**：
+    //    `C:\Users\José\Chrome` ⇒ gb18030 解成 `C:\Users\Jos閈\Chrome`。
+    // ⇒ 代码页**必须按系统语言选**，不能靠「先试哪个」。
+    const raw = Buffer.from('C:\\Users\\Jos\u00e9\\Chrome', 'latin1')
+    // ⚠️ 自证：这段字节是 1252 的（`é` = 0xE9，位于 `Jos` 之后）。
+    expect(raw.indexOf(0xe9)).toBeGreaterThan(0)
+    expect(raw[raw.indexOf(0xe9)]).toBe(0xe9)
+    // ⚠️ 1252 解码器必须给出正确的 `é`
+    expect(decodeRegistryOutput(raw, 'windows-1252')).toContain('Jos\u00e9')
+    // ⚠️ 反向对照：**gb18030 确实会解坏**（证明这条用例有判别力）
+    expect(decodeRegistryOutput(raw, 'gb18030')).not.toContain('Jos\u00e9')
+    // ⚠️ 代码页选择：**英文 locale ⇒ windows-1252**、**中文 locale ⇒ gb18030**
+    expect(registryCodePage('en-US')).toBe('windows-1252')
+    expect(registryCodePage('de-DE')).toBe('windows-1252')
+    expect(registryCodePage('zh-CN')).toBe('gb18030')
+    expect(registryCodePage('ja-JP')).toBe('gb18030')
   })
 
   it('★★ 解码后的中文路径**能过存在性过滤**并成为候选（端到端）', () => {

@@ -114,7 +114,15 @@ describe('canonicalQueryOf（signer 排序 query）', () => {
 describe('readAgentCenterWindow', () => {
   it('accepts positive integers only (no string coercion, no zero/negative)', () => {
     expect(readAgentCenterWindow({ model_parameters: { context_window: 202752, max_tokens: 65536 } }))
-      .toEqual({ contextWindow: 202752, maxOutputTokens: 65536 })
+      .toEqual({ contextWindow: 202752 })
+    // ⚠️⚠️ `max_tokens` **刻意不取**（2026-10-30 第二轮审计 D-4 修）：
+    //    它唯一的去处 `CatalogEntry.maxTokens` ⇒ `defaultMaxTokens` ⇒ 宿主
+    //    `dsh-compaction-basic` 的 `reservedCompletionTokens` 把它**从上下文窗口里
+    //    扣掉** ⇒ 压缩触发点 162,201→109,772；窗口 131,072 的模型 ⇒ 宿主
+    //    **抛** `TargetPressureConfigError`（不是降级）。
+    //    ⇒ 「上游声明」与「我们默认发」被混为一谈 ⇒ 一并移除（且不留死字段）。
+    expect(readAgentCenterWindow({ model_parameters: { context_window: 202752, max_tokens: 65536 } }))
+      .not.toHaveProperty('maxOutputTokens')
     expect(readAgentCenterWindow({ model_parameters: { context_window: '1048576' } })).toEqual({})
     expect(readAgentCenterWindow({ model_parameters: { context_window: 0 } })).toEqual({})
     expect(readAgentCenterWindow({ model_parameters: { context_window: -1 } })).toEqual({})
@@ -221,6 +229,21 @@ describe('AgentCenter 动态窗口合并', () => {
     // 无 query ⇒ 安全
     expect(isSignedQueryValueSafe('https://x/y')).toBe(true)
     expect(isSignedQueryValueSafe('https://x/y?')).toBe(true)
+  })
+
+  it('★★ 安全集必须覆盖 `encodeURIComponent` 的**完整**不编码集（2026-10-30 第二轮审计修）', () => {
+    // ⚠️⚠️ `encodeURIComponent` **不编码** `A-Z a-z 0-9 - _ . ! ~ * ' ( )`
+    //    ⇒ 若安全集漏了其中任何一个 ⇒ **本仓自己拼的 URL**
+    //    （`queue/status?model=${encodeURIComponent(model)}`）会被闸门
+    //    **静默丢弃** ⇒ 用户手填一个带 `!` / `(` 的模型 id ⇒
+    //    **排队状态查询永远失败**（而 chat 请求不走这道闸门 ⇒ 症状极隐蔽）。
+    for (const ch of ['!', '~', '*', "'", '(', ')', '-', '_', '.']) {
+      const enc = encodeURIComponent(ch)
+      expect(isSignedQueryValueSafe(`https://x/y?v=${enc}`), `${ch} 必须安全`).toBe(true)
+    }
+    // ⚠️ 反向对照：真正的危险形态**仍必须被拦**（闸门不能变成「什么都不拦」）
+    expect(isSignedQueryValueSafe('https://x/y?v=a+b')).toBe(false)
+    expect(isSignedQueryValueSafe('https://x/y?v=a b')).toBe(false)
   })
 
   it('AgentCenter failure degrades to no windows without blocking the catalog', async () => {
