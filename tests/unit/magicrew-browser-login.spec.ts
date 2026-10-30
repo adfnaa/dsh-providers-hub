@@ -34,6 +34,7 @@ import {
   createMagicrewCredentialWaiter,
   ensureMagicrewLoginPage,
   createProfileCredentialReader,
+  isBlankPageUrl,
   readCredentialViaCdp,
   readCredentialViaCdpDetailed,
   startMagicrewBrowserLogin,
@@ -311,6 +312,32 @@ describe('ensureMagicrewLoginPage', () => {
     })
   })
 
+  it('★★ 空白页判据必须**前缀匹配**（2026-10-30 第二轮审计 P3-1 修）', () => {
+    // ⚠️⚠️ 真机实测的空白页形态远不止三种 ⇒ 全等判据会漏掉它们 ⇒
+    //    用户面对空白首屏、且插件不导航。
+    for (const url of [
+      'about:blank',
+      'about:blank#x',
+      'chrome://newtab/',
+      'chrome://new-tab-page/',
+      'chrome://new-tab-page-third-party/',
+      'chrome://new-tab-page/?foo=1',
+      'chrome-search://local-ntp/http://newtab/',
+      'edge://newtab/',
+    ]) {
+      expect(isBlankPageUrl(url), `${url} 必须算空白页`).toBe(true)
+    }
+    // ⚠️ 反向对照：**真实页面**不得被当成空白页（否则会抢用户的标签页）
+    for (const url of [
+      'https://www.letsmagic.cn/login',
+      'https://example.com/somewhere',
+      'chrome://version/',
+      'chrome://settings/',
+    ]) {
+      expect(isBlankPageUrl(url), `${url} 不得算空白页`).toBe(false)
+    }
+  })
+
   it('★★ **不得**抢走用户正在看的标签页（2026-10-30 审计 P1 D-05 修）', async () => {
     // ⚠️ 旧实现是 `pages.find(about:blank) ?? pages[0]` ⇒ **没有空白页时**
     //    它会导航 `pages[0]`（用户正在看的页面！）⇒ 用户的标签页被冲掉。
@@ -377,9 +404,36 @@ describe('ensureMagicrewLoginPage', () => {
     //    ⚠️ 必须匹配「调用形态」而不是函数名 —— 匹配函数名会命中
     //    `deps.ensureLoginPage?: typeof ensureMagicrewLoginPage` 这类**类型标注**
     //    ⇒ 变异「删掉调用点」仍然全绿（**假绿**，本轮实测踩到）。
-    expect(source).toMatch(/await session\.start\(\)[\s\S]{0,400}?await \(deps\.ensureLoginPage/)
+    expect(source).toMatch(/await session\.start\(\)[\s\S]{0,800}?await \(deps\.ensureLoginPage/)
     // ⚠️ 反向对照：**不得**有 `if (false)` 之类的死分支包住它。
     expect(source).not.toMatch(/if \(false\)[\s\S]{0,200}?ensureMagicrewLoginPage/)
+  })
+
+  it('★★ 导航失败**不得**冒泡 ⇒ 不得触发「删占位账号」（2026-10-30 第二轮审计 P2 修）', async () => {
+    // ⚠️⚠️ 上一版守卫**只在函数层**（`ensureMagicrewLoginPage` 自己不抛）⇒
+    //    变异「删掉接线点的兜底 try」或「catch 改成 rethrow」⇒ **76 条全绿**
+    //    ⇒ 第一轮 P1「删占位账号」缺陷**可无声复活**。
+    //
+    // ⇒ 这里守**接线级因果链**：注入一个**抛错的** `ensureLoginPage`
+    //    ⇒ 断言 `createChromiumMagicrewLogin` **不抛**、且 **dispose 未被调用**
+    //    （dispose 会关窗 ⇒ 用户连手动登录的机会都没有）。
+    const logs: string[] = []
+    let disposed = 0
+    const fakeSession = {
+      start: async () => {},
+      dispose: () => { disposed += 1 },
+      userDataDir: undefined,
+      waitForCredential: async () => undefined,
+      close: () => {},
+    } as unknown as Parameters<typeof createChromiumMagicrewLogin>[1] & object
+    const created = await createChromiumMagicrewLogin(ORIGIN_CN, {
+      sessionFactory: async () => fakeSession,
+      ensureLoginPage: async () => { throw new Error('导航炸了') },
+      log: (m) => logs.push(m),
+    } as never)
+    expect(created, '导航失败不得冒泡（否则 RPC 层 failLogin 会删占位账号）').toBeDefined()
+    expect(disposed, '导航失败**不得**关窗（用户还要手动登录）').toBe(0)
+    expect(logs.join('\n')).toContain('导航炸了')
   })
 })
 

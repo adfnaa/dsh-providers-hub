@@ -331,12 +331,19 @@ const CODEARTS_QUOTA_EXHAUSTED_CODE = 'QUOTA_EXCEEDED'
 //
 // ⚠️ VL 模型（`kimi-k2.6-vl` / `Qwen3-VL-235B`）**刻意不入本表**：它们被
 // `catalogEntries` 的可见性过滤挡在主列表外，只经 `analyzeImage` 间接调用。
-const DEFAULT_MODELS: readonly string[] = [
+//
+// ⚠️⚠️ **`kimi-k3` 也不在本表**（2026-10-30 第二轮审计 P1 N-1 修）：
+// 它是**只在 AgentCenter 出现**的模型（builtin 漏发）⇒ AgentCenter
+// **不下发倍率** ⇒ 它进目录必然是**裸名** ⇒ `priceFactorFromName` 恒
+// `Infinity` ⇒ 聚合里 codearts 恒排最后、永远不被挑中（静默）。
+// ⇒ **窗口源条目一律不进对话目录**（两条路径：远端与冷缓存兜底）。
+// ⚠️ 它的**上下文窗口**仍可用：见 `CONTEXT_WINDOWS`（静态兜底）与
+// `remoteContextWindows`（动态权威）—— 用户手填 `kimi-k3` 时分母是对的。
+export const DEFAULT_MODELS: readonly string[] = [
   'GLM-5.2', 'GLM-5.1',
   'glm-5.3', 'glm-5.2-sft-harmony',
   'openpangu-2.0-flash', 'openpangu-2.0-pro',
   'deepseek-v4-flash', 'deepseek-v4.1-flash', 'deepseek-v4.1-flash-1017',
-  'kimi-k3',
 ]
 
 /**
@@ -1524,6 +1531,21 @@ export class CodeArtsAdapter extends LlmAdapter {
   private remoteContextWindows = new Map<string, number>()
 
   /**
+   * 「只作窗口源」的模型 id 集合（**独立于目录**）。
+   *
+   * ⚠️⚠️ **必须是独立集合，不能只看条目的 `windowOnly` 属性**
+   * （2026-10-30 第二轮审计 P1 N-1 修）：原先只看属性 ⇒ **只在「远端拉取
+   * 成功」时生效** ⇒ 冷缓存（首启 / 远端失败 / 上游抖动）走 `DEFAULT_MODELS`
+   * 兜底 ⇒ 那些条目**没有** `windowOnly` 属性 ⇒ `kimi-k3` 以**裸名**进目录
+   * ⇒ `priceFactorFromName('kimi-k3')` = `Infinity` ⇒ 聚合里 codearts 恒排
+   * 最后 ⇒ 第一轮 P1-2 的症状**原样复发**（实测）。
+   *
+   * ⇒ 这里在**远端拉到窗口源条目时**记下它们的 id ⇒ 之后**冷缓存也记得**
+   * ⇒ 两条路径口径一致。
+   */
+  private windowOnlyIds = new Set<string>()
+
+  /**
    * AgentCenter 动态窗口优先查（2026-10-29 接入；2026-10-30 改为查独立表）。
    *
    * ⚠️ 查**表**（O(1)）而不是扫数组：旧实现是线性 `find`，且因与目录耦合
@@ -1620,6 +1642,15 @@ export class CodeArtsAdapter extends LlmAdapter {
         if (typeof w === 'number' && Number.isFinite(w) && w > 0) windows.set(model.id, w)
       }
       this.remoteContextWindows = windows
+      // ⚠️⚠️ **同时记下「窗口源 id」**（2026-10-30 第二轮审计 P1 N-1 修）：
+      //    这些 id **只在 AgentCenter 出现**（builtin 没有）⇒ 若它们进目录，
+      //    就是**裸名**（AgentCenter 不下发倍率）⇒ `priceFactorFromName` 恒
+      //    `Infinity` ⇒ 聚合里 codearts 恒排最后。
+      //    ⇒ 记进**独立集合**（`windowOnlyIds`）⇒ 之后**冷缓存也记得**
+      //    ⇒ 远端路径与兜底路径口径一致。
+      this.windowOnlyIds = new Set(
+        models.filter((m) => m.windowOnly === true).map((m) => m.id),
+      )
       // ⚠️ **只在成功赋值后**记时刻：失败/空结果不写，否则一次抖动会把上界
       //    刷新掉、下轮还要等满 20 分钟才发现上游没恢复。
       this.catalogAt = this.options.now?.() ?? Date.now()
@@ -1783,17 +1814,44 @@ export class CodeArtsAdapter extends LlmAdapter {
    */
   private async catalogEntries(): Promise<readonly CatalogEntry[]> {
     await this.ensureRemoteModels()
-    const source = this.remoteModels ?? DEFAULT_MODELS.map((id) => ({ id, name: id, windowOnly: false }))
-    // ⚠️ 与 `listModels` 保持**同一套**「可见性」过滤（VL 多模态不参与），
-    // 唯一区别是不套用户黑名单 —— 那条区别现在由骨架的 `listAllModels` 承担。
-    // ⚠️⚠️ **窗口源条目（`windowOnly`）不进目录**（2026-10-30 审计 P1-2 修）：
-    //    AgentCenter 不下发倍率 ⇒ 这类条目进目录就是裸名 ⇒
-    //    `priceFactorFromName` 恒 `Infinity` ⇒ 聚合里 codearts 恒排最后、
-    //    永远不被挑中（静默）。它们的**窗口**仍可用 —— 见 `remoteContextWindows`。
+    const source = this.remoteModels ?? DEFAULT_MODELS.map((id) => ({ id, name: id }))
     return source
-      .filter((m) => m.windowOnly !== true)
-      .filter((m) => !/-VL-/i.test(m.id) && !/-VL$/i.test(m.id))
+      .filter((m) => this.isVisibleCatalogEntry(m))
       .map((m) => this.toCatalogEntry(m))
+  }
+
+  /**
+   * 一条远端条目**该不该进对话目录**（**两条路径共用**，2026-10-30 第二轮审计 P1 N-2 修）。
+   *
+   * ⚠️⚠️ **必须共用**（实测踩到）：`catalogEntries()`（异步，给 `listModels` /
+   * `resolveModel` 用）与 `syncCatalogEntries()`（同步，给 `listAllModels` 用）
+   * **原本各写一遍** ⇒ 守卫只覆盖了异步那条 ⇒ 变异「删掉同步那条的过滤」
+   * ⇒ **全量 11476 条用例全绿**（零保护）⇒ 而 `listAllModels()` 是
+   * **Jet Hub 模型开关清单**的数据源（`src/jet-hub-rpc.ts` 的 `fullCatalogIds()`）
+   * ⇒ 窗口源条目会**以裸名**出现在设置页（正是 P1-2 想消灭的形态）。
+   *
+   * ⇒ 现在**一份判据、两条路径共用** ⇒ 不可能再分叉。
+   *
+   * 判据两条：
+   * 1. ⚠️ **窗口源条目不进目录** —— AgentCenter 不下发倍率 ⇒ 进目录就是裸名
+   *    ⇒ `priceFactorFromName` 恒 `Infinity` ⇒ 聚合里 codearts 恒排最后、
+   *    永远不被挑中（静默）。它们的**窗口**仍可用 ——
+   *    见 {@link remoteContextWindows}。
+   *    ⚠️⚠️ **判据是「id 集合」而不是「条目属性」**（2026-10-30 第二轮审计
+   *    P1 N-1 修）：原先只看条目的 `windowOnly` 属性 ⇒ **只在「远端拉取成功」
+   *    时生效** ⇒ 冷缓存（首启 / 远端失败 / 上游抖动）走
+   *    `DEFAULT_MODELS` 兜底 ⇒ 那里的条目**没有** `windowOnly` 属性 ⇒
+   *    `kimi-k3` 以**裸名**进目录 ⇒ 第一轮 P1-2 的症状**原样复发**。
+   *    ⇒ 现在判据是 {@link windowOnlyIds} 这个**独立 id 集合**（远端来时填、
+   *    **冷缓存时也留着**）⇒ 两条路径口径一致。
+   * 2. ⚠️ **VL 多模态不进对话目录**（上下文小、不支持工具调用；当 agent 主模型
+   *    会踩别的坑）。⚠️ 与 `src/models.ts` 的 `parseModelInfo` **同口径**
+   *    （大小写**不敏感**）。
+   */
+  private isVisibleCatalogEntry(model: { id: string, windowOnly?: boolean }): boolean {
+    if (model.windowOnly === true) return false
+    if (this.windowOnlyIds.has(model.id)) return false
+    return !/-VL-/i.test(model.id) && !/-VL$/i.test(model.id)
   }
 
   /**
@@ -1803,12 +1861,12 @@ export class CodeArtsAdapter extends LlmAdapter {
    * 缓存，未落地时回退静态兜底表（这正是原实现的语义）。
    */
   private syncCatalogEntries(): readonly CatalogEntry[] {
-    const source = this.remoteModels ?? DEFAULT_MODELS.map((id) => ({ id, name: id, windowOnly: false }))
-    // ⚠️⚠️ **窗口源条目（`windowOnly`）不进目录** —— 与 `catalogEntries()` 同口径
-    //    （2026-10-30 审计 P1-2 修，理由见那里的注释）。
+    const source = this.remoteModels ?? DEFAULT_MODELS.map((id) => ({ id, name: id }))
+    // ⚠️⚠️ **判据与 `catalogEntries()` 共用**（`isVisibleCatalogEntry`）——
+    //    原先两条路径**各写一遍** ⇒ 守卫只覆盖异步那条 ⇒ 同步那条（**Jet Hub
+    //    模型开关清单**的数据源）零保护（2026-10-30 第二轮审计 P1 N-2 修）。
     return source
-      .filter((m) => m.windowOnly !== true)
-      .filter((m) => !/-VL-/i.test(m.id) && !/-VL$/i.test(m.id))
+      .filter((m) => this.isVisibleCatalogEntry(m))
       .map((m) => this.toCatalogEntry(m))
   }
 

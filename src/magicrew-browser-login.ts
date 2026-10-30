@@ -583,12 +583,34 @@ export function createMagicrewCredentialWaiter(
  * **已经是**目标 URL；不带 URL 时是 **`chrome://newtab/`**（**不是**
  * `about:blank`）⇒ 「about:blank 竞态」这条 PR 声称的前提**真机未复现**。
  * ⇒ 但**空白页总得处理**：本集合把三种「空白」形态一视同仁。
+ *
+ * ⚠️⚠️ **判据必须用「前缀」而不是「全等」**（2026-10-30 第二轮审计 P3-1 修）：
+ * 真机实测的空白页形态**远不止三种**（第二轮审计实测出 5 种漏网）：
+ * ```
+ * chrome://new-tab-page-third-party/     ← 第三方新标签页
+ * chrome-search://local-ntp/...          ← 本地搜索新标签页
+ * edge://newtab/                        ← Edge 的新标签页
+ * chrome://new-tab-page/?foo=1           ← 带查询串
+ * about:blank#x                         ← 带 fragment
+ * ```
+ * ⇒ 全等判据 ⇒ 这些**漏掉** ⇒ 用户面对空白首屏、且插件**不导航**。
+ * ⇒ 改为「**前缀匹配**」：`about:blank` 走前缀、`chrome://new-tab-page` 与
+ * `chrome-search://local-ntp` 与 `edge://newtab` 走前缀。
  */
-const BLANK_PAGE_URLS: ReadonlySet<string> = new Set([
+const BLANK_PAGE_URL_PREFIXES: readonly string[] = [
   'about:blank',
-  'chrome://newtab/',
-  'chrome://new-tab-page/',
-])
+  'chrome://newtab',
+  'chrome://new-tab-page',
+  'chrome-search://local-ntp',
+  'edge://newtab',
+  'brave://newtab',
+  'vivaldi://newtab',
+]
+
+/** 这个 URL 是不是「空白页 / 新标签页」（⇒ 可以安全地导航它）。 */
+export function isBlankPageUrl(url: string): boolean {
+  return BLANK_PAGE_URL_PREFIXES.some((prefix) => url.startsWith(prefix))
+}
 
 /**
  * 把「初始仍是空白页」的窗口导航到登录页。
@@ -641,7 +663,7 @@ export async function ensureMagicrewLoginPage(
   // 它既不是 `about:blank`、也不是同站点 ⇒ 落到 `pages[0]` 被导航）。
   // ⇒ 现在**只**导航三种空白形态；**没有空白页就不导航**（宁可让用户自己
   // 切到登录页，也不冲掉他的标签页）。
-  const blank = pages.find((page) => BLANK_PAGE_URLS.has(page.url))
+  const blank = pages.find((page) => isBlankPageUrl(page.url))
   if (blank === undefined) {
     log?.('[magicrew] 没有找到空白页，未自动打开登录页（请手动切换到登录页）')
     return

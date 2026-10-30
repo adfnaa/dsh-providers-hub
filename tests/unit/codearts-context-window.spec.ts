@@ -45,6 +45,7 @@ import {
   CODEARTS_FALLBACK_CONTEXT_WINDOW,
   CodeArtsAdapter,
   codeartsContextWindow,
+  DEFAULT_MODELS as DEFAULT_MODELS_FOR_TEST,
 } from '../../src/llm-adapter.js'
 import type { CodeArtsCredential } from '../../src/types.js'
 
@@ -57,7 +58,7 @@ const validCredential: CodeArtsCredential = {
  * 造适配器。`remote` 为 `undefined` ⇒ 远端拉取失败 ⇒ 走**静态兜底表**
  * （`DEFAULT_MODELS`），这也是首次启动 / 未登录时的真实形态。
  */
-function makeAdapter(remote?: Array<{ id: string; name: string }>) {
+function makeAdapter(remote?: Array<{ id: string; name: string; contextWindow?: number; windowOnly?: boolean }>) {
   return new CodeArtsAdapter({
     credentialRef: 'CODEARTS_ACCESS_TOKEN',
     resolveCredential: async () => validCredential,
@@ -365,5 +366,100 @@ describe('上下文占用条的分母（contextWindow）', () => {
     expect(listed.map((m) => m.id)).not.toContain('window-only-model')
     const resolved = await adapter.resolveModel('codearts', 'window-only-model')
     expect(resolved.context?.contextWindow).toBe(777_777)
+  })
+
+  /**
+   * 守卫 ⑩：**`listAllModels()` 同步视图**也必须过滤窗口源条目
+   * （2026-10-30 第二轮审计 P1 N-2 修）。
+   *
+   * ⚠️⚠️ 上一版守卫⑨**只覆盖了 `listModels()`**（异步那条路）⇒ 变异
+   * 「删掉 `syncCatalogEntries()` 里的 `windowOnly` 过滤」⇒ **全量 11476 条
+   * 用例全绿**（实测）⇒ 那条路**零保护**。
+   *
+   * ⚠️ **生产影响不是摆设**：`listAllModels()` → `src/jet-hub-rpc.ts` 的
+   * `fullCatalogIds()` → **Jet Hub 的模型开关清单 + 黑名单写入集合** ⇒
+   * 窗口源条目会**以裸名出现**在设置页（正是 P1-2 想消灭的形态）。
+   */
+  it('⑩ listAllModels() 同步视图也过滤窗口源条目（Jet Hub 模型开关那条路）', async () => {
+    const adapter = makeAdapter([
+      { id: 'GLM-5.2', name: 'GLM-5.2', contextWindow: 202_752 },
+      { id: 'window-only-model', name: 'Window Only', contextWindow: 777_777, windowOnly: true },
+    ])
+    // ⚠️ 先等一次远端拉取落地（`listAllModels` 是**同步**契约，读的是缓存）。
+    await adapter.listModels('codearts')
+    const all = adapter.listAllModels()
+    expect(all.map((m) => m.id)).toContain('GLM-5.2')
+    expect(all.map((m) => m.id), '同步视图也不该出现窗口源条目').not.toContain('window-only-model')
+  })
+
+  /**
+   * 守卫 ⑪：**冷缓存路径**也必须过滤窗口源条目（2026-10-30 第二轮审计 P1 N-1 修）。
+   *
+   * ⚠️⚠️ **上一版只守「远端拉取成功」那半** ⇒ 冷缓存（首启 / 远端失败 /
+   *    上游抖动）走 `DEFAULT_MODELS` 兜底 ⇒ 那些条目**没有** `windowOnly`
+   *    属性 ⇒ `kimi-k3` 以**裸名**进目录 ⇒ `priceFactorFromName` 恒
+   *    `Infinity` ⇒ 第一轮 P1-2 的症状**原样复发**（实测）。
+   *
+   * ⇒ 判据必须是「**独立 id 集合**」⇒ 远端来时记下、**冷缓存也留着**。
+   *
+   * ⚠️⚠️ 本用例的形状：**先**让远端成功一次（记下窗口源 id）
+   *    ⇒ **再**让远端失败（目录回落兜底表）⇒ 断言 `kimi-k3` **仍不出现**
+   *    ⇒ 这正是「冷缓存路径」的形状（**曾经**成功过 ⇒ 现在失败了）。
+   */
+  it('⑪ 冷缓存路径（远端失败）也不该出现窗口源条目', async () => {
+    // ⚠️⚠️ 本用例的形状：**同一个适配器**先远端成功一次（记下窗口源 id）
+    //    ⇒ **再**让远端失败（目录回落兜底表）⇒ 断言 `kimi-k3` **仍不出现**
+    //    ⇒ 这正是「冷缓存路径」的形状（**曾经**成功过 ⇒ 现在失败了）。
+    let fail = false
+    const adapter = new CodeArtsAdapter({
+      credentialRef: 'CODEARTS_ACCESS_TOKEN',
+      resolveCredential: async () => validCredential,
+      refresh: async () => {},
+      fetchImpl: async () => new Response('not found', { status: 404 }),
+      fetchRemoteModels: async () => {
+        if (fail) throw new Error('offline')
+        return [
+          { id: 'GLM-5.2', name: 'GLM-5.2', contextWindow: 202_752 },
+          { id: 'kimi-k3', name: 'Kimi K3', contextWindow: 1_048_576, windowOnly: true },
+        ]
+      },
+    })
+    // ⚠ 第一轮：远端成功 ⇒ 记下「窗口源 id」。
+    await adapter.listModels('codearts')
+    expect(adapter.listAllModels().map((m) => m.id)).not.toContain('kimi-k3')
+
+    // ⚠ 第二轮：**远端失败** ⇒ 目录回落 `DEFAULT_MODELS` 兜底表
+    //    （那张表**含** `kimi-k3`）⇒ 若判据没被独立集合记住 ⇒ 裸名进目录。
+    //    ⚠⚠ **必须让第二次拉取**真正发生（否则 TTL 短路**不会**重拉
+    //    ⇒ `remoteModels` 仍是第一次的成功结果 ⇒ 下面的断言**恒真**）。
+    //    ⚠ 口径：把 `catalogAt` 清零（`invalidateCatalogCache` 做的同一件事）。
+    fail = true
+    ;(adapter as unknown as { catalogAt: number }).catalogAt = 0
+    const listed = await adapter.listModels('codearts')
+    // ⚠ **判据**：`kimi-k3` 不该出现（它既不在远端路径、也不在兜底路径）。
+    expect(listed.map((m) => m.id), '冷缓存也不该出现窗口源条目').not.toContain('kimi-k3')
+    expect(adapter.listAllModels().map((m) => m.id), '同步视图也不该出现').not.toContain('kimi-k3')
+  })
+
+  /**
+   * 守卫 ⑫：**兜底目录本身**不得含窗口源模型（2026-10-30 第二轮审计 P1 N-1 修）。
+   *
+   * ⚠️⚠️ **这是 N-1 的真正承重处**：`kimi-k3` 是**只在 AgentCenter 出现**的
+   * 模型（builtin 漏发）⇒ AgentCenter **不下发倍率** ⇒ 它进目录必然是**裸名**
+   * ⇒ `priceFactorFromName` 恒 `Infinity` ⇒ 聚合里 codearts 恒排最后、
+   * **永远不被挑中**（静默）。
+   *
+   * ⚠️ 旧实现把 `kimi-k3` 放在 `DEFAULT_MODELS` 兜底表里 ⇒ **冷缓存路径**
+   * （首启 / 远端失败 / 上游抖动）它就**裸名**进目录 ⇒ 第一轮 P1-2 的症状
+   * **原样复发**（实测）。
+   * ⇒ 修法：把它从兜底表**移除**（它的**窗口**仍可用 —— 见 `CONTEXT_WINDOWS`
+   * 与 `remoteContextWindows`，用户手填 `kimi-k3` 时分母是对的）。
+   */
+  it('⑫ 兜底目录不得含「窗口源」模型（kimi-k3 只在 AgentCenter 出现）', () => {
+    // ⚠️ 直接守**兜底表本身**（不依赖任何运行时状态 ⇒ 恒确定的守卫）。
+    expect(DEFAULT_MODELS_FOR_TEST).not.toContain('kimi-k3')
+    // ⚠️ 反向对照：兜底表**不是**空的（否则这条恒真）。
+    expect(DEFAULT_MODELS_FOR_TEST.length).toBeGreaterThan(0)
+    expect(DEFAULT_MODELS_FOR_TEST).toContain('GLM-5.2')
   })
 })

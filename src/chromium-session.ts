@@ -182,11 +182,17 @@ function defaultRegistryQuery(key: string): { status: number | null, stdout: str
   const result = spawnSync(
     'reg',
     ['query', key, '/ve'],
+    // ⚠️⚠️ **`encoding: 'buffer'` 是 P0 D-01 的根**（2026-10-30 第二轮审计 P1-2）：
+    //    必须是**原始字节**（OEM 代码页），不能是 `'utf8'` —— 后者会把中文
+    //    解成 U+FFFD（不可逆）⇒ 路径拼错 ⇒ 存在性过滤把它筛掉 ⇒
+    //    整条注册表腿静默失效。
+    // ⚠️⚠️ **`timeout` 同为承重件** —— 否则 `reg` 卡住会无限期冻结事件循环。
     { encoding: 'buffer', windowsHide: true, timeout: REG_QUERY_TIMEOUT_MS },
   )
   return {
     status: result.status,
-    stdout: decodeRegistryOutput(result.stdout),
+    // ⚠️ 用**带兜底**的解码：首选编码猜错时（解出 U+FFFD）自动重试候选编码。
+    stdout: decodeRegistryOutputWithFallback(result.stdout),
   }
 }
 
@@ -276,8 +282,21 @@ export function windowsRegisteredBrowserPaths(
           if (marker === null) continue
           let executable = line.slice(marker.index + marker[0].length).trim()
           // ⚠️ `REG_EXPAND_SZ` 的值可能含 `%VAR%` ⇒ 展开环境变量。
+          //
+          // ⚠️⚠️ **只展开「确实存在」的环境变量**（2026-10-30 第二轮审计 P2-3 修）：
+          // 旧实现 `replace(/%([^%]+)%/g, (_, name) => process.env[name] ?? '')`
+          // 会把**不存在的**变量替换成**空串** ⇒ 路径被**改短** ⇒
+          // 实测 `C:\a%b%c\chrome.exe`（`b` 不存在）⇒ `C:\ac\chrome.exe`
+          // ⇒ 指向**另一个**（可能存在的）路径 ⇒ 存在性过滤**放行**它
+          // ⇒ **误命中**（而不是安全地「找不到」）。
+          //
+          // ⇒ 修法：只替换**环境里真的有**的变量；不存在的**原样保留**
+          // （⇒ 路径保持不变 ⇒ 存在性过滤会把它正确筛掉）。
           if (marker[0].toUpperCase() === 'REG_EXPAND_SZ') {
-            executable = executable.replace(/%([^%]+)%/g, (_m, name: string) => process.env[name] ?? '')
+            executable = executable.replace(/%([^%]+)%/g, (match, name: string) => {
+              const value = process.env[name]
+              return value === undefined ? match : value
+            })
           }
           if (!isAbsolute(executable)) continue
           // ⚠️⚠️ **basename 守卫必须容许「注册名 ≠ 文件名」**（2026-10-30 审计 P3-3）：
@@ -330,15 +349,83 @@ export function windowsRegisteredBrowserPaths(
  * ⇒ 在英文系统上，路径被解错 ⇒ **存在性过滤把它筛掉** ⇒ 整条注册表腿
  * **静默失效**（比「解成 U+FFFD」更难发现，因为它至少还是有效文本）。
  *
- * ⇒ 修法：**按系统实际语言**选代码页。Windows 的 OEM 代码页跟随
- * **系统 UI 语言**（中文版 = 936/GBK，英文版 = 1252），而 Node 能拿到
- * 该语言：`Intl.DateTimeFormat().resolvedOptions().locale`。
+ * ⚠️⚠️⚠️ **判据源必须是「注册表里的 OEMCP」，不能是 `Intl` 的 locale**
+ * （2026-10-30 第二轮审计 P1-1 修）：第一版按 `Intl.DateTimeFormat()
+ * .resolvedOptions().locale` 判「CJK ⇒ GBK」⇒ **ja / ko / zh-TW 全错**：
+ * - 日文 Windows 的 OEMCP 是 **932（Shift-JIS）** ⇒ `gb18030` 会把 `あ`(82 A0)
+ *   解成 `偁`；
+ * - 韩文是 **949（EUC-KR）**；
+ * - **繁体中文是 950（Big5）** ⇒ `gb18030` 会把 `中` 解成 `い`。
+ * ⚠️ 而且 `Intl` 的 locale 是**用户区域格式**、**不一定等于 UI 语言**
+ * （「英文 UI + 中文区域格式」的机器会分叉）。
  *
- * ⚠️ 判据取**语言**（`zh` / `ja` / `ko` 等 CJK 用 GBK 变体）而不是整个
- * locale 字符串 —— `zh-CN` / `zh-TW` / `zh-HK` 的代码页不同，但它们
- * **共用 GBK 家族**（GB18030 是 GBK/GB2312 的超集）⇒ 对路径解码够用。
+ * ⇒ 修法：读**权威**的 OEM 代码页
+ * `HKLM\SYSTEM\CurrentControlSet\Control\Nls\CodePage` 的 `OEMCP` 值
+ * （实测本机 = **936**；命令形态是 `reg query <key> /v OEMCP`）。
+ * ⇒ 一次覆盖 936 / 932 / 949 / 950 / 1252 / 65001 六档，且**不依赖语言**。
  */
-export function registryCodePage(locale?: string): 'gb18030' | 'windows-1252' {
+export type RegistryEncoding = 'gb18030' | 'shift_jis' | 'euc-kr' | 'big5' | 'windows-1252' | 'utf-8'
+
+/**
+ * OEM 代码页数值 → `TextDecoder` 的编码名。
+ *
+ * ⚠️ 只列**实测会用到的**几档（其余一律退回 `windows-1252` —— 存在的
+ * 后果只是「解错 ⇒ 存在性过滤筛掉 ⇒ 找不到」，**安全降级**，不会误命中）。
+ */
+export function encodingForOemCodePage(codePage: number): RegistryEncoding {
+  switch (codePage) {
+    case 936: return 'gb18030'
+    case 932: return 'shift_jis'
+    case 949: return 'euc-kr'
+    case 950: return 'big5'
+    case 65001: return 'utf-8'
+    case 1252: return 'windows-1252'
+    default: return 'windows-1252'
+  }
+}
+
+/** `HKLM\SYSTEM\CurrentControlSet\Control\Nls\CodePage` 里 `OEMCP` 值的路径。 */
+export const OEM_CODEPAGE_REG_KEY =
+  'HKLM\\SYSTEM\\CurrentControlSet\\Control\\Nls\\CodePage\\OEMCP'
+
+/**
+ * 读本机的 **OEM 代码页**（权威来源）。
+ *
+ * ⚠️ 读不出来时返回 `undefined` ⇒ 调用方退回 locale 启发式（再退回 1252）。
+ */
+export function readOemCodePage(
+  query: (key: string, args: readonly string[]) => { status: number | null, stdout: string } =
+    (key, args) => {
+      const result = spawnSync('reg', ['query', key, ...args], {
+        encoding: 'buffer', windowsHide: true, timeout: REG_QUERY_TIMEOUT_MS,
+      })
+      return { status: result.status, stdout: decodeRegistryOutput(result.stdout, 'windows-1252') }
+    },
+): number | undefined {
+  try {
+    // ⚠️ 命令形态：`reg query <key> /v OEMCP`（**不是** `/ve` —— 默认项是空的）。
+    const result = query('HKLM\\SYSTEM\\CurrentControlSet\\Control\\Nls\\CodePage', ['/v', 'OEMCP'])
+    if (result.status !== 0) return undefined
+    const match = /OEMCP\s+REG_SZ\s+(\d+)/i.exec(result.stdout)
+    if (match === null) return undefined
+    const value = Number(match[1])
+    return Number.isInteger(value) && value > 0 ? value : undefined
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * 本机 `reg.exe` 输出用的**代码页**。
+ *
+ * ⚠️ **优先读注册表的 OEMCP**（权威、与 UI 语言一致）；
+ * ⚠️ 读不到时退回 **locale 启发式**（次优，但比「无条件先试 gb18030」好得多）。
+ */
+export function registryCodePage(
+  oemCodePage?: number,
+  locale?: string,
+): RegistryEncoding {
+  if (oemCodePage !== undefined && oemCodePage > 0) return encodingForOemCodePage(oemCodePage)
   let resolved = locale
   if (resolved === undefined) {
     try {
@@ -347,8 +434,13 @@ export function registryCodePage(locale?: string): 'gb18030' | 'windows-1252' {
       resolved = ''
     }
   }
-  // ⚠️ CJK（中文/日文/韩文）⇒ GBK 家族；其余 ⇒ 西欧 1252。
-  return /^zh|^ja|^ko/i.test(resolved) ? 'gb18030' : 'windows-1252'
+  // ⚠️ locale 启发式（**兜底**，不是权威）：
+  // ⚠️⚠️ **ja / ko / zh-TW 不能映射到 gb18030**（它们的 OEMCP 分别是
+  // 932 / 949 / **950 Big5**）⇒ 这里只把**简体**中文映射到 GBK；
+  // 其余（含 ja/ko/zh-TW）一律 1252 ⇒ 后果是「解错 ⇒ 被存在性过滤筛掉」
+  // （**安全降级**：找不到，而不是误命中）。
+  if (/^zh-(cn|sg|hans)/i.test(resolved) || /^zh$/i.test(resolved)) return 'gb18030'
+  return 'windows-1252'
 }
 
 /**
@@ -365,7 +457,7 @@ export function registryCodePage(locale?: string): 'gb18030' | 'windows-1252' {
  */
 export function decodeRegistryOutput(
   raw: Buffer | string | undefined,
-  encoding: 'gb18030' | 'windows-1252' = registryCodePage(),
+  encoding: RegistryEncoding = registryCodePage(readOemCodePage()),
 ): string {
   if (raw === undefined) return ''
   if (typeof raw === 'string') return raw
@@ -377,6 +469,65 @@ export function decodeRegistryOutput(
     // ⚠️ 存在性过滤会把解错的路径筛掉 ⇒ 退化的表现是「找不到」，不是「乱路径」。
     return raw.toString('latin1')
   }
+}
+
+/**
+ * 解码重试的**候选顺序**（`decodeRegistryOutputWithFallback` 用）。
+ *
+ * ⚠️ 首选是权威 OEMCP 对应的那个；其余是「常见代码页」兜底。
+ * ⚠️ ⚠️ **纯 ASCII 输出**（路径无非 ASCII 字符）⇒ 第一个候选即命中 ⇒
+ * **零额外开销**（绝大多数情况）。
+ */
+const REGISTRY_DECODE_CANDIDATES: readonly RegistryEncoding[] = [
+  'windows-1252', 'gb18030', 'shift_jis', 'euc-kr', 'big5', 'utf-8',
+]
+
+/**
+ * 把 `reg.exe` 的原始输出字节解码成文本，**并在首选编码解出 U+FFFD 时重试**。
+ *
+ * ⚠️⚠️ **为什么需要重试**（2026-10-30 第二轮审计）：首选编码**猜错**时，
+ * `TextDecoder`（`fatal: false`）**不会抛** ⇒ 只会产出 **U+FFFD** ⇒ 路径被
+ * 存在性过滤筛掉 ⇒ 整条注册表腿静默失效。
+ *
+ * ⇒ 判据：「解出来的文本含 U+FFFD」⇒ 说明这个编码**大概率不对** ⇒
+ * 依次试**其它**候选编码，取**第一个不含 U+FFFD** 的。
+ *
+ * ⚠️⚠️ **但 U+FFFD 也不够**（2026-10-30 第二轮审计）：`gb18030` 解 1252 的 `é`(0xE9)
+ * 得到的是 `闈`（U+95C8）——一个「合法」字符，**不含 U+FFFD**！
+ * ⇒ 判据必须再加一条：「**备选解码的结果与首选不同**」⇒ 首选可疑 ⇒ 取那个。
+ *
+ * ⚠️ 候选顺序：首选（权威 OEMCP）→ 1252 → 936 → 932 → 949 → 950 → UTF-8。
+ * ⚠️ ⚠️ **纯 ASCII 的输出**（路径里没有非 ASCII）⇒ 任何编码都解得出**同样**
+ * 的结果 ⇒ 第一个候选直接命中 ⇒ **零额外开销**（这是绝大多数情况）。
+ */
+export function decodeRegistryOutputWithFallback(
+  raw: Buffer | string | undefined,
+  preferred?: RegistryEncoding,
+): string {
+  const first = preferred ?? registryCodePage(readOemCodePage())
+  const decoded = decodeRegistryOutput(raw, first)
+  if (raw === undefined || typeof raw === 'string') return decoded
+  // ⚠️ 没有 U+FFFD ⇒ 首选编码解对了（纯 ASCII 输出也走这条路）。
+  // ⚠️ **纯 ASCII** ⇒ 任何编码都解出同样的结果 ⇒ 直接返回（零额外开销）。
+  if (!/[^\x00-\x7F]/.test(raw.toString('latin1'))) return decoded
+  // ⚠️ 首选解出 U+FFFD ⇒ 首选**大概率错** ⇒ 必须重试。
+  if (decoded.includes('\uFFFD')) {
+    for (const candidate of REGISTRY_DECODE_CANDIDATES) {
+      if (candidate === first) continue
+      const alternative = decodeRegistryOutput(raw, candidate)
+      if (!alternative.includes('\uFFFD')) return alternative
+    }
+    return decoded
+  }
+  // ⚠️⚠️ 首选解出了「合法但可能错」的字符（如 gb18030 解 1252 的 `é` ⇒ `闈`）
+  // ⇒ 判据：「备选解码的结果与首选**不同**」⇒ 首选可疑 ⇒ 取备选。
+  // ⚠️ 存在性过滤会把错的筛掉 ⇒ 与其赌首选，不如取「与首选不同」的那个。
+  for (const candidate of REGISTRY_DECODE_CANDIDATES) {
+    if (candidate === first) continue
+    const alternative = decodeRegistryOutput(raw, candidate)
+    if (alternative !== decoded && !alternative.includes('\uFFFD')) return alternative
+  }
+  return decoded
 }
 
 /**

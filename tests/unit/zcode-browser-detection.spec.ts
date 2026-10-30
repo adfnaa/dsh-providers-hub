@@ -34,6 +34,8 @@ import {
   browserCandidates,
   browserNotFoundMessage,
   decodeRegistryOutput,
+  decodeRegistryOutputWithFallback,
+  encodingForOemCodePage,
   registryCodePage,
   windowsRegisteredBrowserPaths,
   findBrowserExecutable,
@@ -165,11 +167,18 @@ describe('Windows App Paths 浏览器发现', () => {
     //    旧实现写死 `encoding: 'utf8'` ⇒ 中文被解成 **U+FFFD（不可逆）**。
     const gbkBytesOf = (text: string): Buffer => {
       // Node 无 GBK **编码器**（`TextEncoder` 只有 utf8）⇒ 用已知字节表。
-      // ⚠️ 字节表是**实测反查**出来的（对 0x81..0xFE × 0x40..0xFE 逐个试
-      //    `TextDecoder('gb18030')` 解回原字，取首个命中）⇒ 不靠记忆。
+      // ⚠️⚠️ 字节表必须**逐项反查验证**（2026-10-30 第二轮审计 N-4 修）：
+      //    原表把 `认` 写成 `[0xd0,0xb6]` ⇒ 实测解出的是 **`卸`**（另一个字！）
+      //    ⇒ 而夹具里用的是 `默`/`认` 的**标签**、路径用「我的工具」⇒
+      //    那张错表**从未被真正测到**（潜伏）⇒ 必须给表项**加守卫**。
+      //    下表每一项都由 `TextDecoder('gb18030')` 反查得出（见本用例的自证）。
       const table: Record<string, readonly number[]> = {
         '我': [0xce, 0xd2], '的': [0xb5, 0xc4], '工': [0xb9, 0xa4], '具': [0xbe, 0xdf],
-        '默': [0xc4, 0xac], '认': [0xd0, 0xb6],
+        '默': [0xc4, 0xac], '认': [0xc8, 0xcf],
+      }
+      // ⚠️ **自证**：表里每一项都必须**解回原字**（否则这张表是错的）。
+      for (const [ch, bytes] of Object.entries(table)) {
+        expect(new TextDecoder('gb18030').decode(Buffer.from(bytes)), `字节表项 ${ch} 必须解回自身`).toBe(ch)
       }
       const out: number[] = []
       for (const ch of text) {
@@ -199,7 +208,6 @@ describe('Windows App Paths 浏览器发现', () => {
     // ⚠️⚠️ **两个解码器都能解任何字节序列**（`fatal: false`）⇒ 「先试 gb18030」
     //    在**英文 Windows**上会把 1252 的字节解成**别的字符**：
     //    `C:\Users\José\Chrome` ⇒ gb18030 解成 `C:\Users\Jos閈\Chrome`。
-    // ⇒ 代码页**必须按系统语言选**，不能靠「先试哪个」。
     const raw = Buffer.from('C:\\Users\\Jos\u00e9\\Chrome', 'latin1')
     // ⚠️ 自证：这段字节是 1252 的（`é` = 0xE9，位于 `Jos` 之后）。
     expect(raw.indexOf(0xe9)).toBeGreaterThan(0)
@@ -208,11 +216,45 @@ describe('Windows App Paths 浏览器发现', () => {
     expect(decodeRegistryOutput(raw, 'windows-1252')).toContain('Jos\u00e9')
     // ⚠️ 反向对照：**gb18030 确实会解坏**（证明这条用例有判别力）
     expect(decodeRegistryOutput(raw, 'gb18030')).not.toContain('Jos\u00e9')
-    // ⚠️ 代码页选择：**英文 locale ⇒ windows-1252**、**中文 locale ⇒ gb18030**
-    expect(registryCodePage('en-US')).toBe('windows-1252')
-    expect(registryCodePage('de-DE')).toBe('windows-1252')
-    expect(registryCodePage('zh-CN')).toBe('gb18030')
-    expect(registryCodePage('ja-JP')).toBe('gb18030')
+  })
+
+  it('★★ 代码页判据必须**读权威的 OEMCP**（2026-10-30 第二轮审计 P1-1 修）', () => {
+    // ⚠️⚠️ **不能**按 locale 猜：日文 OEMCP=932（Shift-JIS）、韩文=949、
+    //    **繁体中文=950（Big5）** ⇒ 把 ja/ko/zh-TW 映射到 gb18030 **全错**
+    //    （实测 Shift-JIS 的 `あ` 被 gb18030 解成 `偁`、Big5 的 `中` 解成 `い`）。
+    // ⚠️ 而且 `Intl` 的 locale 是**用户区域格式**、不一定等于 UI 语言。
+    // ⇒ 权威来源：`HKLM\SYSTEM\CurrentControlSet\Control\Nls\CodePage` 的 `OEMCP`。
+    expect(encodingForOemCodePage(936)).toBe('gb18030')
+    expect(encodingForOemCodePage(932)).toBe('shift_jis')
+    expect(encodingForOemCodePage(949)).toBe('euc-kr')
+    expect(encodingForOemCodePage(950)).toBe('big5')
+    expect(encodingForOemCodePage(1252)).toBe('windows-1252')
+    expect(encodingForOemCodePage(65001)).toBe('utf-8')
+    // ⚠️ 未知档 ⇒ 1252（**安全降级**：解错会被存在性过滤筛掉 ⇒「找不到」）
+    expect(encodingForOemCodePage(99999)).toBe('windows-1252')
+    // ⚠️ **OEMCP 优先于 locale**
+    expect(registryCodePage(936, 'en-US')).toBe('gb18030')
+    expect(registryCodePage(1252, 'zh-CN')).toBe('windows-1252')
+    // ⚠️ 读不到 OEMCP ⇒ locale 启发式（**只**把简体中文映射到 GBK）
+    expect(registryCodePage(undefined, 'zh-CN')).toBe('gb18030')
+    expect(registryCodePage(undefined, 'zh-TW')).toBe('windows-1252')
+    expect(registryCodePage(undefined, 'ja-JP')).toBe('windows-1252')
+    expect(registryCodePage(undefined, 'ko-KR')).toBe('windows-1252')
+    expect(registryCodePage(undefined, 'en-US')).toBe('windows-1252')
+  })
+
+  it('★★ 首选编码解出 U+FFFD ⇒ 自动重试候选编码（2026-10-30 第二轮审计修）', () => {
+    // ⚠️⚠️ `TextDecoder`（`fatal:false`）**不抛** ⇒ 首选编码猜错时只产出
+    //    U+FFFD ⇒ 路径被存在性过滤筛掉 ⇒ 整条注册表腿静默失效。
+    // ⇒ 必须有「重试」兜底。
+    const raw = Buffer.from('C:\\Users\\Jos\u00e9\\Chrome', 'latin1')
+    // ⚠️ 首选 gb18030（**错**的）⇒ 兜底必须救回来
+    const rescued = decodeRegistryOutputWithFallback(raw, 'gb18030')
+    expect(rescued).toContain('Jos\u00e9')
+    expect(rescued).not.toContain('\uFFFD')
+    // ⚠️ 反向对照：纯 ASCII 输出**首选即命中**（零额外开销）
+    const ascii = Buffer.from('C:\\Program Files\\Chrome\\chrome.exe', 'latin1')
+    expect(decodeRegistryOutputWithFallback(ascii, 'gb18030')).toBe('C:\\Program Files\\Chrome\\chrome.exe')
   })
 
   it('★★ 解码后的中文路径**能过存在性过滤**并成为候选（端到端）', () => {

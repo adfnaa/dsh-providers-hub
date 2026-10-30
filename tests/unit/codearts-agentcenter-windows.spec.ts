@@ -3,7 +3,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import {
-  fetchCodeArtsRemoteModels, readAgentCenterWindow,
+  fetchCodeArtsRemoteModels, fetchSignedGet, readAgentCenterWindow,
   SNAP_AGENT_CENTER_DETAIL_URL, SNAP_AGENT_CENTER_USERAGENTS_URL, SNAP_MODEL_BUILTIN_URL,
 } from '../../src/models.js'
 import { canonicalQueryOf, isSignedQueryValueSafe, signRequestHuawei } from '../../src/sign.js'
@@ -244,6 +244,32 @@ describe('AgentCenter 动态窗口合并', () => {
     // ⚠️ 反向对照：真正的危险形态**仍必须被拦**（闸门不能变成「什么都不拦」）
     expect(isSignedQueryValueSafe('https://x/y?v=a+b')).toBe(false)
     expect(isSignedQueryValueSafe('https://x/y?v=a b')).toBe(false)
+  })
+
+  it('★★ **小写**十六进制必须被拦（`%2b` 往返会变成 `%2B`）', () => {
+    // ⚠️ `decodeURIComponent('%2b')` = `'+'` ⇒ `encodeURIComponent('+')` = `'%2B'`
+    //    ⇒ **字节变了** ⇒ 与服务端可能分叉 ⇒ 必须拦。
+    //    （`encodeURIComponent` 恒产**大写**十六进制 ⇒ 本仓自己拼的 URL 不会
+    //    出现小写 ⇒ 这条只防「上游给了小写」这种情况。）
+    expect(isSignedQueryValueSafe('https://x/y?v=a%2Bb')).toBe(true)
+    expect(isSignedQueryValueSafe('https://x/y?v=a%2bb')).toBe(false)
+  })
+
+  it('★★ 安全集闸门在**签名器内部**（覆盖全部签名请求，2026-10-30 第二轮审计 P1 N-3 修）', async () => {
+    // ⚠️⚠️ 原先闸门只在 `src/models.ts` 的 `fetchSignedGet` 里 ⇒ **4 条带 query
+    //    的签名 GET 只盖了 1 条**（`queue/status` / `ops/delivery` / benefit
+    //    claim 那几条**不过闸门**）⇒ 同一个 signer **两条腿两套防护口径**。
+    // ⇒ 现在判据在**签名器内部** ⇒ 全部经它的请求都受保护。
+    // ⚠️ 判据：**抛错**（⇒ 调用方的 try/catch 把它变成「这次请求没发出去」
+    //    ⇒ 退化为上一次成功的值或空 ⇒ 静默降级而非崩溃）。
+    await expect(signRequestHuawei(
+      'AK', 'SK', 'ST', 'GET', 'https://x/y?agent_id=a+b', new Uint8Array(),
+    )).rejects.toThrow(/安全集/)
+    // ⚠️ 反向对照：安全 query ⇒ 正常签名（闸门不能变成「什么都不能签」）
+    const headers = await signRequestHuawei(
+      'AK', 'SK', 'ST', 'GET', 'https://x/y?agent_id=a%2Bb', new Uint8Array(),
+    )
+    expect(headers.get('Authorization')).toContain('SDK-HMAC-SHA256')
   })
 
   it('AgentCenter failure degrades to no windows without blocking the catalog', async () => {

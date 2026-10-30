@@ -73,12 +73,23 @@ AgentCenter 当时还没被当作目录源（codearts2api 那时也只用它取�
 | # | 缺陷 | 修法 |
 |---|---|---|
 | **P1-1** | **`maxTokens` 出口污染宿主的上下文预留** —— `CatalogEntry.maxTokens` ⇒ `defaultMaxTokens` ⇒ 宿主 `dsh-compaction-basic` 的 `reservedCompletionTokens` 把它**从窗口里扣掉** ⇒ GLM-5.2 压缩触发点 162,201→109,772、压力预算 137,216→71,680；窗口 131,072 的模型 ⇒ **抛 `TargetPressureConfigError`** | **撤掉该落键**（照 `src/opencode-adapter.ts:392-413` 的先例：「上限 ≠ 合理默认预算」）+ 守卫⑦ |
-| **P1-2** | **AgentCenter 独有模型无倍率 ⇒ 聚合定价恒 `Infinity`** ⇒ codearts 在聚合里**永远排最后** | **`windowOnly`**：只作窗口源、**不进目录** + 守卫⑨ |
+| **P1-2** | **AgentCenter 独有模型无倍率 ⇒ 聚合定价恒 `Infinity`** ⇒ codearts 在聚合里**永远排最后** | **`windowOnly`**：只作窗口源、**不进目录** + 守卫⑨⑩⑪⑫ |
 | **P2 D1** | **`canonicalQueryOf` 往返会改字节**（`+`/裸 `%`/`=`）⇒ 可能与服务端口径分叉 ⇒ 静默 401 | 加 `isSignedQueryValueSafe` 闸门（**安全集外不发请求**） |
 | **P2 D3** | **`detail` 一步的路由头零守卫** ⇒ 上游从严则 detail 恒 400 ⇒ 核心功能静默失效 | 守卫改**普查**（两次请求都要带） |
 | **P3 D6** | **动态腿在「手填 id」场景不可达**（`unknownModelContextWindow` 只在 `entry===undefined` 时被调，而旧实现查 `remoteModels` ⇒ 二者等价） | 动态窗口收进**独立的表**（`remoteContextWindows`）+ 守卫⑧ |
 
-⚠️ **两条「结论」的更正**（审计发现原文过度归纳）：
+⚠️⚠️ **2026-10-30 第二轮四路审计（2 正向 + 2 对抗，31 变异）后的修订** ——
+第一轮的修复**方向全部正确**，但「修法」本身暴露了 3 个新的承重处：
+
+| # | 缺陷 | 修法 |
+|---|---|---|
+| **P1 N-1** | **`windowOnly` 只在「远端拉取成功」时生效** —— 兜底路径 `DEFAULT_MODELS` **含 `kimi-k3`** ⇒ 冷缓存（首启 / 远端失败 / 上游抖动）下它**裸名**进目录 ⇒ 第一轮 P1-2 的症状**原样复发** | ① 把 `kimi-k3` **从 `DEFAULT_MODELS` 移除**（它的**窗口**仍可用：`CONTEXT_WINDOWS` + `remoteContextWindows`）② 判据改成**独立 id 集合**（`windowOnlyIds`）⇒ 两条路径口径一致 + 守卫⑪⑫ |
+| **P1 N-2** | **代码页判据把 ja/ko/zh-TW 误判成 GBK** —— 它们的 OEMCP 分别是 932(SJIS)/949/**950(Big5)**，**都不是 GB18030 的子集** ⇒ 那三类系统上路径被解坏 ⇒ 存在性过滤筛掉 ⇒ 整条注册表腿静默失效 | 改读**权威的 `OEMCP`**（`HKLM\SYSTEM\CurrentControlSet\Control\Nls\CodePage` 的 `OEMCP` 值）+ 解码**兜底重试**（首选解出 U+FFFD **或**与备选不同 ⇒ 换编码） |
+| **P1 N-3** | **安全集闸门只盖 4 条带 query 的签名 GET 里的 1 条** ⇒ 同一个 signer **两条腿两套防护口径** | 判据**下沉到 `signRequestHuawei`**（唯一入口、覆盖全部签名请求）；`models.ts` 那层保留只为**脱敏日志** |
+| **P2** | **`Agent-Type` 签名口径三条腿两套**（大小写 + 是否签名），分岔依据**零注释登记** | **已登记**（见 `src/models.ts` 的 `signedExtras` 注释里的矩阵）⇒ 修法需**真实上游**逐端点验证 |
+| **P3** | 安全集漏了 `encodeURIComponent` 的不编码字符（`! * ' ( )`）⇒ 用户手填带 `!` 的模型 id ⇒ `queue/status` 请求被**静默丢弃** | 安全集扩到 `encodeURIComponent` 的**完整**不编码集 + `%XX`（**且要求大写十六进制**：`%2b` 往返会变 `%2B`） |
+
+⚠️ **三条「结论」的更正**（审计发现原文过度归纳）：
 ① 「10-21 那次不是上游永久上调而是**临时值/灰度**」—— 从 3 个数据点推出的
 **过度归纳**（按**账号**灰度同样解释得通，未验证）。⇒ 改为事实陈述 +
 登记「若上游按账号灰度 ⇒ 静态表对部分账号仍错」。
@@ -90,7 +101,7 @@ AgentCenter 当时还没被当作目录源（codearts2api 那时也只用它取�
 | 步骤 | 端点 | 关键返回 |
 |---|---|---|
 | ① | `/v1/agent-center/agents/useragents?offset=0&limit=100` | `agents[]`，取 `is_primary_agent` 那条（缺省第一条） |
-| ② | `/v1/agent-center/agents/detail?agent_id={id}` | `gpts.models[]` 含 `model_parameters.{context_window,max_tokens,supports_images}` |
+| ② | `/v1/agent-center/agents/detail?agent_id={id}` | `gpts.models[]` 含 `model_parameters.{context_window,max_tokens,supports_images}`（⚠️ 2026-10-30 起本仓**只取 `context_window`** —— `max_tokens` 刻意不取，见上表 P1-1 的后果说明） |
 
 必须带 `agent-type: AgentCenter` + `x-language: zh-cn`（**进签名**）：
 - 缺 `x-language` ⇒ `400 TM.00001001`（「未找到合法可路由 api」—— 看着像路由问题，其实是头不全）；

@@ -87,7 +87,7 @@ export function isCanonicalQueryValueSafe(value: string): boolean {
   // 会被这道闸门**静默丢弃** ⇒ 用户手填一个带 `!` / `(` 的模型 id ⇒
   // **排队状态查询永远失败**（而 chat 请求不走这道闸门 ⇒ 症状极隐蔽）。
   // ⇒ 安全集 = `encodeURIComponent` 的**完整不编码集** + `%XX`。
-  return /^(?:[A-Za-z0-9_.!~*'()-]|%[0-9A-Fa-f]{2})*$/.test(value)
+  return /^(?:[A-Za-z0-9_.!~*'()-]|%[0-9A-F]{2})*$/.test(value)
 }
 
 /**
@@ -163,7 +163,29 @@ export function isSignedQueryValueSafe(url: string): boolean {
   return true
 }
 
-/** 签名一个华为请求；返回需合并到请求中的头映射。 */
+/**
+ * 签名一个华为请求；返回需合并到请求中的头映射。
+ *
+ * ⚠️⚠️⚠️ **query 值不在安全集内 ⇒ 抛错**（2026-10-30 第二轮审计 P1 N-3 修）。
+ *
+ * ⚠️ **为什么下沉到这一层**：安全集闸门原先只在 `src/models.ts` 的
+ * `fetchSignedGet` 里 ⇒ **4 条带 query 的签名 GET 只盖了 1 条**
+ * （`queue/status`、`ops/delivery`、benefit claim 那几条**不过闸门**）
+ * ⇒ 同一个 signer **两条腿两套防护口径**。
+ *
+ * ⇒ 现在判据在**签名器内部** ⇒ **所有**经它的请求都受保护
+ * （`src/models.ts` 的三个 GET + `src/codearts-credits.ts` 的两个 POST +
+ * `src/llm-adapter.ts` 的 chat 与 queue/status）。
+ *
+ * ⚠️ **抛错的后果**：调用方（`fetchSignedGet` / `signedSnapRequest`）的
+ * `try/catch` 会把它变成「这次请求没发出去」⇒ 目录/积分退化为**上一次成功
+ * 的值**或**空** ⇒ **静默降级**而非崩溃。⇒ 抛错是**安全**的方向
+ * （宁可少一个请求，也不要静默 401）。
+ *
+ * ⚠️ **现网不会触发**：本仓构造的 query 值全部在安全集内（实测 10/10 安全：
+ * `encodeURIComponent` 恒产安全集内的字符）⇒ 这道闸是**纯防御**，
+ * 防的是「上游改口径 / 用户手填特殊字符」。
+ */
 export async function signRequestHuawei(
   ak: string,
   sk: string,
@@ -173,6 +195,13 @@ export async function signRequestHuawei(
   body: Uint8Array,
   extraHeaders?: Readonly<Record<string, string>>,
 ): Promise<Map<string, string>> {
+  // ⚠️⚠️ **安全集闸门（唯一入口）** —— 抛错 ⇒ 调用方降级，绝不静默 401。
+  if (!isSignedQueryValueSafe(urlStr)) {
+    throw new Error(
+      `华为云签名被拒：query 值不在安全集内（值含 '+'、空格、'&'、'=' 或畸形 '%'）`
+      + `⇒ canonical 可能与服务端口径分叉 ⇒ 本次请求不发。URL=${urlStr.split('?')[0]}`,
+    )
+  }
   const url = new URL(urlStr)
   let uri = url.pathname
   if (!uri.endsWith('/')) uri += '/'

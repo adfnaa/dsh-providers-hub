@@ -109,9 +109,14 @@ export interface RemoteModel {
    *
    * ⚠️ **保留它作为死字段是有害的**：它会被 `saveModelsCache` **序列化进磁盘
    * 缓存**（误导后来者以为它在用）⇒ 一并移除。
-   * ⚠️ 上游的 `max_tokens` 仍在 `readAgentCenterWindow` 的**原始读取**里
-   * 可见（取证用），但**不再**流向任何出站预算 —— 出站预算由
-   * `CODEARTS_MAX_OUTPUT_TOKENS`（llm-adapter.ts）**单点**决定。
+   * 上游的 `max_tokens` 本轮一并不再读取（2026-10-30 第二轮审计修：第一版的
+   * 注释声称「仍在 `readAgentCenterWindow` 的原始读取里可见」——**不成立**（实现已不读）。
+   * 取证能力**确实下降**：上游允许多少这一信息**不再进本仓任何结构**。
+   * 后果（设计取舍，已登记）：若某模型上游只允许 4096，本仓仍发 65536
+   * ⇒ 上游截断/报错。与 `src/opencode-adapter.ts:392-413` 的已有先例
+   * 「上限≠合理默认预算」同构；若要恢复取证能力，请**另开**一个
+   * 明确标注「仅诊断」的独立读取，**不要**复用本函数。
+   * 出站预算由 `CODEARTS_MAX_OUTPUT_TOKENS`（llm-adapter.ts）**单点**决定。
    */
   /**
    * ⚠️⚠️ **只作窗口源、刻意不进目录**（2026-10-30 四路审计 P1-2 定案）。
@@ -374,8 +379,13 @@ function extractJsonArray(text: string, path: string[]): unknown[] | undefined {
 /**
  * 签名 GET 请求远端端点并读取文本；网络失败或非 200 时返回 undefined
  * （不阻断调用方）。
+ *
+ * ⚠️ **导出**（2026-10-30 第二轮审计 P2 修）：上一版守卫**只测安全集函数本身**、
+ * 不测**调用点** ⇒ 变异「删掉下面的闸门调用」⇒ **12 条全绿** ⇒ 第一轮 P2 D1
+ * 的修复**可零阻力复活**。⇒ 导出它，让守卫能**行为级**地断言
+ * 「query 不安全 ⇒ **fetcher 零调用**」。
  */
-async function fetchSignedGet(
+export async function fetchSignedGet(
   fetcher: typeof fetch,
   url: string,
   ak: string,
@@ -400,6 +410,9 @@ async function fetchSignedGet(
   //    **同形**，极难定位），不如**当场不发**并留一条脱敏日志。
   //    ⚠️ 现网全部 query 值都在安全集内（uuid、模型 id、`msg`、`DESKTOP`、数字）
   //    ⇒ 这道闸**当前不会拦掉任何真实请求**（它只拦「上游改口径」这种情况）。
+  // ⚠️⚠️ **闸门已下沉到 `signRequestHuawei`**（2026-10-30 第二轮审计 P1 N-3 修）
+  //    ⇒ 那里是**唯一入口**、覆盖**全部**签名请求（原先只盖 4 条 GET 里的 1 条）。
+  //    ⇒ 这里保留这一层是为了**给出脱敏日志**（签名器里抛错没有上下文）。
   if (!isSignedQueryValueSafe(url)) {
     console.warn('[codearts] 已跳过一个 query 值不在安全集内的签名请求（避免验签分叉）')
     return undefined
@@ -467,8 +480,28 @@ export async function fetchAgentCenterWindows(
   st: string,
 ): Promise<Map<string, { contextWindow: number; name?: string }>> {
   const out = new Map<string, { contextWindow: number; name?: string }>()
-  // 路由判据头必须**参与签名**（去掉 x-language ⇒ 400 TM.00001001，
+  // ⚠️⚠️ **路由判据头必须「参与签名」**（去掉 x-language ⇒ 400 TM.00001001，
   // 真机判别 2026-10-29；accept 实测非必需）。
+  //
+  // ⚠️⚠️⚠️ **头名大小写与「是否签名」两条口径在本仓内部是分岔的**
+  // （2026-10-30 两轮审计 P2 D2 / N-4 **未修已登记**，理由见下）：
+  //
+  // | 端点 | 头名拼写 | 是否参与签名 | 出处 |
+  // |---|---|---|---|
+  // | AgentCenter | `agent-type` / `x-language`（**小写**） | **签** | 本函数 |
+  // | builtin | `Agent-Type` / `X-Language`（大写） | **不签** | `fetchSignedGet` 的 `extraUnsignedHeaders` |
+  // | ops/claim / benefit | `Agent-Type` / `X-Language`（大写） | **不签** | `src/codearts-credits.ts` |
+  // | queue/status | `Agent-Type` / `X-Language`（大写） | **不签** | `src/llm-adapter.ts` 的 `queryQueueStatus` |
+  //
+  // ⚠️ **HTTP 头名大小写不敏感**，但**参与签名时 SignedHeaders 里的大小写会
+  // 逐字进入 canonical** ⇒ 服务端若按「自己收到的头名」重算 canonical，两种
+  // 拼写会得到**不同的 SignedHeaders 串** ⇒ 验签失败。
+  // ⇒ **本仓无法自证哪种拼写对**（需要真实上游）⇒ 现状是「实测能过的那个」。
+  // ⇒ ⚠️ **上游一旦统一口径**（例如 builtin 也要求签 `Agent-Type`），
+  //   那条 unsigned 腿会**立刻 401** ⇒ 这是一条**已登记的脆弱点**。
+  // ⇒ 修法（需真实上游逐端点验证后再做）：把「路由头」抽成**一份**常量
+  //   （名字 + 值 + 是否参与签名），四个端点共用；并在常量注释里写明
+  //   「实测矩阵（端点 × 头拼写 × 是否签名 → 状态码）」。
   const signedExtras = { 'agent-type': 'AgentCenter', 'x-language': 'zh-cn' } as const
   const listText = await fetchSignedGet(fetcher, SNAP_AGENT_CENTER_USERAGENTS_URL, ak, sk, st, undefined, signedExtras)
   if (listText === undefined) return out
