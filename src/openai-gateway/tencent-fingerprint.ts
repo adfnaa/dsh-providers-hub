@@ -155,6 +155,20 @@ interface ContentFingerprint {
   readonly replace: string
   /** 来源与证据，写死在代码里，免得后人「顺手」把它改成正则或删掉。 */
   readonly note: string
+  /**
+   * ⚠️ **可选的「漂移容忍」正则源码**（2026-10-30 新增，只有第 4 条用它）。
+   *
+   * 语义：**只**放宽「形态」这一维（大小写、空白量、可选逗号、可选
+   * `coding` / 定冠词），**不放宽**成关键词 —— 锚点仍必须是**整句**。
+   *
+   * ⚠️ 存在的理由：`find` 是**逐字符**字面量，DSH 只要改动其中**一个**字符，
+   * 这条规则就**静默失效**（症状 = 每轮 400/11128，与「没登记过」同形）。
+   * 本文件顶部已把这条风险登记为「漂移风险未解」。
+   *
+   * ⚠️ 填了 `findRegex` 也必须**同时**填 `find`：`find` 是文档可读的原文，
+   * 也是单测「原文 vs 改写后」对照的取样源。
+   */
+  readonly findRegex?: string
 }
 
 /**
@@ -327,11 +341,20 @@ const CONTENT_FINGERPRINTS: readonly ContentFingerprint[] = [
     //
     // `find` 刻意不带尾句点：一条同时覆盖带句点与不带句点两种形态。
     find: 'You are an AI agent powered by DeepSeek Harness',
+    // ⚠️⚠️ **漂移容忍**（2026-10-30 实测定案，见下方「2026-10-30」一节）：
+    // 上游的匹配器**大小写不敏感**、且**归一空白**，但**不跨标点** ——
+    // 于是「形态」这一维可以放宽，而语义仍锁在整句上。
+    findRegex: 'You\\s+are\\s+an?\\s+AI\\s+(?:coding\\s+)?agent\\s*,?\\s*powered\\s+by\\s+'
+      + '(?:the\\s+)?DeepSeek\\s+Harness',
     // 见上方「2026-10-21」一节：官方同形 + 官方原生兜底措辞。
     replace: 'You are an AI coding assistant, powered by a large language model',
     note: '本机 2026-10-20 对 copilot.tencent.com 实测：system 绝对行首 400/11128，'
       + '前接任意字符放行；2026-10-21 换成官方同形措辞后**实测放行**（buddy 站 / '
-      + 'deepseek-v4.1-flash），另实测该句在 www.workbuddy.ai 两模型**均不拦**（站点相关）',
+      + 'deepseek-v4.1-flash），另实测该句在 www.workbuddy.ai 两模型**均不拦**（站点相关）'
+      + '；2026-10-30 复测（buddy / deepseek-v4.1-flash / 账号 A6146635）：原文 400'
+      + '，全小写与全大写**同样 400**（⇒ 大小写不敏感），双空格**仍 400**（⇒ 空白归一）'
+      + '，`agent` 后加逗号**200**、`agent,` 无空格**200**（⇒ 匹配不跨标点）'
+      + '，裸两个词 DeepSeek Harness **200**（⇒ 认整句不认 token）',
   },
   {
     // **DSH Web 运行面的开头两句** —— 来自 DSH 的 `@deepseek-ai/dsh-harness-dev-context`
@@ -482,16 +505,38 @@ function escapeRegExp(literal: string): string {
 
 interface CompiledFingerprint {
   readonly replace: string
-  /** 小写形态，用于 `includes` 预检（不命中就不必跑正则，字符串**原样**返回）。 */
+  /**
+   * 用于 `includes` 预检的**锚**（不命中就不必跑正则，字符串**原样**返回）。
+   *
+   * ⚠️ 有 `findRegex` 时它是「正则里那段**必然出现**的稳定子串」的小写形态
+   * （第 4 条用 `'ai agent'`）—— 不能再用整句小写，否则漂移容忍就白做了。
+   */
   readonly findLower: string
   readonly pattern: RegExp
 }
 
+/**
+ * 从 `findRegex` 源码里取「预检锚」。
+ *
+ * ⚠️ 取法是**人工指定的常量**（每条规则自带 `precheckAnchor`），不从正则反推 ——
+ * 从正则反推「哪段必然出现」是**不可判定**的，猜错会让预检把真命中挡掉
+ * （症状：规则静默不生效，与「没登记」同形）。
+ */
+const PRECHECK_ANCHORS: Readonly<Record<string, string>> = {
+  // 第 4 条：锚取 `deepseek harness` 而**不是** `ai agent` ——
+  // 后者不含漂移形态 `ai **coding** agent`（实测：锚写成 `ai agent` 时
+  // 「coding agent」那一格**静默不匹配**，正是本轮要治的那类失效）。
+  // ⚠️ 锚只需「必然出现且够独特」：`deepseek harness` 在本句里恒在，
+  //    且不会命中无关文本（比 `powered by` 这种通用短语好得多）。
+  'You are an AI agent powered by DeepSeek Harness': 'deepseek harness',
+}
+
 const COMPILED: readonly CompiledFingerprint[] = CONTENT_FINGERPRINTS.map((rule) => ({
   replace: rule.replace,
-  findLower: rule.find.toLowerCase(),
+  findLower: PRECHECK_ANCHORS[rule.find] ?? rule.find.toLowerCase(),
   // `g` = 全部出现都改写；`i` = 大小写不敏感（实测全小写 / 全大写同样被拦）。
-  pattern: new RegExp(escapeRegExp(rule.find), 'gi'),
+  // ⚠️ 有 `findRegex` 时用它（只放宽形态，仍锚整句）。
+  pattern: new RegExp(rule.findRegex ?? escapeRegExp(rule.find), 'gi'),
 }))
 
 /** 该 provider 是否走腾讯系后端（有这套内容级风控）。 */

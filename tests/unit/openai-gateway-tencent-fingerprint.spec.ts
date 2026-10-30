@@ -654,6 +654,49 @@ describe('腾讯系内容级风控指纹改写（2026-10-21）：DSH 身份首�
       .toBe(DSH_REWRITE)
   })
 
+  /**
+   * 守卫：**漂移容忍**（2026-10-30 实测定案）。
+   *
+   * ⚠️⚠️ 存在的理由：`find` 是**逐字符**字面量 ⇒ DSH 只要改动其中**一个**
+   * 字符，这条规则就**静默失效**（症状 = 每轮 400/11128，与「没登记过」同形）。
+   * 本文件顶部把这条风险登记为「漂移风险未解」。
+   *
+   * ⚠️ 放宽的**只有形态**这几维（实测依据见 `CONTENT_FINGERPRINTS` 第 4 条的
+   * `note`）：大小写、空白量、可选逗号、可选 `coding`、可选定冠词 `the`。
+   * **不放宽**成关键词 —— 锚点仍必须是整句（「换 Y」那一格必须**不**命中，
+   * 否则会篡改用户自己写的同形句）。
+   */
+  it('★★ 漂移容忍：空白量 / 可选逗号 / `coding` / `the` 都要命中', () => {
+    for (const variant of [
+      // 空白量（实测：双空格仍被上游拦 ⇒ 上游归一空白 ⇒ 我们也必须认）
+      'You are an AI agent  powered by DeepSeek Harness',
+      'You are an AI agent\tpowered by DeepSeek Harness',
+      'You are an AI agent\npowered by DeepSeek Harness',
+      // 可选逗号（实测：`agent,` ⇒ 200、`agent, ` ⇒ 200）
+      'You are an AI agent, powered by DeepSeek Harness',
+      'You are an AI agent,powered by DeepSeek Harness',
+      // 可选 `coding`（用户手填 / DSH 改词）
+      'You are an AI coding agent powered by DeepSeek Harness',
+      // 可选定冠词
+      'You are an AI agent powered by the DeepSeek Harness',
+      // 组合
+      'you are an ai coding agent,  powered by the deepseek harness',
+    ]) {
+      const out = rewriteTencentContentFingerprints(variant, 'buddy')
+      expect(out, `漂移形态必须被改写：${variant}`).toBe(DSH_REWRITE)
+    }
+  })
+
+  it('★★ 漂移容忍**不得**越界成关键词匹配（否则会篡改用户自己的同形句）', () => {
+    // ⚠️ Y 不是 `DeepSeek Harness` ⇒ 那是**别人**写的同形句，不该替它改成
+    //    「a large language model」（那会丢掉用户的真实信息）。
+    const foreign = 'You are an AI agent powered by Some Other Harness'
+    expect(rewriteTencentContentFingerprints(foreign, 'buddy')).toBe(foreign)
+    // ⚠️ 骨架不完整（缺 `powered by`）⇒ 不是同一句。
+    const partial = 'You are an AI agent. DeepSeek Harness is documented below.'
+    expect(rewriteTencentContentFingerprints(partial, 'buddy')).toBe(partial)
+  })
+
   it('★ 整段真实 system：只改首句，其余段落与行数逐字节不变', () => {
     // 现场形状：本句是 system 的**绝对首行**，后面跟着真正的行为约定与语言约束
     // —— 那些**不能**被碰（改了会篡改用户提示词并破坏上游的前缀缓存）。
