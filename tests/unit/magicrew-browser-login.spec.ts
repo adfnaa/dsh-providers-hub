@@ -32,6 +32,7 @@ import {
   MAGICREW_BROWSER_LOGIN_TIMEOUT_MS,
   createChromiumMagicrewLogin,
   createMagicrewCredentialWaiter,
+  ensureMagicrewLoginPage,
   createProfileCredentialReader,
   readCredentialViaCdp,
   readCredentialViaCdpDetailed,
@@ -254,6 +255,43 @@ describe('startMagicrewBrowserLogin', () => {
     // 跳 ①：`magicrew-auth.ts` 的缺省工厂给出 `log` 出口（走 warn，不是无声的 info）。
     expect(authSource).toMatch(/startMagicrewBrowserLogin\(\{[\s\S]{0,800}?log: \(message\)/)
     expect(authSource).toMatch(/this\.warnImpl !== undefined\) this\.warnImpl\(message\)/)
+  })
+})
+
+describe('ensureMagicrewLoginPage', () => {
+  function fakeCdp(initialUrl: string) {
+    const calls: { method: string, params: Record<string, unknown>, sessionId?: string }[] = []
+    const cdp = {
+      send: async (method: string, params: Record<string, unknown>, _timeout?: number, sessionId?: string) => {
+        calls.push({ method, params, sessionId })
+        if (method === 'Target.getTargets') {
+          return { targetInfos: [{ type: 'page', targetId: 'page-1', url: initialUrl }] }
+        }
+        if (method === 'Target.attachToTarget') return { sessionId: 'session-1' }
+        return {}
+      },
+    }
+    return { cdp, calls }
+  }
+
+  it('★★ CDP 就绪时仍是 about:blank ⇒ 主动导航到登录页，不能把空白窗交给用户', async () => {
+    const { cdp, calls } = fakeCdp('about:blank')
+    await ensureMagicrewLoginPage({ cdp }, `${ORIGIN_CN}/login`)
+    expect(calls.find((call) => call.method === 'Page.navigate')).toMatchObject({
+      params: { url: `${ORIGIN_CN}/login` },
+      sessionId: 'session-1',
+    })
+    expect(calls.find((call) => call.method === 'Target.detachFromTarget')?.sessionId).toBeUndefined()
+    expect(calls.at(-1)).toMatchObject({
+      method: 'Target.detachFromTarget',
+      params: { sessionId: 'session-1' },
+    })
+  })
+
+  it('★ 已有麦吉页面 ⇒ 不重复导航', async () => {
+    const { cdp, calls } = fakeCdp(`${ORIGIN_CN}/login`)
+    await ensureMagicrewLoginPage({ cdp }, `${ORIGIN_CN}/login`)
+    expect(calls.some((call) => call.method === 'Page.navigate')).toBe(false)
   })
 })
 
