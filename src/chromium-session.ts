@@ -160,6 +160,57 @@ function scoopChromiumPath(root: string): string {
   return join(root, 'apps', 'chromium', 'current', 'chrome.exe')
 }
 
+/**
+ * Windows「App Paths」里登记的 Chromium 可执行文件。
+ *
+ * 便携版 Chrome 不在 `%LOCALAPPDATA%`，但仍会在这里登记。注册表查询器可注入，
+ * 让中文 / 英文 Windows 的输出都能在单测里覆盖；查询失败只意味着没有这条补充路径。
+ */
+export function windowsRegisteredBrowserPaths(
+  query: (key: string) => { status: number | null, stdout: string } = (key) => spawnSync(
+    'reg', ['query', key, '/ve'], { encoding: 'utf8', windowsHide: true },
+  ),
+): string[] {
+  if (process.platform !== 'win32') return []
+  const found: string[] = []
+  for (const hive of ['HKCU', 'HKLM']) {
+    for (const name of ['chrome.exe', 'chromium.exe', 'msedge.exe', 'brave.exe']) {
+      const key = `${hive}\\Software\\Microsoft\\Windows\\CurrentVersion\\App Paths\\${name}`
+      try {
+        const result = query(key)
+        if (result.status !== 0) continue
+        for (const line of result.stdout.split(/\r?\n/)) {
+          const marker = /\bREG_SZ\b/i.exec(line)
+          if (marker === null) continue
+          const executable = line.slice(marker.index + marker[0].length).trim()
+          if (!isAbsolute(executable) || basename(executable).toLowerCase() !== name) continue
+          if (!found.some((item) => winPathEquals(item, executable))) found.push(executable)
+        }
+      } catch {
+        // 没有 reg / 注册表不可读时继续走原有的固定候选链。
+      }
+    }
+  }
+  return found
+}
+
+/**
+ * 已登记浏览器的默认与便携版 User Data 目录。
+ *
+ * 便携版 Chrome 的常见布局是 `<install>/App/chrome.exe` + `<install>/Data`。
+ * 两条目录都只是候选：读取方只处理实际存在的 profile，不写浏览器数据。
+ */
+export function registeredBrowserUserDataRoots(): string[] {
+  const roots: string[] = []
+  for (const executable of windowsRegisteredBrowserPaths()) {
+    const install = dirname(dirname(executable))
+    for (const root of [join(install, 'Data'), join(install, 'User Data')]) {
+      if (!roots.some((item) => winPathEquals(item, root))) roots.push(root)
+    }
+  }
+  return roots
+}
+
 /** Windows 候选链（逐字保留自重构前，⚠️ 改这里等于动本仓库绝大多数用户）。 */
 function windowsBrowserCandidates(
   env: Record<string, string | undefined>,

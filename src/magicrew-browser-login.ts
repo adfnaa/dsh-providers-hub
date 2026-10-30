@@ -558,6 +558,52 @@ export function createMagicrewCredentialWaiter(
   }
 }
 
+/**
+ * 把「初始仍是空白页」的窗口导航到登录页。
+ *
+ * CDP 就绪早于首屏导航时，启动参数里的 URL 可能尚未落到 page target。
+ * 此时不能让用户面对 about:blank；已有同站点页面则不重复导航。
+ */
+export async function ensureMagicrewLoginPage(
+  session: { cdp: CdpChannel | undefined },
+  url: string,
+): Promise<void> {
+  const cdp = session.cdp
+  if (cdp === undefined) throw new Error('超级麦吉: 浏览器调试通道未就绪，无法打开登录页')
+  const targets = await cdp.send('Target.getTargets', {}, CDP_CREDENTIAL_TIMEOUT_MS) as {
+    targetInfos?: Array<{ type?: unknown, targetId?: unknown, url?: unknown }>
+  }
+  const pages = (targets.targetInfos ?? []).filter(
+    (info): info is { targetId: string, url: string, type: string } => (
+      info.type === 'page' && typeof info.targetId === 'string' && typeof info.url === 'string'
+    ),
+  )
+  if (pages.some((page) => sameSite(hostnameOf(page.url), hostnameOf(url)))) return
+  const blank = pages.find((page) => page.url === 'about:blank') ?? pages[0]
+  if (blank === undefined) throw new Error('超级麦吉: 浏览器没有可用于登录的页面')
+  const attached = await cdp.send(
+    'Target.attachToTarget', { targetId: blank.targetId, flatten: true }, CDP_CREDENTIAL_TIMEOUT_MS,
+  ) as { sessionId?: unknown }
+  if (typeof attached.sessionId !== 'string' || attached.sessionId.length === 0) {
+    throw new Error('超级麦吉: 无法连接登录页面')
+  }
+  const sessionId = attached.sessionId
+  try {
+    const navigated = await cdp.send(
+      'Page.navigate', { url }, CDP_CREDENTIAL_TIMEOUT_MS, sessionId,
+    ) as { errorText?: unknown }
+    if (typeof navigated.errorText === 'string' && navigated.errorText.length > 0) {
+      throw new Error(`超级麦吉: 打开登录页失败（${navigated.errorText}）`)
+    }
+  } finally {
+    try {
+      await cdp.send('Target.detachFromTarget', { sessionId }, CDP_CREDENTIAL_TIMEOUT_MS)
+    } catch {
+      // 会话关闭时连接可能已断开；导航结果不能被清理错误覆盖。
+    }
+  }
+}
+
 /** {@link createChromiumMagicrewLogin} 的依赖（生产缺省全接线；单测逐个注入）。 */
 export interface ChromiumMagicrewLoginDeps {
   /** 产品常量（只用于诊断文案）。 */
@@ -581,6 +627,8 @@ export interface ChromiumMagicrewLoginDeps {
   pollIntervalMs?: number
   /** 读凭据原语（单测注入）。 */
   readCreds?: typeof readMagicrewLocalCreds
+  /** 登录页导航原语（单测注入，验证 about:blank 修复而不起真实浏览器）。 */
+  ensureLoginPage?: typeof ensureMagicrewLoginPage
   /** 实时读凭据原语（缺省 {@link readCredentialViaCdp}；单测注入假 session）。 */
   readRealtime?: (session: { cdp: CdpChannel | undefined }) => Promise<MagicrewRealtimeRead>
   /** 等待原语（单测注入 ⇒ 零真实等待）。 */
@@ -701,6 +749,7 @@ export async function createChromiumMagicrewLogin(
   })
   try {
     await session.start()
+    await (deps.ensureLoginPage ?? ensureMagicrewLoginPage)(session, url)
   } catch (error) {
     /**
      * ⚠️ 起不来时**必须** dispose：`launch()` 失败路径只 `kill()` 进程树，

@@ -33,6 +33,7 @@ import { fileURLToPath } from 'node:url'
 import {
   browserCandidates,
   browserNotFoundMessage,
+  windowsRegisteredBrowserPaths,
   findBrowserExecutable,
   isBrowserDeploymentError,
   scoopRootFromPath,
@@ -132,6 +133,22 @@ afterEach(() => {
     else process.env[k] = v
   }
   for (const k of Object.keys(saved)) delete saved[k]
+})
+
+describe('Windows App Paths 浏览器发现', () => {
+  it('★ 识别中文注册表输出中的 REG_SZ，发现便携版 Chrome', () => {
+    const found = windowsRegisteredBrowserPaths((key) => (
+      key.startsWith('HKCU') && key.endsWith('\\chrome.exe')
+        ? { status: 0, stdout: '    (默认)    REG_SZ    D:\\\\Tools\\\\Chrome\\\\App\\\\chrome.exe\r\n' }
+        : { status: 1, stdout: '' }
+    ))
+    expect(found).toEqual(process.platform === 'win32' ? ['D:\\\\Tools\\\\Chrome\\\\App\\\\chrome.exe'] : [])
+  })
+
+  it('★ 查询失败或路径不完整时不产生候选', () => {
+    const found = windowsRegisteredBrowserPaths(() => ({ status: 0, stdout: '    (默认)    REG_SZ\r\n' }))
+    expect(found).toEqual([])
+  })
 })
 
 describe('ZCode 浏览器探测', () => {

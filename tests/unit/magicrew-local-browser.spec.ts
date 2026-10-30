@@ -255,6 +255,16 @@ describe('magicrewBrowserRoots / leveldbTextFor', () => {
     expect(roots.every((entry) => !entry.root.includes('magpie'))).toBe(true)
   })
 
+  it('★ 可通过环境变量发现便携版 Chrome 的 User Data（不再漏掉已登录态）', () => {
+    const root = join(tmpdir(), 'portable-chrome-user-data')
+    vi.stubEnv('MAGICREW_CHROME_USER_DATA', root)
+    try {
+      expect(magicrewBrowserRoots()).toContainEqual({ browser: 'Chrome 便携版', root })
+    } finally {
+      vi.unstubAllEnvs()
+    }
+  })
+
   it('★ 多 profile 的文本都要读到，且**用 \\n 隔开**（否则尾部与头部会拼出假记录）', () => {
     const root = mkdtempSync(join(tmpdir(), 'magicrew-browser-profiles-'))
     const write = (profile: string, text: string) => {
