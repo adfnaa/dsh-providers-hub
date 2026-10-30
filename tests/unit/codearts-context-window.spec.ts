@@ -140,7 +140,9 @@ describe('上下文占用条的分母（contextWindow）', () => {
     ])
     for (const [id, window] of [
       ['glm-5.3', 1_048_576],
-      ['GLM-5.2', 1_048_576],
+      // 2026-10-29：IDE 0.2.6 抓包 + AgentCenter 双源权威 202_752（10-21 的 1M 是
+      // 临时值/灰度 —— 本表三次漂移史见 CONTEXT_WINDOWS 注释）。
+      ['GLM-5.2', 202_752],
       ['openpangu-2.0-flash', 524_288],
       ['deepseek-v4.1-flash', 1_048_576],
     ] as const) {
@@ -210,13 +212,21 @@ describe('上下文占用条的分母（contextWindow）', () => {
    * 守卫 ④：**逐模型的权威值**（IDE 下发的 `inferhub-provider.models[*].limit.context`）。
    *
    * ⚠️ 这条钉的是**数值本身**，防两件事：
-   * ① `GLM-5.2` 被改回过期的 `202_752`（10-20 及以前的 IDE 配置；上游 10-21 已改 1M）
-   *    —— 留着它会让分母小 5 倍，占用比封顶 100%、自动压缩阈值降到 ~162K；
+   * ① 表值静默漂移（这条用例要求改值的人**带着取证来改**）；
    * ② 有人把兜底值「顺手」也填进表里冒充实测值。
    *
-   * 取证方式与日期见 `CONTEXT_WINDOWS` 的注释（本机 42 份内核日志，2026-09-11~10-21）。
+   * ## GLM-5.2 的取值史（三次漂移，改这条断言前必读）
+   *
+   * - 202_752（2026-09-11~10-20 内核日志，42 份）；
+   * - 1_048_576（10-21 校准 —— 当时的守卫文本还专门写着「不得退回 202_752」）；
+   * - **202_752（10-29 复测：IDE 0.2.6 抓包 record 38 + AgentCenter 双源一致）**
+   *   ⇒ 结论：10-21 那次不是「上游永久上调」而是临时值/灰度。
+   *
+   * ⇒ 现按 10-29 权威写回 202_752。⚠️ 运行时权威已由 AgentCenter 动态下发
+   * （`RemoteModel.contextWindow` 优先于静态表），本表只是冷缓存兜底 ——
+   * 但兜底也必须钉数值：下次再漂移，改这条断言的人必须同样带着双源取证。
    */
-  it('④ 逐模型窗口等于 IDE 下发的权威值（GLM-5.2 不得退回 202_752）', () => {
+  it('④ 逐模型窗口等于 IDE 下发的权威值（GLM-5.2 按 2026-10-29 双源取证 = 202_752）', () => {
     expect({
       'GLM-5.2': codeartsContextWindow('GLM-5.2'),
       'glm-5.3': codeartsContextWindow('glm-5.3'),
@@ -225,14 +235,16 @@ describe('上下文占用条的分母（contextWindow）', () => {
       'openpangu-2.0-flash': codeartsContextWindow('openpangu-2.0-flash'),
       'openpangu-2.0-pro': codeartsContextWindow('openpangu-2.0-pro'),
       'deepseek-v4.1-flash': codeartsContextWindow('deepseek-v4.1-flash'),
+      'kimi-k3': codeartsContextWindow('kimi-k3'),
     }).toEqual({
-      'GLM-5.2': 1_048_576,
+      'GLM-5.2': 202_752,
       'glm-5.3': 1_048_576,
       'glm-5.3-flash': 1_048_576,
       'glm-5.2-sft-harmony': 202_752,
       'openpangu-2.0-flash': 524_288,
       'openpangu-2.0-pro': 524_288,
       'deepseek-v4.1-flash': 1_048_576,
+      'kimi-k3': 1_048_576,
     })
   })
 
@@ -244,5 +256,25 @@ describe('上下文占用条的分母（contextWindow）', () => {
   it('⑤ 表内命中时返回表内值，不是兜底', () => {
     expect(codeartsContextWindow('GLM-5.2')).not.toBe(CODEARTS_FALLBACK_CONTEXT_WINDOW)
     expect(codeartsContextWindow('deepseek-v4.1-flash')).not.toBe(CODEARTS_FALLBACK_CONTEXT_WINDOW)
+  })
+
+  /**
+   * 守卫 ⑥：**AgentCenter 动态值优先于静态表**（2026-10-29 接入）。
+   *
+   * ⚠️ 变异「`toCatalogEntry` 忽略 `model.contextWindow`、恒走静态表」会让
+   * ①②③④⑤ 全绿（静态表本身仍自洽）而这条红 —— 它是动态源唯一有牙的守卫。
+   * 取值 999_999 刻意是静态表与兜底里**都不存在**的数（避免巧合相等）。
+   */
+  it('⑥ 远端目录带回的动态窗口优先于静态表（AgentCenter 权威）', async () => {
+    const adapter = makeAdapter([
+      { id: 'GLM-5.2', name: 'GLM-5.2', contextWindow: 999_999 },
+      { id: 'kimi-k3', name: 'Kimi K3', contextWindow: 1_048_576 },
+    ])
+    const glm = await adapter.resolveModel('codearts', 'GLM-5.2')
+    expect(glm.context?.contextWindow).toBe(999_999)
+    // ⚠️ 反向对照：无动态值时仍走静态表（「凡远端就赢」的变异会被这条抓到）。
+    const adapterNoWin = makeAdapter([{ id: 'kimi-k3', name: 'Kimi K3' }])
+    const kimi = await adapterNoWin.resolveModel('codearts', 'kimi-k3')
+    expect(kimi.context?.contextWindow).toBe(1_048_576)
   })
 })

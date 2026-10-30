@@ -16,6 +16,44 @@ export const OPENGW_GATEWAY_CONFIG_URL = 'https://opengw.developer.huaweicloud.c
  */
 export const SNAP_MODEL_BUILTIN_URL = 'https://snap-access.cn-north-4.myhuaweicloud.com/v1/model/builtin'
 
+/**
+ * snap-access AgentCenter 端点组 — **动态上下文窗口权威源**（2026-10-29 接入）。
+ *
+ * ## 为什么需要第三个来源
+ *
+ * 上下文窗口此前只有**静态表**（`CONTEXT_WINDOWS`，llm-adapter.ts），而静态表
+ * 必然腐坏：GLM-5.2 实测 2026-09~10 为 202_752、10-21 起上游改成 1_048_576、
+ * **10-29 IDE 0.2.6 抓包又改回 202_752** —— 每次漂移都让插件的下分母错数倍
+ * （占用条 / 自动压缩阈值全错）。而 builtin 与 gateway/config 两个端点都实测
+ * **不下发**任何窗口字段（providers-codearts.md 笔记）。
+ *
+ * AgentCenter（`codearts2api` 参考实现一直在用的两个端点，2026-10-29 用本仓
+ * STS 凭据真机验证）是唯一找到的**按账号动态下发窗口**的来源：
+ *
+ * 1. `GET /v1/agent-center/agents/useragents?offset=0&limit=100`
+ *    → `{ agents: [{ id, is_primary_agent, ... }] }`；
+ * 2. `GET /v1/agent-center/agents/detail?agent_id={id}`
+ *    → `{ gpts: { models: [{ model_id, model_alias, model_parameters:
+ *         { context_window, max_tokens, supports_images } }] } }`。
+ *
+ * 实测 8 模型全带窗口，与 IDE 内核 `/cag/global/config` 权威**逐值一致**
+ * （GLM-5.2=202752 max 65536、openpangu=524288、glm-5.3 / ds-v4.1-flash(-1017)
+ * / kimi-k3=1048576）。取 primary agent（`is_primary_agent`，缺省第一条）。
+ *
+ * ## 签名与路由要求（全部真机判别过）
+ *
+ * - `agent-type: AgentCenter` + `x-language: zh-cn` 头**必须带且参与签名**
+ *   （不带 x-language ⇒ 400 `TM.00001001`「未找到合法可路由api」；带 AgentCenter
+ *   打 PromptCenter 专有端点也回同一 400 —— 该头是**路由判据**）；
+ * - query 必须**排序**后签名（`offset` < `limit` 恰好已是字典序，但本 signer
+ *   现已统一排序，见 `canonicalQueryOf`）；
+ * - `accept` / `content-type`（GET）参与与否都 200（非必需）。
+ */
+export const SNAP_AGENT_CENTER_USERAGENTS_URL =
+  'https://snap-access.cn-north-4.myhuaweicloud.com/v1/agent-center/agents/useragents?offset=0&limit=100'
+export const SNAP_AGENT_CENTER_DETAIL_URL =
+  'https://snap-access.cn-north-4.myhuaweicloud.com/v1/agent-center/agents/detail'
+
 /** 远端动态模型列表缓存文件名（~/.cache/deveco/codearts_models.json）。 */
 const CODEARTS_MODELS_CACHE_FILENAME = 'codearts_models.json'
 
@@ -49,6 +87,18 @@ export interface RemoteModel {
    *   绝不臆造上游未下发的数）。故直接取 `ratio_display`，取不到就不显示。
    */
   rateLabel?: string
+  /**
+   * 上下文窗口（tokens）—— **仅来自 AgentCenter**（见
+   * `SNAP_AGENT_CENTER_USERAGENTS_URL` 的注释），取不到时为 `undefined`
+   * （调用方回退静态表，见 llm-adapter.ts 的 `codeartsContextWindow`）。
+   *
+   * ⚠️ 动态值**优先于**静态表（AgentCenter 与 IDE 内核权威逐值一致，静态表
+   * 有腐坏史：GLM-5.2 三次漂移）；但它**不在**完整性判据里（`isRemoteCatalogComplete`
+   * 不看它）—— AgentCenter 失败只是窗口退化到静态表，目录本身仍完整。
+   */
+  contextWindow?: number
+  /** 单次输出上限（tokens），来源与 `contextWindow` 同（AgentCenter `max_tokens`）。 */
+  maxOutputTokens?: number
 }
 
 /**
@@ -295,8 +345,14 @@ async function fetchSignedGet(
   st: string,
   /** 签名后追加的头（不参与 SDK-HMAC-SHA256 签名计算）。 */
   extraUnsignedHeaders?: Readonly<Record<string, string>>,
+  /**
+   * **参与签名**的额外头（传入 `signRequestHuawei` 的 `extraHeaders`）——
+   * AgentCenter 的 `agent-type` / `x-language` 是路由判据，必须签上
+   * （builtin 的 Agent-Type 实测不签也能过，但 AgentCenter 按同口径从严）。
+   */
+  extraSignedHeaders?: Readonly<Record<string, string>>,
 ): Promise<string | undefined> {
-  const signed = await signRequestHuawei(ak, sk, st, 'GET', url, new Uint8Array())
+  const signed = await signRequestHuawei(ak, sk, st, 'GET', url, new Uint8Array(), extraSignedHeaders)
   const headers = new Headers()
   signed.forEach((v, k) => {
     if (k !== 'host') headers.set(k, v)
@@ -318,9 +374,106 @@ async function fetchSignedGet(
 }
 
 /**
- * 从两个远端端点拉取模型列表并合并去重：
+ * AgentCenter 单模型的 `model_parameters` → 动态窗口。
+ *
+ * ⚠️ 只认**正整数**（上游实测形态 `202752` / `1048576` / `65536`）；浮点、0、
+ * 负数、字符串一律**不落键**（绝不臆造/强转 —— 字符串数字强转是「静态表
+ * 腐坏」的同型病：上游改形态时就静默喂错值）。
+ */
+export function readAgentCenterWindow(
+  m: Record<string, unknown>,
+): { contextWindow?: number; maxOutputTokens?: number } {
+  const params = m['model_parameters']
+  if (typeof params !== 'object' || params === null) return {}
+  const p = params as Record<string, unknown>
+  const out: { contextWindow?: number; maxOutputTokens?: number } = {}
+  const ctx = p['context_window']
+  if (typeof ctx === 'number' && Number.isInteger(ctx) && ctx > 0) out.contextWindow = ctx
+  const max = p['max_tokens']
+  if (typeof max === 'number' && Number.isInteger(max) && max > 0) out.maxOutputTokens = max
+  return out
+}
+
+/**
+ * 拉 AgentCenter 的动态窗口表（best-effort：两步请求**任何一步**失败都返回
+ * 空 Map，**不阻断**调用方 —— 窗口缺失只是退化到静态表，目录本身不受影响）。
+ *
+ * 流程：`useragents` 选 primary agent（`is_primary_agent`，无标记取第一条）
+ * → `detail?agent_id=` → `gpts.models[]` 按 `model_id` 收
+ * `{ contextWindow, maxOutputTokens, name }`（name = `model_alias`）。
+ * 只有带窗口的条目才收（无窗口的条目对调用方无信息量）。
+ */
+export async function fetchAgentCenterWindows(
+  fetcher: typeof fetch,
+  ak: string,
+  sk: string,
+  st: string,
+): Promise<Map<string, { contextWindow: number; maxOutputTokens?: number; name?: string }>> {
+  const out = new Map<string, { contextWindow: number; maxOutputTokens?: number; name?: string }>()
+  // 路由判据头必须**参与签名**（去掉 x-language ⇒ 400 TM.00001001，
+  // 真机判别 2026-10-29；accept 实测非必需）。
+  const signedExtras = { 'agent-type': 'AgentCenter', 'x-language': 'zh-cn' } as const
+  const listText = await fetchSignedGet(fetcher, SNAP_AGENT_CENTER_USERAGENTS_URL, ak, sk, st, undefined, signedExtras)
+  if (listText === undefined) return out
+  let agents: unknown[]
+  try {
+    const parsed: unknown = JSON.parse(listText)
+    const arr = typeof parsed === 'object' && parsed !== null
+      ? (parsed as Record<string, unknown>)['agents']
+      : undefined
+    if (!Array.isArray(arr)) return out
+    agents = arr
+  } catch {
+    return out
+  }
+  // 选 primary agent：有标记的优先，否则第一条可用的（与 codearts2api 参考实现同口径）。
+  let agentId: string | undefined
+  for (const item of agents) {
+    if (typeof item !== 'object' || item === null) continue
+    const a = item as Record<string, unknown>
+    const id = typeof a['id'] === 'string' ? a['id'] : undefined
+    if (id === undefined || id.length === 0) continue
+    if (a['is_primary_agent'] === true) { agentId = id; break }
+    if (agentId === undefined) agentId = id
+  }
+  if (agentId === undefined) return out
+
+  const detailUrl = `${SNAP_AGENT_CENTER_DETAIL_URL}?agent_id=${encodeURIComponent(agentId)}`
+  const detailText = await fetchSignedGet(fetcher, detailUrl, ak, sk, st, undefined, signedExtras)
+  if (detailText === undefined) return out
+  try {
+    const parsed: unknown = JSON.parse(detailText)
+    if (typeof parsed !== 'object' || parsed === null) return out
+    const gpts = (parsed as Record<string, unknown>)['gpts']
+    if (typeof gpts !== 'object' || gpts === null) return out
+    const gptsModels = (gpts as Record<string, unknown>)['models']
+    if (!Array.isArray(gptsModels)) return out
+    for (const item of gptsModels) {
+      if (typeof item !== 'object' || item === null) continue
+      const m = item as Record<string, unknown>
+      const id = typeof m['model_id'] === 'string' ? m['model_id'] : ''
+      if (id.length === 0) continue
+      const w = readAgentCenterWindow(m)
+      if (w.contextWindow === undefined) continue
+      const alias = m['model_alias']
+      out.set(id, {
+        contextWindow: w.contextWindow,
+        ...(w.maxOutputTokens !== undefined ? { maxOutputTokens: w.maxOutputTokens } : {}),
+        ...(typeof alias === 'string' && alias.length > 0 ? { name: alias } : {}),
+      })
+    }
+  } catch {
+    return out
+  }
+  return out
+}
+
+/**
+ * 从三个远端端点拉取模型列表并合并去重：
  * 1. opengw gateway/config → result.models（benefit 模型）
  * 2. snap-access /v1/model/builtin → builtinModels（常规模型）
+ * 3. snap-access AgentCenter → 动态上下文窗口（best-effort，见
+ *    {@link fetchAgentCenterWindows}；**不参与**完整性判据）
  * 失败或空凭据时返回空数组（不阻断）。
  *
  * 同时把 gateway/config 下发的 benefit 模型 id 集合写入独立缓存
@@ -412,6 +565,43 @@ export async function fetchCodeArtsRemoteModels(
         const mi = parseModelInfo(item as Record<string, unknown>, seen, nowMs)
         if (mi) models.push(mi)
       }
+    }
+  }
+
+  /**
+   * 3. snap-access AgentCenter — **动态上下文窗口**（2026-10-29 接入）。
+   *
+   * ⚠️⚠️ **刻意不进完整性判据**（`isRemoteCatalogComplete` 仍只看
+   * `gatewayOk && builtinOk`）：窗口缺失的后果只是「分母退化到静态表」，
+   * 而静态表本就是现状；若把它算进完整性，AgentCenter 一抖动就会让
+   * 整份**目录**被拒之门外（不能永久缓存）—— 因果完全不成比例。
+   * 失败静默（fetchSignedGet 内已 catch），无日志面。
+   *
+   * 合并规则：
+   * - 目录已有该 id → **补** `contextWindow`/`maxOutputTokens`（目录端点不下发，
+   *   不存在冲突，无需「远端优先」判据）；
+   * - AgentCenter 有、目录没有的 id → **补进目录**（带窗口才收；同样过 VL 过滤，
+   *   与 `parseModelInfo` 同一判据）—— 实测 builtin 就漏过 `kimi-k3`（IDE 已
+   *   下发、builtin 无），AgentCenter 有它的窗口，这条腿能把它救回目录。
+   */
+  const agentCenterWindows = await fetchAgentCenterWindows(fetcher, ak, sk, st)
+  if (agentCenterWindows.size > 0) {
+    for (const model of models) {
+      const w = agentCenterWindows.get(model.id)
+      if (w === undefined) continue
+      model.contextWindow = w.contextWindow
+      if (w.maxOutputTokens !== undefined) model.maxOutputTokens = w.maxOutputTokens
+    }
+    for (const [id, w] of agentCenterWindows) {
+      if (seen.has(id)) continue
+      if (id.includes('-VL-') || id.endsWith('-VL')) continue
+      models.push({
+        id,
+        name: w.name ?? id,
+        contextWindow: w.contextWindow,
+        ...(w.maxOutputTokens !== undefined ? { maxOutputTokens: w.maxOutputTokens } : {}),
+      })
+      seen.add(id)
     }
   }
 
